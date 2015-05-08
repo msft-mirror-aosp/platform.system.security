@@ -1,0 +1,123 @@
+//
+// Copyright (C) 2009 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+cc_binary {
+    // ANDROIDMK TRANSLATION ERROR: unsupported conditional
+    // ifeq ($(USE_32_BIT_KEYSTORE), true)
+    //compile_multilib: "32",
+    // ANDROIDMK TRANSLATION ERROR: endif from unsupported contitional
+    // endif
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wunused",
+    ],
+    srcs: [
+        "keystore.cpp",
+        "keyblob_utils.cpp",
+        "operation.cpp",
+        "auth_token_table.cpp",
+    ],
+    shared_libs: [
+        "libbinder",
+        "libcutils",
+        "libcrypto",
+        "libhardware",
+        "libkeystore_binder",
+        "liblog",
+        "libsoftkeymaster",
+        "libutils",
+        "libselinux",
+        "libsoftkeymasterdevice",
+        "libkeymaster_messages",
+    ],
+    name: "keystore",
+}
+
+cc_binary {
+    // ANDROIDMK TRANSLATION ERROR: unsupported conditional
+    // ifeq ($(USE_32_BIT_KEYSTORE), true)
+    //compile_multilib: "32",
+    // ANDROIDMK TRANSLATION ERROR: endif from unsupported contitional
+    // endif
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    srcs: ["keystore_cli.cpp"],
+    shared_libs: [
+        "libcutils",
+        "libcrypto",
+        "libkeystore_binder",
+        "libutils",
+        "liblog",
+        "libbinder",
+    ],
+    name: "keystore_cli",
+    tags: ["debug"],
+}
+
+// Library for keystore clients
+cc_library_shared {
+    // ANDROIDMK TRANSLATION ERROR: unsupported conditional
+    // ifeq ($(USE_32_BIT_KEYSTORE), true)
+    //compile_multilib: "32",
+    // ANDROIDMK TRANSLATION ERROR: endif from unsupported contitional
+    // endif
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    srcs: [
+        "IKeystoreService.cpp",
+        "keystore_get.cpp",
+        "keyblob_utils.cpp",
+    ],
+    shared_libs: [
+        "libbinder",
+        "libutils",
+        "liblog",
+        "libsoftkeymasterdevice",
+    ],
+    name: "libkeystore_binder",
+    local_include_dirs: ["include"],
+    export_include_dirs: ["include"],
+
+}
+
+// Library for unit tests
+cc_library_static {
+    // ANDROIDMK TRANSLATION ERROR: unsupported conditional
+    // ifeq ($(USE_32_BIT_KEYSTORE), true)
+    //compile_multilib: "32",
+    // ANDROIDMK TRANSLATION ERROR: endif from unsupported contitional
+    // endif
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    srcs: ["auth_token_table.cpp"],
+    name: "libkeystore_test",
+    local_include_dirs: ["include"],
+    static_libs: ["libgtest_main"],
+    shared_libs: ["libkeymaster_messages"],
+    export_include_dirs: ["include"],
+
+}
