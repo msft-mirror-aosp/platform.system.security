@@ -20,12 +20,15 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
 
-#include <UniquePtr.h>
+#define LOG_TAG "keystore-engine"
 
+#include <pthread.h>
 #include <sys/socket.h>
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <cutils/log.h>
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -36,16 +39,17 @@
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 
-#include <binder/IServiceManager.h>
-#include <keystore/keystore.h>
-#include <keystore/IKeystoreService.h>
+#include <memory>
 
-using namespace android;
+#ifndef BACKEND_WIFI_HIDL
+#include "keystore_backend_binder.h"
+#else
+#include "keystore_backend_hidl.h"
+#endif
 
 namespace {
-
-extern const RSA_METHOD keystore_rsa_method;
-extern const ECDSA_METHOD keystore_ecdsa_method;
+KeystoreBackend *g_keystore_backend;
+void ensure_keystore_engine();
 
 /* key_id_dup is called when one of the RSA or EC_KEY objects is duplicated. */
 int key_id_dup(CRYPTO_EX_DATA* /* to */,
@@ -72,6 +76,110 @@ void key_id_free(void* /* parent */,
     free(key_id);
 }
 
+/* Many OpenSSL APIs take ownership of an argument on success but don't free
+ * the argument on failure. This means we need to tell our scoped pointers when
+ * we've transferred ownership, without triggering a warning by not using the
+ * result of release(). */
+#define OWNERSHIP_TRANSFERRED(obj) \
+    typeof ((obj).release()) _dummy __attribute__((unused)) = (obj).release()
+
+const char* rsa_get_key_id(const RSA* rsa);
+
+/* rsa_private_transform takes a big-endian integer from |in|, calculates the
+ * d'th power of it, modulo the RSA modulus, and writes the result as a
+ * big-endian integer to |out|. Both |in| and |out| are |len| bytes long. It
+ * returns one on success and zero otherwise. */
+int rsa_private_transform(RSA *rsa, uint8_t *out, const uint8_t *in, size_t len) {
+    ALOGV("rsa_private_transform(%p, %p, %p, %u)", rsa, out, in, (unsigned) len);
+
+    ensure_keystore_engine();
+
+    const char *key_id = rsa_get_key_id(rsa);
+    if (key_id == NULL) {
+        ALOGE("key had no key_id!");
+        return 0;
+    }
+
+    uint8_t* reply = NULL;
+    size_t reply_len;
+    int32_t ret = g_keystore_backend->sign(key_id, in, len, &reply, &reply_len);
+    if (ret < 0) {
+        ALOGW("There was an error during rsa_decrypt: could not connect");
+        return 0;
+    } else if (ret != 0) {
+        ALOGW("Error during sign from keystore: %d", ret);
+        return 0;
+    } else if (reply_len == 0 || reply == NULL) {
+        ALOGW("No valid signature returned");
+        return 0;
+    }
+
+    if (reply_len > len) {
+        /* The result of the RSA operation can never be larger than the size of
+         * the modulus so we assume that the result has extra zeros on the
+         * left. This provides attackers with an oracle, but there's nothing
+         * that we can do about it here. */
+        ALOGW("Reply len %zu greater than expected %zu", reply_len, len);
+        memcpy(out, &reply[reply_len - len], len);
+    } else if (reply_len < len) {
+        /* If the Keystore implementation returns a short value we assume that
+         * it's because it removed leading zeros from the left side. This is
+         * bad because it provides attackers with an oracle but we cannot do
+         * anything about a broken Keystore implementation here. */
+        ALOGW("Reply len %zu lesser than expected %zu", reply_len, len);
+        memset(out, 0, len);
+        memcpy(out + len - reply_len, &reply[0], reply_len);
+    } else {
+        memcpy(out, &reply[0], len);
+    }
+
+    ALOGV("rsa=%p keystore_rsa_priv_dec successful", rsa);
+    return 1;
+}
+
+const char* ecdsa_get_key_id(const EC_KEY* ec_key);
+
+/* ecdsa_sign signs |digest_len| bytes from |digest| with |ec_key| and writes
+ * the resulting signature (an ASN.1 encoded blob) to |sig|. It returns one on
+ * success and zero otherwise. */
+static int ecdsa_sign(const uint8_t* digest, size_t digest_len, uint8_t* sig,
+                      unsigned int* sig_len, EC_KEY* ec_key) {
+    ALOGV("ecdsa_sign(%p, %u, %p)", digest, (unsigned) digest_len, ec_key);
+
+    ensure_keystore_engine();
+
+    const char *key_id = ecdsa_get_key_id(ec_key);
+    if (key_id == NULL) {
+        ALOGE("key had no key_id!");
+        return 0;
+    }
+
+    size_t ecdsa_size = ECDSA_size(ec_key);
+
+    uint8_t* reply = NULL;
+    size_t reply_len;
+    int32_t ret = g_keystore_backend->sign(
+            key_id, digest, digest_len, &reply, &reply_len);
+    if (ret < 0) {
+        ALOGW("There was an error during ecdsa_sign: could not connect");
+        return 0;
+    } else if (reply_len == 0 || reply == NULL) {
+        ALOGW("No valid signature returned");
+        return 0;
+    } else if (reply_len > ecdsa_size) {
+        ALOGW("Signature is too large");
+        return 0;
+    }
+
+    // Reviewer: should't sig_len be checked here? Or is it just assumed that it is at least ecdsa_size?
+    memcpy(sig, &reply[0], reply_len);
+    *sig_len = reply_len;
+
+    ALOGV("ecdsa_sign(%p, %u, %p) => success", digest, (unsigned)digest_len,
+          ec_key);
+    return 1;
+}
+
 /* KeystoreEngine is a BoringSSL ENGINE that implements RSA and ECDSA by
  * forwarding the requested operations to Keystore. */
 class KeystoreEngine {
@@ -88,10 +196,17 @@ class KeystoreEngine {
                                               key_id_dup,
                                               key_id_free)),
         engine_(ENGINE_new()) {
-    ENGINE_set_RSA_method(
-        engine_, &keystore_rsa_method, sizeof(keystore_rsa_method));
-    ENGINE_set_ECDSA_method(
-        engine_, &keystore_ecdsa_method, sizeof(keystore_ecdsa_method));
+    memset(&rsa_method_, 0, sizeof(rsa_method_));
+    rsa_method_.common.is_static = 1;
+    rsa_method_.private_transform = rsa_private_transform;
+    rsa_method_.flags = RSA_FLAG_CACHE_PUBLIC | RSA_FLAG_OPAQUE;
+    ENGINE_set_RSA_method(engine_, &rsa_method_, sizeof(rsa_method_));
+
+    memset(&ecdsa_method_, 0, sizeof(ecdsa_method_));
+    ecdsa_method_.common.is_static = 1;
+    ecdsa_method_.sign = ecdsa_sign;
+    ecdsa_method_.flags = ECDSA_FLAG_OPAQUE;
+    ENGINE_set_ECDSA_method(engine_, &ecdsa_method_, sizeof(ecdsa_method_));
   }
 
   int rsa_ex_index() const { return rsa_index_; }
@@ -102,6 +217,8 @@ class KeystoreEngine {
  private:
   const int rsa_index_;
   const int ec_key_index_;
+  RSA_METHOD rsa_method_;
+  ECDSA_METHOD ecdsa_method_;
   ENGINE* const engine_;
 };
 
@@ -111,211 +228,50 @@ KeystoreEngine *g_keystore_engine;
 /* init_keystore_engine is called to initialize |g_keystore_engine|. This
  * should only be called by |pthread_once|. */
 void init_keystore_engine() {
-    g_keystore_engine = new KeystoreEngine;
+  g_keystore_engine = new KeystoreEngine;
+#ifndef BACKEND_WIFI_HIDL
+  g_keystore_backend = new KeystoreBackendBinder;
+#else
+  g_keystore_backend = new KeystoreBackendHidl;
+#endif
 }
 
 /* ensure_keystore_engine ensures that |g_keystore_engine| is pointing to a
  * valid |KeystoreEngine| object and creates one if not. */
 void ensure_keystore_engine() {
-    pthread_once(&g_keystore_engine_once, init_keystore_engine);
+  pthread_once(&g_keystore_engine_once, init_keystore_engine);
 }
-
-/* Many OpenSSL APIs take ownership of an argument on success but don't free
- * the argument on failure. This means we need to tell our scoped pointers when
- * we've transferred ownership, without triggering a warning by not using the
- * result of release(). */
-#define OWNERSHIP_TRANSFERRED(obj) \
-    typeof ((obj).release()) _dummy __attribute__((unused)) = (obj).release()
 
 const char* rsa_get_key_id(const RSA* rsa) {
   return reinterpret_cast<char*>(
       RSA_get_ex_data(rsa, g_keystore_engine->rsa_ex_index()));
 }
 
-/* rsa_private_transform takes a big-endian integer from |in|, calculates the
- * d'th power of it, modulo the RSA modulus, and writes the result as a
- * big-endian integer to |out|. Both |in| and |out| are |len| bytes long. It
- * returns one on success and zero otherwise. */
-int rsa_private_transform(RSA *rsa, uint8_t *out, const uint8_t *in, size_t len) {
-    ALOGV("rsa_private_transform(%p, %p, %p, %u)", rsa, out, in, (unsigned) len);
-
-    const char *key_id = rsa_get_key_id(rsa);
-    if (key_id == NULL) {
-        ALOGE("key had no key_id!");
-        return 0;
-    }
-
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
-
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
-        return 0;
-    }
-
-    uint8_t* reply = NULL;
-    size_t reply_len;
-    int32_t ret = service->sign(String16(key_id), in, len, &reply, &reply_len);
-    if (ret < 0) {
-        ALOGW("There was an error during rsa_decrypt: could not connect");
-        return 0;
-    } else if (ret != 0) {
-        ALOGW("Error during sign from keystore: %d", ret);
-        return 0;
-    } else if (reply_len == 0) {
-        ALOGW("No valid signature returned");
-        free(reply);
-        return 0;
-    }
-
-    if (reply_len > len) {
-        /* The result of the RSA operation can never be larger than the size of
-         * the modulus so we assume that the result has extra zeros on the
-         * left. This provides attackers with an oracle, but there's nothing
-         * that we can do about it here. */
-        memcpy(out, reply + reply_len - len, len);
-    } else if (reply_len < len) {
-        /* If the Keystore implementation returns a short value we assume that
-         * it's because it removed leading zeros from the left side. This is
-         * bad because it provides attackers with an oracle but we cannot do
-         * anything about a broken Keystore implementation here. */
-        memset(out, 0, len);
-        memcpy(out + len - reply_len, reply, reply_len);
-    } else {
-        memcpy(out, reply, len);
-    }
-
-    free(reply);
-
-    ALOGV("rsa=%p keystore_rsa_priv_dec successful", rsa);
-    return 1;
-}
-
-const struct rsa_meth_st keystore_rsa_method = {
-  {
-    0 /* references */,
-    1 /* is_static */,
-  },
-  NULL /* app_data */,
-
-  NULL /* init */,
-  NULL /* finish */,
-
-  NULL /* size */,
-
-  NULL /* sign */,
-  NULL /* verify */,
-
-  NULL /* encrypt */,
-  NULL /* sign_raw */,
-  NULL /* decrypt */,
-  NULL /* verify_raw */,
-
-  rsa_private_transform,
-
-  NULL /* mod_exp */,
-  NULL /* bn_mod_exp */,
-
-  RSA_FLAG_CACHE_PUBLIC | RSA_FLAG_OPAQUE,
-
-  NULL /* keygen */,
-  NULL /* multi_prime_keygen */,
-  NULL /* supports_digest */,
-};
-
 const char* ecdsa_get_key_id(const EC_KEY* ec_key) {
-    return reinterpret_cast<char*>(
-        EC_KEY_get_ex_data(ec_key, g_keystore_engine->ec_key_ex_index()));
+  return reinterpret_cast<char*>(
+      EC_KEY_get_ex_data(ec_key, g_keystore_engine->ec_key_ex_index()));
 }
-
-/* ecdsa_sign signs |digest_len| bytes from |digest| with |ec_key| and writes
- * the resulting signature (an ASN.1 encoded blob) to |sig|. It returns one on
- * success and zero otherwise. */
-static int ecdsa_sign(const uint8_t* digest, size_t digest_len, uint8_t* sig,
-                      unsigned int* sig_len, EC_KEY* ec_key) {
-    ALOGV("ecdsa_sign(%p, %u, %p)", digest, (unsigned) digest_len, ec_key);
-
-    const char *key_id = ecdsa_get_key_id(ec_key);
-    if (key_id == NULL) {
-        ALOGE("key had no key_id!");
-        return 0;
-    }
-
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
-
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
-        return 0;
-    }
-
-    size_t ecdsa_size = ECDSA_size(ec_key);
-
-    uint8_t* reply = NULL;
-    size_t reply_len;
-    int32_t ret = service->sign(String16(reinterpret_cast<const char*>(key_id)),
-                                digest, digest_len, &reply, &reply_len);
-    if (ret < 0) {
-        ALOGW("There was an error during ecdsa_sign: could not connect");
-        return 0;
-    } else if (ret != 0) {
-        ALOGW("Error during sign from keystore: %d", ret);
-        return 0;
-    } else if (reply_len == 0) {
-        ALOGW("No valid signature returned");
-        free(reply);
-        return 0;
-    } else if (reply_len > ecdsa_size) {
-        ALOGW("Signature is too large");
-        free(reply);
-        return 0;
-    }
-
-    memcpy(sig, reply, reply_len);
-    *sig_len = reply_len;
-
-    ALOGV("ecdsa_sign(%p, %u, %p) => success", digest, (unsigned)digest_len,
-          ec_key);
-    return 1;
-}
-
-const ECDSA_METHOD keystore_ecdsa_method = {
-    {
-     0 /* references */,
-     1 /* is_static */
-    } /* common */,
-    NULL /* app_data */,
-
-    NULL /* init */,
-    NULL /* finish */,
-    NULL /* group_order_size */,
-    ecdsa_sign,
-    NULL /* verify */,
-    ECDSA_FLAG_OPAQUE,
-};
 
 struct EVP_PKEY_Delete {
     void operator()(EVP_PKEY* p) const {
         EVP_PKEY_free(p);
     }
 };
-typedef UniquePtr<EVP_PKEY, EVP_PKEY_Delete> Unique_EVP_PKEY;
+typedef std::unique_ptr<EVP_PKEY, EVP_PKEY_Delete> Unique_EVP_PKEY;
 
 struct RSA_Delete {
     void operator()(RSA* p) const {
         RSA_free(p);
     }
 };
-typedef UniquePtr<RSA, RSA_Delete> Unique_RSA;
+typedef std::unique_ptr<RSA, RSA_Delete> Unique_RSA;
 
 struct EC_KEY_Delete {
     void operator()(EC_KEY* ec) const {
         EC_KEY_free(ec);
     }
 };
-typedef UniquePtr<EC_KEY, EC_KEY_Delete> Unique_EC_KEY;
+typedef std::unique_ptr<EC_KEY, EC_KEY_Delete> Unique_EC_KEY;
 
 /* wrap_rsa returns an |EVP_PKEY| that contains an RSA key where the public
  * part is taken from |public_rsa| and the private operations are forwarded to
@@ -401,35 +357,25 @@ EVP_PKEY* EVP_PKEY_from_keystore(const char* key_id) __attribute__((visibility("
 EVP_PKEY* EVP_PKEY_from_keystore(const char* key_id) {
     ALOGV("EVP_PKEY_from_keystore(\"%s\")", key_id);
 
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
-
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
-        return 0;
-    }
+    ensure_keystore_engine();
 
     uint8_t *pubkey = NULL;
     size_t pubkey_len;
-    int32_t ret = service->get_pubkey(String16(key_id), &pubkey, &pubkey_len);
+    int32_t ret = g_keystore_backend->get_pubkey(key_id, &pubkey, &pubkey_len);
     if (ret < 0) {
         ALOGW("could not contact keystore");
         return NULL;
-    } else if (ret != 0) {
+    } else if (ret != 0 || pubkey == NULL) {
         ALOGW("keystore reports error: %d", ret);
         return NULL;
     }
 
     const uint8_t *inp = pubkey;
     Unique_EVP_PKEY pkey(d2i_PUBKEY(NULL, &inp, pubkey_len));
-    free(pubkey);
     if (pkey.get() == NULL) {
         ALOGW("Cannot convert pubkey");
         return NULL;
     }
-
-    ensure_keystore_engine();
 
     EVP_PKEY *result;
     switch (EVP_PKEY_type(pkey->type)) {
