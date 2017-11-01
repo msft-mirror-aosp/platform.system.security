@@ -31,7 +31,9 @@
 #include "blob.h"
 #include "keystore_utils.h"
 
-UserState::UserState(uid_t userId) : mUserId(userId), mRetry(MAX_RETRY) {
+
+UserState::UserState(uid_t userId) :
+        mUserId(userId), mState(STATE_UNINITIALIZED), mRetry(MAX_RETRY) {
     asprintf(&mUserDir, "user_%u", mUserId);
     asprintf(&mMasterKeyFile, "%s/.masterkey", mUserDir);
 }
@@ -66,8 +68,6 @@ void UserState::setState(State state) {
 void UserState::zeroizeMasterKeysInMemory() {
     memset(mMasterKey, 0, sizeof(mMasterKey));
     memset(mSalt, 0, sizeof(mSalt));
-    memset(&mMasterKeyEncryption, 0, sizeof(mMasterKeyEncryption));
-    memset(&mMasterKeyDecryption, 0, sizeof(mMasterKeyDecryption));
 }
 
 bool UserState::deleteMasterKey() {
@@ -78,22 +78,22 @@ bool UserState::deleteMasterKey() {
 
 ResponseCode UserState::initialize(const android::String8& pw, Entropy* entropy) {
     if (!generateMasterKey(entropy)) {
-        return SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     ResponseCode response = writeMasterKey(pw, entropy);
-    if (response != NO_ERROR) {
+    if (response != ResponseCode::NO_ERROR) {
         return response;
     }
     setupMasterKeys();
-    return ::NO_ERROR;
+    return ResponseCode::NO_ERROR;
 }
 
 ResponseCode UserState::copyMasterKey(UserState* src) {
     if (mState != STATE_UNINITIALIZED) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     if (src->getState() != STATE_NO_ERROR) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     memcpy(mMasterKey, src->mMasterKey, MASTER_KEY_SIZE_BYTES);
     setupMasterKeys();
@@ -106,51 +106,49 @@ ResponseCode UserState::copyMasterKeyFile(UserState* src) {
      */
     int in = TEMP_FAILURE_RETRY(open(src->getMasterKeyFileName(), O_RDONLY));
     if (in < 0) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
-    blob rawBlob;
+    blobv3 rawBlob;
     size_t length = readFully(in, (uint8_t*)&rawBlob, sizeof(rawBlob));
     if (close(in) != 0) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     int out =
         TEMP_FAILURE_RETRY(open(mMasterKeyFile, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IWUSR));
     if (out < 0) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     size_t outLength = writeFully(out, (uint8_t*)&rawBlob, length);
     if (close(out) != 0) {
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     if (outLength != length) {
         ALOGW("blob not fully written %zu != %zu", outLength, length);
         unlink(mMasterKeyFile);
-        return ::SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
-    return ::NO_ERROR;
+    return ResponseCode::NO_ERROR;
 }
 
 ResponseCode UserState::writeMasterKey(const android::String8& pw, Entropy* entropy) {
     uint8_t passwordKey[MASTER_KEY_SIZE_BYTES];
     generateKeyFromPassword(passwordKey, MASTER_KEY_SIZE_BYTES, pw, mSalt);
-    AES_KEY passwordAesKey;
-    AES_set_encrypt_key(passwordKey, MASTER_KEY_SIZE_BITS, &passwordAesKey);
     Blob masterKeyBlob(mMasterKey, sizeof(mMasterKey), mSalt, sizeof(mSalt), TYPE_MASTER_KEY);
-    return masterKeyBlob.writeBlob(mMasterKeyFile, &passwordAesKey, STATE_NO_ERROR, entropy);
+    return masterKeyBlob.writeBlob(mMasterKeyFile, passwordKey, STATE_NO_ERROR, entropy);
 }
 
 ResponseCode UserState::readMasterKey(const android::String8& pw, Entropy* entropy) {
     int in = TEMP_FAILURE_RETRY(open(mMasterKeyFile, O_RDONLY));
     if (in < 0) {
-        return SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
 
     // We read the raw blob to just to get the salt to generate the AES key, then we create the Blob
     // to use with decryptBlob
-    blob rawBlob;
+    blobv3 rawBlob;
     size_t length = readFully(in, (uint8_t*)&rawBlob, sizeof(rawBlob));
     if (close(in) != 0) {
-        return SYSTEM_ERROR;
+        return ResponseCode::SYSTEM_ERROR;
     }
     // find salt at EOF if present, otherwise we have an old file
     uint8_t* salt;
@@ -161,22 +159,20 @@ ResponseCode UserState::readMasterKey(const android::String8& pw, Entropy* entro
     }
     uint8_t passwordKey[MASTER_KEY_SIZE_BYTES];
     generateKeyFromPassword(passwordKey, MASTER_KEY_SIZE_BYTES, pw, salt);
-    AES_KEY passwordAesKey;
-    AES_set_decrypt_key(passwordKey, MASTER_KEY_SIZE_BITS, &passwordAesKey);
     Blob masterKeyBlob(rawBlob);
-    ResponseCode response = masterKeyBlob.readBlob(mMasterKeyFile, &passwordAesKey, STATE_NO_ERROR);
-    if (response == SYSTEM_ERROR) {
+    ResponseCode response = masterKeyBlob.readBlob(mMasterKeyFile, passwordKey, STATE_NO_ERROR);
+    if (response == ResponseCode::SYSTEM_ERROR) {
         return response;
     }
-    if (response == NO_ERROR && masterKeyBlob.getLength() == MASTER_KEY_SIZE_BYTES) {
+    if (response == ResponseCode::NO_ERROR && masterKeyBlob.getLength() == MASTER_KEY_SIZE_BYTES) {
         // If salt was missing, generate one and write a new master key file with the salt.
         if (salt == NULL) {
             if (!generateSalt(entropy)) {
-                return SYSTEM_ERROR;
+                return ResponseCode::SYSTEM_ERROR;
             }
             response = writeMasterKey(pw, entropy);
         }
-        if (response == NO_ERROR) {
+        if (response == ResponseCode::NO_ERROR) {
             memcpy(mMasterKey, masterKeyBlob.getValue(), MASTER_KEY_SIZE_BYTES);
             setupMasterKeys();
         }
@@ -184,20 +180,20 @@ ResponseCode UserState::readMasterKey(const android::String8& pw, Entropy* entro
     }
     if (mRetry <= 0) {
         reset();
-        return UNINITIALIZED;
+        return ResponseCode::UNINITIALIZED;
     }
     --mRetry;
     switch (mRetry) {
     case 0:
-        return WRONG_PASSWORD_0;
+        return ResponseCode::WRONG_PASSWORD_0;
     case 1:
-        return WRONG_PASSWORD_1;
+        return ResponseCode::WRONG_PASSWORD_1;
     case 2:
-        return WRONG_PASSWORD_2;
+        return ResponseCode::WRONG_PASSWORD_2;
     case 3:
-        return WRONG_PASSWORD_3;
+        return ResponseCode::WRONG_PASSWORD_3;
     default:
-        return WRONG_PASSWORD_3;
+        return ResponseCode::WRONG_PASSWORD_3;
     }
 }
 
@@ -256,7 +252,5 @@ bool UserState::generateMasterKey(Entropy* entropy) {
 }
 
 void UserState::setupMasterKeys() {
-    AES_set_encrypt_key(mMasterKey, MASTER_KEY_SIZE_BITS, &mMasterKeyEncryption);
-    AES_set_decrypt_key(mMasterKey, MASTER_KEY_SIZE_BITS, &mMasterKeyDecryption);
     setState(STATE_NO_ERROR);
 }
