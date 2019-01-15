@@ -20,7 +20,7 @@
 #include <sys/types.h>
 #include <vector>
 
-#include <android/security/IKeystoreService.h>
+#include <android/security/keystore/IKeystoreService.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 
@@ -28,7 +28,7 @@
 
 using namespace android;
 using namespace keystore;
-using android::security::IKeystoreService;
+using android::security::keystore::IKeystoreService;
 
 static const char* responses[] = {
     nullptr,
@@ -253,8 +253,6 @@ int main(int argc, char* argv[])
     SINGLE_INT_ARG_INT_RETURN(isEmpty);
 
     // TODO: generate
-
-    SINGLE_ARG_DATA_RETURN(get_pubkey);
 
     // TODO: grant
 
