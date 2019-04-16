@@ -142,12 +142,12 @@ ResponseCode AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len,
     EVP_DecryptUpdate(ctx.get(), out_pos, &out_len, in, len);
     out_pos += out_len;
     if (!EVP_DecryptFinal_ex(ctx.get(), out_pos, &out_len)) {
-        ALOGD("Failed to decrypt blob; ciphertext or tag is likely corrupted");
+        ALOGE("Failed to decrypt blob; ciphertext or tag is likely corrupted");
         return ResponseCode::VALUE_CORRUPTED;
     }
     out_pos += out_len;
     if (out_pos - out_tmp.get() != static_cast<ssize_t>(len)) {
-        ALOGD("Encrypted plaintext is the wrong size, expected %zu, got %zd", len,
+        ALOGE("Encrypted plaintext is the wrong size, expected %zu, got %zd", len,
               out_pos - out_tmp.get());
         return ResponseCode::VALUE_CORRUPTED;
     }
@@ -401,6 +401,7 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
     }
 
     if (fileLength == 0) {
+        LOG(ERROR) << __func__ << " VALUE_CORRUPTED file length == 0";
         return ResponseCode::VALUE_CORRUPTED;
     }
 
@@ -412,7 +413,10 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
         if (state == STATE_UNINITIALIZED) return ResponseCode::UNINITIALIZED;
     }
 
-    if (fileLength < offsetof(blobv3, value)) return ResponseCode::VALUE_CORRUPTED;
+    if (fileLength < offsetof(blobv3, value)) {
+        LOG(ERROR) << __func__ << " VALUE_CORRUPTED blob file too short: " << fileLength;
+        return ResponseCode::VALUE_CORRUPTED;
+    }
 
     if (rawBlob->version == 3) {
         const ssize_t encryptedLength = ntohl(rawBlob->length);
@@ -420,16 +424,33 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
         if (rawBlobIsEncrypted(*rawBlob)) {
             rc = AES_gcm_decrypt(rawBlob->value /* in */, rawBlob->value /* out */, encryptedLength,
                                  aes_key, rawBlob->initialization_vector, rawBlob->aead_tag);
-            if (rc != ResponseCode::NO_ERROR) return rc;
+            if (rc != ResponseCode::NO_ERROR) {
+                // If the blob was superencrypted and decryption failed, it is
+                // almost certain that decryption is failing due to a user's
+                // changed master key.
+                if ((rawBlob->flags & KEYSTORE_FLAG_SUPER_ENCRYPTED) &&
+                    (rc == ResponseCode::VALUE_CORRUPTED)) {
+                    return ResponseCode::KEY_PERMANENTLY_INVALIDATED;
+                }
+                LOG(ERROR) << __func__ << " AES_gcm_decrypt returned: " << uint32_t(rc);
+
+                return rc;
+            }
         }
     } else if (rawBlob->version < 3) {
         blobv2& v2blob = reinterpret_cast<blobv2&>(*rawBlob);
         const size_t headerLength = offsetof(blobv2, encrypted);
         const ssize_t encryptedLength = fileLength - headerLength - v2blob.info;
-        if (encryptedLength < 0) return ResponseCode::VALUE_CORRUPTED;
+        if (encryptedLength < 0) {
+            LOG(ERROR) << __func__ << " VALUE_CORRUPTED v2blob file too short";
+            return ResponseCode::VALUE_CORRUPTED;
+        }
 
         if (rawBlobIsEncrypted(*rawBlob)) {
             if (encryptedLength % AES_BLOCK_SIZE != 0) {
+                LOG(ERROR) << __func__
+                           << " VALUE_CORRUPTED encrypted length is not a multiple"
+                              " of the AES block size";
                 return ResponseCode::VALUE_CORRUPTED;
             }
 
@@ -443,6 +464,7 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
             ssize_t digestedLength = encryptedLength - MD5_DIGEST_LENGTH;
             MD5(v2blob.digested, digestedLength, computedDigest);
             if (memcmp(v2blob.digest, computedDigest, MD5_DIGEST_LENGTH) != 0) {
+                LOG(ERROR) << __func__ << " v2blob MD5 digest mismatch";
                 return ResponseCode::VALUE_CORRUPTED;
             }
         }
@@ -453,6 +475,7 @@ ResponseCode Blob::readBlob(const std::string& filename, const std::vector<uint8
     if (rawBlob->length < 0 || rawBlob->length > maxValueLength ||
         rawBlob->length + rawBlob->info + AES_BLOCK_SIZE >
             static_cast<ssize_t>(sizeof(rawBlob->value))) {
+        LOG(ERROR) << __func__ << " raw blob length is out of bounds";
         return ResponseCode::VALUE_CORRUPTED;
     }
 
