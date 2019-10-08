@@ -42,16 +42,6 @@ namespace {
 
 constexpr size_t kGcmIvSizeBytes = 96 / 8;
 
-template <typename T, void (*FreeFunc)(T*)> struct OpenSslObjectDeleter {
-    void operator()(T* p) { FreeFunc(p); }
-};
-
-#define DEFINE_OPENSSL_OBJECT_POINTER(name)                                                        \
-    typedef OpenSslObjectDeleter<name, name##_free> name##_Delete;                                 \
-    typedef std::unique_ptr<name, name##_Delete> name##_Ptr;
-
-DEFINE_OPENSSL_OBJECT_POINTER(EVP_CIPHER_CTX);
-
 #if defined(__clang__)
 #define OPTNONE __attribute__((optnone))
 #elif defined(__GNUC__)
@@ -92,7 +82,7 @@ ResponseCode AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len,
     // There can be 128-bit and 256-bit keys
     const EVP_CIPHER* cipher = getAesCipherForKey(key);
 
-    EVP_CIPHER_CTX_Ptr ctx(EVP_CIPHER_CTX_new());
+    bssl::UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
 
     EVP_EncryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key.data(), iv);
     EVP_CIPHER_CTX_set_padding(ctx.get(), 0 /* no padding needed with GCM */);
@@ -129,7 +119,7 @@ ResponseCode AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len,
     // There can be 128-bit and 256-bit keys
     const EVP_CIPHER* cipher = getAesCipherForKey(key);
 
-    EVP_CIPHER_CTX_Ptr ctx(EVP_CIPHER_CTX_new());
+    bssl::UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
 
     EVP_DecryptInit_ex(ctx.get(), cipher, nullptr /* engine */, key.data(), iv);
     EVP_CIPHER_CTX_set_padding(ctx.get(), 0 /* no padding needed with GCM */);
@@ -704,10 +694,27 @@ std::string KeyBlobEntry::getCharacteristicsBlobPath() const {
 }
 
 bool KeyBlobEntry::hasKeyBlob() const {
-    return !access(getKeyBlobPath().c_str(), R_OK | W_OK);
+    int trys = 3;
+    while (trys--) {
+        if (!access(getKeyBlobPath().c_str(), R_OK | W_OK)) return true;
+        if (errno == ENOENT) return false;
+        LOG(WARNING) << "access encountered " << strerror(errno) << " (" << errno << ")"
+                     << " while checking for key blob";
+        if (errno != EAGAIN) break;
+    }
+    return false;
 }
+
 bool KeyBlobEntry::hasCharacteristicsBlob() const {
-    return !access(getCharacteristicsBlobPath().c_str(), R_OK | W_OK);
+    int trys = 3;
+    while (trys--) {
+        if (!access(getCharacteristicsBlobPath().c_str(), R_OK | W_OK)) return true;
+        if (errno == ENOENT) return false;
+        LOG(WARNING) << "access encountered " << strerror(errno) << " (" << errno << ")"
+                     << " while checking for key characteristics blob";
+        if (errno != EAGAIN) break;
+    }
+    return false;
 }
 
 static std::tuple<bool, uid_t, std::string> filename2UidAlias(const std::string& filepath) {

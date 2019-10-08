@@ -156,6 +156,7 @@ int main(int argc, char* argv[]) {
     keyStore->initialize();
     android::sp<android::IServiceManager> sm = android::defaultServiceManager();
     android::sp<keystore::KeyStoreService> service = new keystore::KeyStoreService(keyStore);
+    service->setRequestingSid(true);
     android::status_t ret = sm->addService(android::String16("android.security.keystore"), service);
     CHECK(ret == android::OK) << "Couldn't register binder service!";
 
@@ -167,7 +168,7 @@ int main(int argc, char* argv[]) {
     configureRpcThreadpool(1, false /* callerWillJoin */);
     android::sp<IKeystore> wifiKeystoreHalService = new Keystore();
     android::status_t err = wifiKeystoreHalService->registerAsService();
-    CHECK(ret == android::OK) << "Cannot register wifi keystore HAL service: " << err;
+    CHECK(err == android::OK) << "Cannot register wifi keystore HAL service: " << err;
 
     /*
      * This thread is just going to process Binder transactions.
