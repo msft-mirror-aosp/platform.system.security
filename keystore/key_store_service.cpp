@@ -57,6 +57,8 @@ using namespace android;
 namespace {
 
 using ::android::binder::Status;
+using android::hardware::keymaster::V4_0::support::authToken2HidlVec;
+using android::hardware::keymaster::V4_0::support::serializeVerificationToken;
 using android::security::keymaster::ExportResult;
 using android::security::keymaster::KeymasterArguments;
 using android::security::keymaster::KeymasterBlob;
@@ -64,6 +66,7 @@ using android::security::keymaster::KeymasterCertificateChain;
 using android::security::keymaster::operationFailed;
 using android::security::keymaster::OperationResult;
 using ConfirmationResponseCode = android::hardware::confirmationui::V1_0::ResponseCode;
+using ::android::security::keystore::ICredstoreTokenCallback;
 using ::android::security::keystore::IKeystoreOperationResultCallback;
 using ::android::security::keystore::IKeystoreResponseCallback;
 using ::android::security::keystore::KeystoreResponse;
@@ -943,9 +946,9 @@ Status KeyStoreService::addAuthToken(const ::std::vector<uint8_t>& authTokenAsVe
     return Status::ok();
 }
 
-Status KeyStoreService::getAuthTokenForCredstore(int64_t challenge, int64_t secureUserId,
-                                                 int32_t authTokenMaxAgeMillis,
-                                                 std::vector<uint8_t>* _aidl_return) {
+Status KeyStoreService::getTokensForCredstore(int64_t challenge, int64_t secureUserId,
+                                              int32_t authTokenMaxAgeMillis,
+                                              const ::android::sp<ICredstoreTokenCallback>& cb) {
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
     if (callingUid != AID_CREDSTORE) {
         return Status::fromServiceSpecificError(static_cast<int32_t>(0));
@@ -953,29 +956,147 @@ Status KeyStoreService::getAuthTokenForCredstore(int64_t challenge, int64_t secu
 
     auto [err, authToken] = mKeyStore->getAuthTokenTable().FindAuthorizationForCredstore(
         challenge, secureUserId, authTokenMaxAgeMillis);
-    std::vector<uint8_t> ret;
-    if (err == AuthTokenTable::OK) {
-        ret = android::hardware::keymaster::V4_0::support::authToken2HidlVec(authToken);
+    // It's entirely possible we couldn't find an authToken (e.g. no user auth
+    // happened within the requested deadline) and in that case, we just
+    // callback immediately signaling success but just not returning any tokens.
+    if (err != AuthTokenTable::OK) {
+        cb->onFinished(true, {} /* serializedAuthToken */, {} /* serializedVerificationToken */);
+        return Status::ok();
     }
-    *_aidl_return = ret;
+
+    // If we did find an authToken, get a verificationToken as well...
+    //
+    std::vector<uint8_t> serializedAuthToken = authToken2HidlVec(authToken);
+    std::vector<uint8_t> serializedVerificationToken;
+    std::shared_ptr<KeymasterWorker> dev = mKeyStore->getDevice(SecurityLevel::TRUSTED_ENVIRONMENT);
+    if (!dev) {
+        LOG(ERROR) << "Unable to get KM device for SecurityLevel::TRUSTED_ENVIRONMENT";
+        dev = mKeyStore->getDevice(SecurityLevel::SOFTWARE);
+        if (!dev) {
+            LOG(ERROR) << "Unable to get KM device for SecurityLevel::SOFTWARE";
+            cb->onFinished(false, {}, {});
+            return Status::fromServiceSpecificError(static_cast<int32_t>(0));
+        }
+    }
+
+    dev->verifyAuthorization(
+        challenge, {} /* params */, authToken,
+        [serializedAuthToken, cb](KeyStoreServiceReturnCode rc, HardwareAuthToken,
+                                  VerificationToken verificationToken) {
+            if (rc != ErrorCode::OK) {
+                LOG(ERROR) << "verifyAuthorization failed, rc=" << rc;
+                cb->onFinished(false, {}, {});
+                return;
+            }
+            std::optional<std::vector<uint8_t>> serializedVerificationToken =
+                serializeVerificationToken(verificationToken);
+            if (!serializedVerificationToken) {
+                LOG(ERROR) << "Error serializing verificationToken";
+                cb->onFinished(false, {}, {});
+                return;
+            }
+            cb->onFinished(true, serializedAuthToken, serializedVerificationToken.value());
+        });
+
     return Status::ok();
+}
+
+bool isDeviceIdAttestationTag(Tag tag) {
+    switch (tag) {
+    case Tag::ATTESTATION_ID_BRAND:
+    case Tag::ATTESTATION_ID_DEVICE:
+    case Tag::ATTESTATION_ID_MANUFACTURER:
+    case Tag::ATTESTATION_ID_MODEL:
+    case Tag::ATTESTATION_ID_PRODUCT:
+    case Tag::ATTESTATION_ID_IMEI:
+    case Tag::ATTESTATION_ID_MEID:
+    case Tag::ATTESTATION_ID_SERIAL:
+        return true;
+    case Tag::INVALID:
+    case Tag::PURPOSE:
+    case Tag::ALGORITHM:
+    case Tag::KEY_SIZE:
+    case Tag::BLOCK_MODE:
+    case Tag::DIGEST:
+    case Tag::PADDING:
+    case Tag::CALLER_NONCE:
+    case Tag::MIN_MAC_LENGTH:
+    case Tag::EC_CURVE:
+    case Tag::RSA_PUBLIC_EXPONENT:
+    case Tag::INCLUDE_UNIQUE_ID:
+    case Tag::BLOB_USAGE_REQUIREMENTS:
+    case Tag::BOOTLOADER_ONLY:
+    case Tag::ROLLBACK_RESISTANCE:
+    case Tag::HARDWARE_TYPE:
+    case Tag::ACTIVE_DATETIME:
+    case Tag::ORIGINATION_EXPIRE_DATETIME:
+    case Tag::USAGE_EXPIRE_DATETIME:
+    case Tag::MIN_SECONDS_BETWEEN_OPS:
+    case Tag::MAX_USES_PER_BOOT:
+    case Tag::USER_ID:
+    case Tag::USER_SECURE_ID:
+    case Tag::NO_AUTH_REQUIRED:
+    case Tag::USER_AUTH_TYPE:
+    case Tag::AUTH_TIMEOUT:
+    case Tag::ALLOW_WHILE_ON_BODY:
+    case Tag::TRUSTED_USER_PRESENCE_REQUIRED:
+    case Tag::TRUSTED_CONFIRMATION_REQUIRED:
+    case Tag::UNLOCKED_DEVICE_REQUIRED:
+    case Tag::APPLICATION_ID:
+    case Tag::APPLICATION_DATA:
+    case Tag::CREATION_DATETIME:
+    case Tag::ORIGIN:
+    case Tag::ROOT_OF_TRUST:
+    case Tag::OS_VERSION:
+    case Tag::OS_PATCHLEVEL:
+    case Tag::UNIQUE_ID:
+    case Tag::ATTESTATION_CHALLENGE:
+    case Tag::ATTESTATION_APPLICATION_ID:
+    case Tag::VENDOR_PATCHLEVEL:
+    case Tag::BOOT_PATCHLEVEL:
+    case Tag::ASSOCIATED_DATA:
+    case Tag::NONCE:
+    case Tag::MAC_LENGTH:
+    case Tag::RESET_SINCE_ID_ROTATION:
+    case Tag::CONFIRMATION_TOKEN:
+        return false;
+        // no default, all values must be present in the switch, in this way the compiler ensures
+        // that new values added in the Tag enum are also added here.
+    }
+}
+
+// These are attestation id tags that are not unique per device and don't require special permission
+// to be attested. Any addition to this list needs privacy review and approval (PWG).
+bool isDevicePropertyAttestationTag(Tag tag) {
+    switch (tag) {
+    case Tag::ATTESTATION_ID_BRAND:
+    case Tag::ATTESTATION_ID_DEVICE:
+    case Tag::ATTESTATION_ID_MANUFACTURER:
+    case Tag::ATTESTATION_ID_MODEL:
+    case Tag::ATTESTATION_ID_PRODUCT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool isDeviceIdAttestationRequested(const KeymasterArguments& params) {
     const hardware::hidl_vec<KeyParameter>& paramsVec = params.getParameters();
     for (size_t i = 0; i < paramsVec.size(); ++i) {
-        switch (paramsVec[i].tag) {
-        case Tag::ATTESTATION_ID_BRAND:
-        case Tag::ATTESTATION_ID_DEVICE:
-        case Tag::ATTESTATION_ID_MANUFACTURER:
-        case Tag::ATTESTATION_ID_MODEL:
-        case Tag::ATTESTATION_ID_PRODUCT:
-        case Tag::ATTESTATION_ID_IMEI:
-        case Tag::ATTESTATION_ID_MEID:
-        case Tag::ATTESTATION_ID_SERIAL:
+        if (isDeviceIdAttestationTag(paramsVec[i].tag)) {
             return true;
-        default:
-            continue;
+        }
+    }
+    return false;
+}
+
+// Device properties can be attested safely without special permission
+bool needsPermissionToAttestDeviceIds(const KeymasterArguments& params) {
+    const hardware::hidl_vec<KeyParameter>& paramsVec = params.getParameters();
+    for (size_t i = 0; i < paramsVec.size(); ++i) {
+        if (isDeviceIdAttestationTag(paramsVec[i].tag) &&
+            !isDevicePropertyAttestationTag(paramsVec[i].tag)) {
+            return true;
         }
     }
     return false;
@@ -991,7 +1112,7 @@ Status KeyStoreService::attestKey(
 
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
 
-    if (isDeviceIdAttestationRequested(params) && (get_app_id(callingUid) != AID_SYSTEM)) {
+    if (needsPermissionToAttestDeviceIds(params) && (get_app_id(callingUid) != AID_SYSTEM)) {
         return AIDL_RETURN(KeyStoreServiceReturnCode(ErrorCode::INVALID_ARGUMENT));
     }
 
@@ -1055,14 +1176,19 @@ Status KeyStoreService::attestDeviceIds(
     }
 
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
-    sp<IBinder> binder = defaultServiceManager()->getService(String16("permission"));
-    if (binder == nullptr) {
-        return AIDL_RETURN(ErrorCode::CANNOT_ATTEST_IDS);
-    }
-    if (!interface_cast<IPermissionController>(binder)->checkPermission(
-            String16("android.permission.READ_PRIVILEGED_PHONE_STATE"),
-            IPCThreadState::self()->getCallingPid(), callingUid)) {
-        return AIDL_RETURN(ErrorCode::CANNOT_ATTEST_IDS);
+
+    // Request special permission only for unique ids
+    if (needsPermissionToAttestDeviceIds(params)) {
+        sp<IBinder> binder = defaultServiceManager()->getService(String16("permission"));
+        if (binder == nullptr) {
+            return AIDL_RETURN(ErrorCode::CANNOT_ATTEST_IDS);
+        }
+
+        if (!interface_cast<IPermissionController>(binder)->checkPermission(
+                String16("android.permission.READ_PRIVILEGED_PHONE_STATE"),
+                IPCThreadState::self()->getCallingPid(), callingUid)) {
+            return AIDL_RETURN(ErrorCode::CANNOT_ATTEST_IDS);
+        }
     }
 
     AuthorizationSet mutableParams = params.getParameters();
@@ -1322,11 +1448,22 @@ bool KeyStoreService::checkAllowedOperationParams(const hidl_vec<KeyParameter>& 
 }
 
 Status KeyStoreService::onKeyguardVisibilityChanged(bool isShowing, int32_t userId,
-                                                    int32_t* aidl_return) {
+                                                    int32_t* _aidl_return) {
+    if (isShowing) {
+        if (!checkBinderPermission(P_LOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == true but "
+                            "without LOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
+    } else {
+        if (!checkBinderPermission(P_UNLOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == false but "
+                            "without UNLOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
+    }
     mKeyStore->getEnforcementPolicy().set_device_locked(isShowing, userId);
-    *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
-
-    return Status::ok();
+    return AIDL_RETURN(ResponseCode::NO_ERROR);
 }
 
 }  // namespace keystore
