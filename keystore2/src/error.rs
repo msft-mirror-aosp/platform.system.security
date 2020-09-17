@@ -31,35 +31,18 @@
 //! context should be added every time an error is forwarded.
 
 use std::cmp::PartialEq;
-use std::convert::From;
 
-use keystore_aidl_generated as aidl;
-use keystore_aidl_generated::ResponseCode as AidlRc;
+pub use android_hardware_keymint::aidl::android::hardware::keymint::ErrorCode as Ec;
+pub use android_security_keystore2::aidl::android::security::keystore2::ResponseCode as Rc;
+
+use android_hardware_keymint::aidl::android::hardware::keymint::ErrorCode::ErrorCode;
+use android_security_keystore2::aidl::android::security::keystore2::ResponseCode::ResponseCode;
 
 use keystore2_selinux as selinux;
 
-pub use aidl::ResponseCode;
-
-/// AidlResult wraps the `android.security.keystore2.Result` generated from AIDL
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AidlResult(aidl::Result);
-
-impl AidlResult {
-    /// Creates an instance of AidlResult indicating no error has occurred.
-    pub fn ok() -> Self {
-        Self(aidl::Result { rc: AidlRc::Ok, km_error_code: 0 })
-    }
-
-    /// Creates an instance of AidlResult indicating the given ResponseCode.
-    pub fn rc(rc: AidlRc) -> Self {
-        Self(aidl::Result { rc, km_error_code: 0 })
-    }
-
-    /// Creates an instance of AidlResult indicating the given KM ErrorCode.
-    pub fn ec(ec: aidl::ErrorCode) -> Self {
-        Self(aidl::Result { rc: AidlRc::KeymintErrorCode, km_error_code: ec })
-    }
-}
+use android_security_keystore2::binder::{
+    ExceptionCode, Result as BinderResult, Status as BinderStatus,
+};
 
 /// This is the main Keystore error type. It wraps the Keystore `ResponseCode` generated
 /// from AIDL in the `Rc` variant and Keymint `ErrorCode` in the Km variant.
@@ -67,36 +50,55 @@ impl AidlResult {
 pub enum Error {
     /// Wraps a Keystore `ResponseCode` as defined by the Keystore AIDL interface specification.
     #[error("Error::Rc({0:?})")]
-    Rc(AidlRc),
+    Rc(ResponseCode),
     /// Wraps a Keymint `ErrorCode` as defined by the Keymint AIDL interface specification.
     #[error("Error::Km({0:?})")]
-    Km(aidl::ErrorCode), // TODO Keymint ErrorCode is a generated AIDL type.
+    Km(ErrorCode),
+    /// Wraps a Binder exception code other than a service specific exception.
+    #[error("Binder exception code {0:?}, {1:?}")]
+    Binder(ExceptionCode, i32),
 }
 
 impl Error {
     /// Short hand for `Error::Rc(ResponseCode::SystemError)`
     pub fn sys() -> Self {
-        Error::Rc(AidlRc::SystemError)
+        Error::Rc(Rc::SystemError)
     }
 
     /// Short hand for `Error::Rc(ResponseCode::PermissionDenied`
     pub fn perm() -> Self {
-        Error::Rc(AidlRc::PermissionDenied)
+        Error::Rc(Rc::PermissionDenied)
     }
 }
 
-impl From<anyhow::Error> for AidlResult {
-    fn from(error: anyhow::Error) -> Self {
-        let root_cause = error.root_cause();
-        match root_cause.downcast_ref::<Error>() {
-            Some(Error::Rc(rcode)) => AidlResult::rc(*rcode),
-            Some(Error::Km(ec)) => AidlResult::ec(*ec),
-            None => match root_cause.downcast_ref::<selinux::Error>() {
-                Some(selinux::Error::PermissionDenied) => AidlResult::rc(AidlRc::PermissionDenied),
-                _ => AidlResult::rc(AidlRc::SystemError),
-            },
+/// Helper function to map the binder status we get from calls into KeyMint
+/// to a Keystore Error. We don't create an anyhow error here to make
+/// it easier to evaluate KeyMint errors, which we must do in some cases, e.g.,
+/// when diagnosing authentication requirements, update requirements, and running
+/// out of operation slots.
+pub fn map_km_error<T>(r: BinderResult<T>) -> Result<T, Error> {
+    r.map_err(|s| {
+        match s.exception_code() {
+            ExceptionCode::SERVICE_SPECIFIC => {
+                let se = s.service_specific_error();
+                if se < 0 {
+                    // Negative service specific errors are KM error codes.
+                    Error::Km(s.service_specific_error())
+                } else {
+                    // Non negative error codes cannot be KM error codes.
+                    // So we create an `Error::Binder` variant to preserve
+                    // the service specific error code for logging.
+                    // `map_or_log_err` will map this on a system error,
+                    // but not before logging the details to logcat.
+                    Error::Binder(ExceptionCode::SERVICE_SPECIFIC, se)
+                }
+            }
+            // We create `Error::Binder` to preserve the exception code
+            // for logging.
+            // `map_or_log_err` will map this on a system error.
+            e_code => Error::Binder(e_code, 0),
         }
-    }
+    })
 }
 
 /// This function should be used by Keystore service calls to translate error conditions
@@ -129,32 +131,46 @@ impl From<anyhow::Error> for AidlResult {
 ///
 /// aidl_result_ = map_or_log_err(loadKey(), |r| { some_side_effect(); AidlResult::rc(r) });
 /// ```
-pub fn map_or_log_err<T>(
-    result: anyhow::Result<T>,
-    handle_ok: impl FnOnce(T) -> AidlResult,
-) -> AidlResult {
+pub fn map_or_log_err<T, U, F>(result: anyhow::Result<U>, handle_ok: F) -> BinderResult<T>
+where
+    F: FnOnce(U) -> BinderResult<T>,
+{
     result.map_or_else(
         |e| {
             log::error!("{:?}", e);
-            e.into()
+            let root_cause = e.root_cause();
+            let rc = match root_cause.downcast_ref::<Error>() {
+                Some(Error::Rc(rcode)) => *rcode,
+                Some(Error::Km(ec)) => *ec,
+                // If an Error::Binder reaches this stage we report a system error.
+                // The exception code and possible service specific error will be
+                // printed in the error log above.
+                Some(Error::Binder(_, _)) => Rc::SystemError,
+                None => match root_cause.downcast_ref::<selinux::Error>() {
+                    Some(selinux::Error::PermissionDenied) => Rc::PermissionDenied,
+                    _ => Rc::SystemError,
+                },
+            };
+            Err(BinderStatus::new_service_specific_error(rc, None))
         },
         handle_ok,
     )
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
+    use super::*;
+    use android_security_keystore2::binder::{
+        ExceptionCode, Result as BinderResult, Status as BinderStatus,
+    };
     use anyhow::{anyhow, Context};
 
-    use super::aidl::ErrorCode;
-    use super::*;
-
-    fn nested_nested_rc(rc: AidlRc) -> anyhow::Result<()> {
+    fn nested_nested_rc(rc: ResponseCode) -> anyhow::Result<()> {
         Err(anyhow!(Error::Rc(rc))).context("nested nested rc")
     }
 
-    fn nested_rc(rc: AidlRc) -> anyhow::Result<()> {
+    fn nested_rc(rc: ResponseCode) -> anyhow::Result<()> {
         nested_nested_rc(rc).context("nested rc")
     }
 
@@ -166,11 +182,11 @@ mod tests {
         nested_nested_ec(ec).context("nested ec")
     }
 
-    fn nested_nested_ok(rc: AidlRc) -> anyhow::Result<AidlRc> {
+    fn nested_nested_ok(rc: ResponseCode) -> anyhow::Result<ResponseCode> {
         Ok(rc)
     }
 
-    fn nested_ok(rc: AidlRc) -> anyhow::Result<AidlRc> {
+    fn nested_ok(rc: ResponseCode) -> anyhow::Result<ResponseCode> {
         nested_nested_ok(rc).context("nested ok")
     }
 
@@ -196,6 +212,14 @@ mod tests {
         nested_nested_other_error().context("nested other error")
     }
 
+    fn binder_sse_error(sse: i32) -> BinderResult<()> {
+        Err(BinderStatus::new_service_specific_error(sse, None))
+    }
+
+    fn binder_exception(ex: ExceptionCode) -> BinderResult<()> {
+        Err(BinderStatus::new_exception(ex, None))
+    }
+
     #[test]
     fn keystore_error_test() -> anyhow::Result<(), String> {
         android_logger::init_once(
@@ -203,85 +227,101 @@ mod tests {
                 .with_tag("keystore_error_tests")
                 .with_min_level(log::Level::Debug),
         );
-        // All Error::Rc(x) get mapped on aidl::Result{x, 0}
+        // All Error::Rc(x) get mapped on a service specific error
+        // code of x.
+        for rc in Rc::Ok..Rc::BackendBusy {
+            assert_eq!(
+                Result::<(), i32>::Err(rc),
+                map_or_log_err(nested_rc(rc), |_| Err(BinderStatus::ok()))
+                    .map_err(|s| s.service_specific_error())
+            );
+        }
+
+        // All Keystore Error::Km(x) get mapped on a service
+        // specific error of x.
+        for ec in Ec::UNKNOWN_ERROR..Ec::ROOT_OF_TRUST_ALREADY_SET {
+            assert_eq!(
+                Result::<(), i32>::Err(ec),
+                map_or_log_err(nested_ec(ec), |_| Err(BinderStatus::ok()))
+                    .map_err(|s| s.service_specific_error())
+            );
+        }
+
+        // All Keymint errors x received through a Binder Result get mapped on
+        // a service specific error of x.
+        for ec in Ec::UNKNOWN_ERROR..Ec::ROOT_OF_TRUST_ALREADY_SET {
+            assert_eq!(
+                Result::<(), i32>::Err(ec),
+                map_or_log_err(
+                    map_km_error(binder_sse_error(ec))
+                        .with_context(|| format!("Km error code: {}.", ec)),
+                    |_| Err(BinderStatus::ok())
+                )
+                .map_err(|s| s.service_specific_error())
+            );
+        }
+
+        // map_km_error creates an Error::Binder variant storing
+        // ExceptionCode::SERVICE_SPECIFIC and the given
+        // service specific error.
+        let sse = map_km_error(binder_sse_error(1));
+        assert_eq!(Err(Error::Binder(ExceptionCode::SERVICE_SPECIFIC, 1)), sse);
+        // map_or_log_err then maps it on a service specific error of Rc::SystemError.
         assert_eq!(
-            AidlResult::rc(AidlRc::Ok),
-            map_or_log_err(nested_rc(AidlRc::Ok), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::Locked),
-            map_or_log_err(nested_rc(AidlRc::Locked), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::Uninitialized),
-            map_or_log_err(nested_rc(AidlRc::Uninitialized), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::SystemError),
-            map_or_log_err(nested_rc(AidlRc::SystemError), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::PermissionDenied),
-            map_or_log_err(nested_rc(AidlRc::PermissionDenied), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::KeyNotFound),
-            map_or_log_err(nested_rc(AidlRc::KeyNotFound), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::ValueCorrupted),
-            map_or_log_err(nested_rc(AidlRc::ValueCorrupted), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::WrongPassword),
-            map_or_log_err(nested_rc(AidlRc::WrongPassword), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::OpAuthNeeded),
-            map_or_log_err(nested_rc(AidlRc::OpAuthNeeded), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::KeyPermanentlyInvalidated),
-            map_or_log_err(nested_rc(AidlRc::KeyPermanentlyInvalidated), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::NoSuchSecurityLevel),
-            map_or_log_err(nested_rc(AidlRc::NoSuchSecurityLevel), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::KeymintErrorCode),
-            map_or_log_err(nested_rc(AidlRc::KeymintErrorCode), |_| AidlResult::ec(0))
-        );
-        assert_eq!(
-            AidlResult::rc(AidlRc::BackendBusy),
-            map_or_log_err(nested_rc(AidlRc::BackendBusy), |_| AidlResult::ec(0))
+            Result::<(), i32>::Err(Rc::SystemError),
+            map_or_log_err(sse.context("Non negative service specific error."), |_| Err(
+                BinderStatus::ok()
+            ))
+            .map_err(|s| s.service_specific_error())
         );
 
-        // All KeystoreKerror::Km(x) get mapped on
-        // aidl::Result{AidlRc::KeymintErrorCode, x}
+        // map_km_error creates a Error::Binder variant storing the given exception code.
+        let binder_exception = map_km_error(binder_exception(ExceptionCode::TRANSACTION_FAILED));
+        assert_eq!(Err(Error::Binder(ExceptionCode::TRANSACTION_FAILED, 0)), binder_exception);
+        // map_or_log_err then maps it on a service specific error of Rc::SystemError.
         assert_eq!(
-            AidlResult::ec(-7),
-            map_or_log_err(nested_ec(-7), |_| AidlResult::rc(AidlRc::SystemError))
+            Result::<(), i32>::Err(Rc::SystemError),
+            map_or_log_err(binder_exception.context("Binder Exception."), |_| Err(
+                BinderStatus::ok()
+            ))
+            .map_err(|s| s.service_specific_error())
         );
 
-        // All other get mapped on System Error.
+        // selinux::Error::Perm() needs to be mapped to Rc::PermissionDenied
         assert_eq!(
-            AidlResult::rc(AidlRc::SystemError),
-            map_or_log_err(nested_other_error(), |_| AidlResult::ec(0))
+            Result::<(), i32>::Err(Rc::PermissionDenied),
+            map_or_log_err(nested_selinux_perm(), |_| Err(BinderStatus::ok()))
+                .map_err(|s| s.service_specific_error())
+        );
+
+        // All other errors get mapped on System Error.
+        assert_eq!(
+            Result::<(), i32>::Err(Rc::SystemError),
+            map_or_log_err(nested_other_error(), |_| Err(BinderStatus::ok()))
+                .map_err(|s| s.service_specific_error())
         );
 
         // Result::Ok variants get passed to the ok handler.
-        assert_eq!(
-            AidlResult::rc(AidlRc::OpAuthNeeded),
-            map_or_log_err(nested_ok(AidlRc::OpAuthNeeded), AidlResult::rc)
-        );
-        assert_eq!(AidlResult::ok(), map_or_log_err(nested_ok(AidlRc::Ok), AidlResult::rc));
+        assert_eq!(Ok(Rc::OpAuthNeeded), map_or_log_err(nested_ok(Rc::OpAuthNeeded), Ok));
+        assert_eq!(Ok(Rc::Ok), map_or_log_err(nested_ok(Rc::Ok), Ok));
 
-        // selinux::Error::Perm() needs to be mapped to AidlRc::PermissionDenied
-        assert_eq!(
-            AidlResult::rc(AidlRc::PermissionDenied),
-            map_or_log_err(nested_selinux_perm(), |_| AidlResult::ec(0))
-        );
         Ok(())
+    }
+
+    //Helper function to test whether error cases are handled as expected.
+    pub fn check_result_contains_error_string<T>(
+        result: anyhow::Result<T>,
+        expected_error_string: &str,
+    ) {
+        let error_str = format!(
+            "{:#?}",
+            result.err().unwrap_or_else(|| panic!("Expected the error: {}", expected_error_string))
+        );
+        assert!(
+            error_str.contains(expected_error_string),
+            "The string \"{}\" should contain \"{}\"",
+            error_str,
+            expected_error_string
+        );
     }
 } // mod tests
