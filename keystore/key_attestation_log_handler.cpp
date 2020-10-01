@@ -13,17 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#ifndef KEYSTORE_KEY_PROTO_HANDLER_H_
-#define KEYSTORE_KEY_PROTO_HANDLER_H_
-
-#include <keystore/keystore_hidl_support.h>
-
+#include <statslog.h>
 namespace keystore {
 
-void uploadKeyCharacteristicsAsProto(const hidl_vec<KeyParameter>& keyParams,
-                                     bool wasCreationSuccessful);
+void logKeystoreKeyAttestationEvent(bool wasSuccessful, int32_t errorCode) {
+    android::util::stats_write(android::util::KEYSTORE_KEY_EVENT_REPORTED,
+                               android::util::KEYSTORE_KEY_EVENT_REPORTED__TYPE__KEY_ATTESTATION,
+                               wasSuccessful, errorCode);
+}
 
 }  // namespace keystore
-
-#endif  // KEYSTORE_KEY_PROTO_HANDLER_H_
