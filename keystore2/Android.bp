@@ -1,0 +1,83 @@
+// Copyright 2020, The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+rust_library {
+    name: "libkeystore2",
+    crate_name: "keystore2",
+    srcs: ["src/lib.rs"],
+
+    rustlibs: [
+        "libandroid_hardware_keymint",
+        "libandroid_security_keystore2",
+        "libanyhow",
+        "libbinder_rs",
+        "libkeystore2_selinux",
+        "liblazy_static",
+        "liblibsqlite3_sys",
+        "liblog_rust",
+        "librand",
+        "librusqlite",
+        "libthiserror",
+    ],
+}
+
+rust_test {
+    name: "keystore2_test",
+    crate_name: "keystore2",
+    srcs: ["src/lib.rs"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    rustlibs: [
+        "libandroid_logger",
+        "libandroid_hardware_keymint",
+        "libandroid_security_keystore2",
+        "libanyhow",
+        "libbinder_rs",
+        "libkeystore2_selinux",
+        "liblazy_static",
+        "liblibsqlite3_sys",
+        "liblog_rust",
+        "librusqlite",
+        "libthiserror",
+    ],
+}
+
+// This is a placeholder for the libraries that will be generated from the AIDL specs
+// eventually.
+rust_library {
+    name: "libandroid_hardware_keymint",
+    crate_name: "android_hardware_keymint",
+
+    srcs: ["src/android_hardware_keymint.rs"],
+
+    rustlibs: [
+        "libbinder_rs",
+        "liblazy_static",
+    ],
+}
+
+// This is a placeholder for the libraries that will be generated from the AIDL specs
+// eventually.
+rust_library {
+    name: "libandroid_security_keystore2",
+    crate_name: "android_security_keystore2",
+
+    srcs: ["src/android_security_keystore2.rs"],
+
+    rustlibs: [
+        "libandroid_hardware_keymint",
+        "libbinder_rs",
+        "liblazy_static",
+    ],
+}
