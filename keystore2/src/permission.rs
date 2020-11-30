@@ -18,9 +18,9 @@
 //! It also provides KeystorePerm and KeyPerm as convenience wrappers for the SELinux permission
 //! defined by keystore2 and keystore2_key respectively.
 
-use android_security_keystore2::aidl::android::security::keystore2::KeyPermission;
-
-use android_security_keystore2::aidl::android::security::keystore2::KeyDescriptor::KeyDescriptor;
+use android_system_keystore2::aidl::android::system::keystore2::{
+    Domain::Domain, KeyDescriptor::KeyDescriptor, KeyPermission::KeyPermission,
+};
 
 use std::cmp::PartialEq;
 use std::convert::From;
@@ -137,10 +137,10 @@ macro_rules! implement_permission_aidl {
     =>
     {
         $(#[$m])*
-        pub struct $name(pub $aidl_name::$aidl_name);
+        pub struct $name(pub $aidl_name);
 
-        impl From<$aidl_name::$aidl_name> for $name {
-            fn from (p: $aidl_name::$aidl_name) -> Self {
+        impl From<$aidl_name> for $name {
+            fn from (p: $aidl_name) -> Self {
                 match p {
                     $aidl_name::$def_name => Self($aidl_name::$def_name),
                     $($aidl_name::$element_name => Self($aidl_name::$element_name),)*
@@ -149,8 +149,8 @@ macro_rules! implement_permission_aidl {
             }
         }
 
-        impl Into<$aidl_name::$aidl_name> for $name {
-            fn into(self) -> $aidl_name::$aidl_name {
+        impl Into<$aidl_name> for $name {
+            fn into(self) -> $aidl_name {
                 self.0
             }
         }
@@ -192,18 +192,17 @@ implement_permission_aidl!(
     ///                       KeyPerm::get_info().to_selinux());
     /// ```
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    KeyPerm from KeyPermission with default (None, none) {
-        Delete,         selinux name: delete;
-        GenUniqueId,    selinux name: gen_unique_id;
-        GetInfo,        selinux name: get_info;
-        Grant,          selinux name: grant;
-        List,           selinux name: list;
-        ManageBlob,     selinux name: manage_blob;
-        Rebind,         selinux name: rebind;
-        ReqForcedOp,    selinux name: req_forced_op;
-        Update,         selinux name: update;
-        Use,            selinux name: use;
-        UseDevId,       selinux name: use_dev_id;
+    KeyPerm from KeyPermission with default (NONE, none) {
+        DELETE,         selinux name: delete;
+        GEN_UNIQUE_ID,  selinux name: gen_unique_id;
+        GET_INFO,       selinux name: get_info;
+        GRANT,          selinux name: grant;
+        MANAGE_BLOB,    selinux name: manage_blob;
+        REBIND,         selinux name: rebind;
+        REQ_FORCED_OP,  selinux name: req_forced_op;
+        UPDATE,         selinux name: update;
+        USE,            selinux name: use;
+        USE_DEV_ID,     selinux name: use_dev_id;
     }
 );
 
@@ -294,12 +293,15 @@ implement_permission!(
         ClearNs = 2,    selinux name: clear_ns;
         /// Checked when Keystore 2.0 gets locked.
         GetState = 4,   selinux name: get_state;
+        /// Checked when Keystore 2.0 is asked to list a namespace that the caller
+        /// does not have the get_info permission for.
+        List = 8,       selinux name: list;
         /// Checked when Keystore 2.0 gets locked.
-        Lock = 8,       selinux name: lock;
+        Lock = 0x10,       selinux name: lock;
         /// Checked when Keystore 2.0 shall be reset.
-        Reset = 0x10,   selinux name: reset;
+        Reset = 0x20,   selinux name: reset;
         /// Checked when Keystore 2.0 shall be unlocked.
-        Unlock = 0x20,  selinux name: unlock;
+        Unlock = 0x40,  selinux name: unlock;
     }
 );
 
@@ -354,7 +356,7 @@ mod perm {
                 let p = self.vec.0 & (1 << self.pos);
                 self.pos += 1;
                 if p != 0 {
-                    return Some(KeyPerm::from(p));
+                    return Some(KeyPerm::from(KeyPermission(p)));
                 }
             }
         }
@@ -363,7 +365,7 @@ mod perm {
 
 impl From<KeyPerm> for KeyPermSet {
     fn from(p: KeyPerm) -> Self {
-        Self(p.0 as i32)
+        Self((p.0).0 as i32)
     }
 }
 
@@ -398,7 +400,7 @@ impl KeyPermSet {
 macro_rules! key_perm_set {
     () => { KeyPermSet(0) };
     ($head:expr $(, $tail:expr)* $(,)?) => {
-        KeyPermSet($head.0 as i32 $(| $tail.0 as i32)*)
+        KeyPermSet(($head.0).0 $(| ($tail.0).0)*)
     };
 }
 
@@ -427,8 +429,8 @@ pub fn check_keystore_permission(caller_ctx: &CStr, perm: KeystorePerm) -> anyho
 /// Attempts to grant the grant permission are always denied.
 ///
 /// The only viable target domains are
-///  * `Domain::App` in which case u:r:keystore:s0 is used as target context and
-///  * `Domain::SELinux` in which case the `key.namespace_` parameter is looked up in
+///  * `Domain::APP` in which case u:r:keystore:s0 is used as target context and
+///  * `Domain::SELINUX` in which case the `key.nspace` parameter is looked up in
 ///                      SELinux keystore key backend, and the result is used
 ///                      as target context.
 pub fn check_grant_permission(
@@ -436,12 +438,10 @@ pub fn check_grant_permission(
     access_vec: KeyPermSet,
     key: &KeyDescriptor,
 ) -> anyhow::Result<()> {
-    use android_security_keystore2::aidl::android::security::keystore2::Domain;
-
     let target_context = match key.domain {
-        Domain::App => getcon().context("check_grant_permission: getcon failed.")?,
-        Domain::SELinux => lookup_keystore2_key_context(key.namespace_)
-            .context("check_grant_permission: Domain::SELinux: Failed to lookup namespace.")?,
+        Domain::APP => getcon().context("check_grant_permission: getcon failed.")?,
+        Domain::SELINUX => lookup_keystore2_key_context(key.nspace)
+            .context("check_grant_permission: Domain::SELINUX: Failed to lookup namespace.")?,
         _ => return Err(KsError::sys()).context(format!("Cannot grant {:?}.", key.domain)),
     };
 
@@ -467,19 +467,19 @@ pub fn check_grant_permission(
 /// descriptor `key` in the security class `keystore2_key`.
 ///
 /// The behavior differs slightly depending on the selected target domain:
-///  * `Domain::App` u:r:keystore:s0 is used as target context.
-///  * `Domain::SELinux` `key.namespace_` parameter is looked up in the SELinux keystore key
+///  * `Domain::APP` u:r:keystore:s0 is used as target context.
+///  * `Domain::SELINUX` `key.nspace` parameter is looked up in the SELinux keystore key
 ///                      backend, and the result is used as target context.
-///  * `Domain::Blob` Same as SELinux but the "manage_blob" permission is always checked additionally
+///  * `Domain::BLOB` Same as SELinux but the "manage_blob" permission is always checked additionally
 ///                   to the one supplied in `perm`.
-///  * `Domain::Grant` Does not use selinux::check_access. Instead the `access_vector`
+///  * `Domain::GRANT` Does not use selinux::check_access. Instead the `access_vector`
 ///                    parameter is queried for permission, which must be supplied in this case.
 ///
 /// ## Return values.
 ///  * Ok(()) If the requested permissions were granted.
 ///  * Err(selinux::Error::perm()) If the requested permissions were denied.
-///  * Err(KsError::sys()) This error is produced if `Domain::Grant` is selected but no `access_vec`
-///                      was supplied. It is also produced if `Domain::KeyId` was selected, and
+///  * Err(KsError::sys()) This error is produced if `Domain::GRANT` is selected but no `access_vec`
+///                      was supplied. It is also produced if `Domain::KEY_ID` was selected, and
 ///                      on various unexpected backend failures.
 pub fn check_key_permission(
     caller_ctx: &CStr,
@@ -487,14 +487,12 @@ pub fn check_key_permission(
     key: &KeyDescriptor,
     access_vector: &Option<KeyPermSet>,
 ) -> anyhow::Result<()> {
-    use android_security_keystore2::aidl::android::security::keystore2::Domain;
-
     let target_context = match key.domain {
         // apps get the default keystore context
-        Domain::App => getcon().context("check_key_permission: getcon failed.")?,
-        Domain::SELinux => lookup_keystore2_key_context(key.namespace_)
-            .context("check_key_permission: Domain::SELinux: Failed to lookup namespace.")?,
-        Domain::Grant => {
+        Domain::APP => getcon().context("check_key_permission: getcon failed.")?,
+        Domain::SELINUX => lookup_keystore2_key_context(key.nspace)
+            .context("check_key_permission: Domain::SELINUX: Failed to lookup namespace.")?,
+        Domain::GRANT => {
             match access_vector {
                 Some(pv) => {
                     if pv.includes(perm) {
@@ -507,20 +505,20 @@ pub fn check_key_permission(
                 None => {
                     // If DOMAIN_GRANT was selected an access vector must be supplied.
                     return Err(KsError::sys()).context(
-                        "Cannot check permission for Domain::Grant without access vector.",
+                        "Cannot check permission for Domain::GRANT without access vector.",
                     );
                 }
             }
         }
-        Domain::KeyId => {
-            // We should never be called with `Domain::KeyId. The database
-            // lookup should have converted this into one of `Domain::App`
-            // or `Domain::SELinux`.
-            return Err(KsError::sys()).context("Cannot check permission for Domain::KeyId.");
+        Domain::KEY_ID => {
+            // We should never be called with `Domain::KEY_ID. The database
+            // lookup should have converted this into one of `Domain::APP`
+            // or `Domain::SELINUX`.
+            return Err(KsError::sys()).context("Cannot check permission for Domain::KEY_ID.");
         }
-        Domain::Blob => {
-            let tctx = lookup_keystore2_key_context(key.namespace_)
-                .context("Domain::Blob: Failed to lookup namespace.")?;
+        Domain::BLOB => {
+            let tctx = lookup_keystore2_key_context(key.nspace)
+                .context("Domain::BLOB: Failed to lookup namespace.")?;
             // If DOMAIN_KEY_BLOB was specified, we check for the "manage_blob"
             // permission in addition to the requested permission.
             selinux::check_access(
@@ -534,7 +532,7 @@ pub fn check_key_permission(
         }
         _ => {
             return Err(KsError::sys())
-                .context(format!("Unknown domain value: \"{}\".", key.domain))
+                .context(format!("Unknown domain value: \"{:?}\".", key.domain))
         }
     };
 
@@ -556,7 +554,6 @@ mod tests {
         KeyPerm::gen_unique_id(),
         KeyPerm::grant(),
         KeyPerm::get_info(),
-        KeyPerm::list(),
         KeyPerm::rebind(),
         KeyPerm::update(),
         KeyPerm::use_(),
@@ -570,7 +567,6 @@ mod tests {
         KeyPerm::gen_unique_id(),
         // No KeyPerm::grant()
         KeyPerm::get_info(),
-        KeyPerm::list(),
         KeyPerm::rebind(),
         KeyPerm::update(),
         KeyPerm::use_(),
@@ -579,7 +575,6 @@ mod tests {
     const UNPRIV_PERMS: KeyPermSet = key_perm_set![
         KeyPerm::delete(),
         KeyPerm::get_info(),
-        KeyPerm::list(),
         KeyPerm::rebind(),
         KeyPerm::update(),
         KeyPerm::use_(),
@@ -632,6 +627,7 @@ mod tests {
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::add_auth()).is_ok());
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::clear_ns()).is_ok());
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::get_state()).is_ok());
+        assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::list()).is_ok());
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::lock()).is_ok());
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::reset()).is_ok());
         assert!(check_keystore_permission(&system_server_ctx, KeystorePerm::unlock()).is_ok());
@@ -639,6 +635,7 @@ mod tests {
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::add_auth()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::clear_ns()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::get_state()));
+        assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::list()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::lock()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::reset()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::unlock()));
@@ -649,8 +646,7 @@ mod tests {
     fn check_grant_permission_app() -> Result<()> {
         let system_server_ctx = Context::new("u:r:system_server:s0")?;
         let shell_ctx = Context::new("u:r:shell:s0")?;
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
-        let key = KeyDescriptor { domain: Domain::App, namespace_: 0, alias: None, blob: None };
+        let key = KeyDescriptor { domain: Domain::APP, nspace: 0, alias: None, blob: None };
         assert!(check_grant_permission(&system_server_ctx, NOT_GRANT_PERMS, &key).is_ok());
         // attempts to grant the grant permission must always fail even when privileged.
 
@@ -666,11 +662,10 @@ mod tests {
 
     #[test]
     fn check_grant_permission_selinux() -> Result<()> {
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
         let (sctx, namespace, is_su) = check_context()?;
         let key = KeyDescriptor {
-            domain: Domain::SELinux,
-            namespace_: namespace as i64,
+            domain: Domain::SELINUX,
+            nspace: namespace as i64,
             alias: None,
             blob: None,
         };
@@ -687,8 +682,7 @@ mod tests {
 
     #[test]
     fn check_key_permission_domain_grant() -> Result<()> {
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
-        let key = KeyDescriptor { domain: Domain::Grant, namespace_: 0, alias: None, blob: None };
+        let key = KeyDescriptor { domain: Domain::GRANT, nspace: 0, alias: None, blob: None };
 
         assert_perm_failed!(check_key_permission(
             &selinux::Context::new("ignored").unwrap(),
@@ -710,15 +704,13 @@ mod tests {
         let system_server_ctx = Context::new("u:r:system_server:s0")?;
         let shell_ctx = Context::new("u:r:shell:s0")?;
         let gmscore_app = Context::new("u:r:gmscore_app:s0")?;
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
 
-        let key = KeyDescriptor { domain: Domain::App, namespace_: 0, alias: None, blob: None };
+        let key = KeyDescriptor { domain: Domain::APP, nspace: 0, alias: None, blob: None };
 
         assert!(check_key_permission(&system_server_ctx, KeyPerm::use_(), &key, &None).is_ok());
         assert!(check_key_permission(&system_server_ctx, KeyPerm::delete(), &key, &None).is_ok());
         assert!(check_key_permission(&system_server_ctx, KeyPerm::get_info(), &key, &None).is_ok());
         assert!(check_key_permission(&system_server_ctx, KeyPerm::rebind(), &key, &None).is_ok());
-        assert!(check_key_permission(&system_server_ctx, KeyPerm::list(), &key, &None).is_ok());
         assert!(check_key_permission(&system_server_ctx, KeyPerm::update(), &key, &None).is_ok());
         assert!(check_key_permission(&system_server_ctx, KeyPerm::grant(), &key, &None).is_ok());
         assert!(
@@ -730,7 +722,6 @@ mod tests {
         assert!(check_key_permission(&shell_ctx, KeyPerm::delete(), &key, &None).is_ok());
         assert!(check_key_permission(&shell_ctx, KeyPerm::get_info(), &key, &None).is_ok());
         assert!(check_key_permission(&shell_ctx, KeyPerm::rebind(), &key, &None).is_ok());
-        assert!(check_key_permission(&shell_ctx, KeyPerm::list(), &key, &None).is_ok());
         assert!(check_key_permission(&shell_ctx, KeyPerm::update(), &key, &None).is_ok());
         assert_perm_failed!(check_key_permission(&shell_ctx, KeyPerm::grant(), &key, &None));
         assert_perm_failed!(check_key_permission(
@@ -753,11 +744,10 @@ mod tests {
 
     #[test]
     fn check_key_permission_domain_selinux() -> Result<()> {
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
         let (sctx, namespace, is_su) = check_context()?;
         let key = KeyDescriptor {
-            domain: Domain::SELinux,
-            namespace_: namespace as i64,
+            domain: Domain::SELINUX,
+            nspace: namespace as i64,
             alias: None,
             blob: None,
         };
@@ -767,7 +757,6 @@ mod tests {
             assert!(check_key_permission(&sctx, KeyPerm::delete(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::get_info(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::rebind(), &key, &None).is_ok());
-            assert!(check_key_permission(&sctx, KeyPerm::list(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::update(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::grant(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::manage_blob(), &key, &None).is_ok());
@@ -779,7 +768,6 @@ mod tests {
             assert!(check_key_permission(&sctx, KeyPerm::delete(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::get_info(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::rebind(), &key, &None).is_ok());
-            assert!(check_key_permission(&sctx, KeyPerm::list(), &key, &None).is_ok());
             assert!(check_key_permission(&sctx, KeyPerm::update(), &key, &None).is_ok());
             assert_perm_failed!(check_key_permission(&sctx, KeyPerm::grant(), &key, &None));
             assert_perm_failed!(check_key_permission(&sctx, KeyPerm::req_forced_op(), &key, &None));
@@ -792,11 +780,10 @@ mod tests {
 
     #[test]
     fn check_key_permission_domain_blob() -> Result<()> {
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
         let (sctx, namespace, is_su) = check_context()?;
         let key = KeyDescriptor {
-            domain: Domain::Blob,
-            namespace_: namespace as i64,
+            domain: Domain::BLOB,
+            nspace: namespace as i64,
             alias: None,
             blob: None,
         };
@@ -811,8 +798,7 @@ mod tests {
 
     #[test]
     fn check_key_permission_domain_key_id() -> Result<()> {
-        use android_security_keystore2::aidl::android::security::keystore2::Domain;
-        let key = KeyDescriptor { domain: Domain::KeyId, namespace_: 0, alias: None, blob: None };
+        let key = KeyDescriptor { domain: Domain::KEY_ID, nspace: 0, alias: None, blob: None };
 
         assert_eq!(
             Some(&KsError::sys()),
@@ -840,7 +826,6 @@ mod tests {
             KeyPerm::gen_unique_id(),
             KeyPerm::grant(),
             KeyPerm::get_info(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_() // Test if the macro accepts missing comma at the end of the list.
@@ -850,7 +835,6 @@ mod tests {
         assert_eq!(i.next().unwrap().to_selinux(), "gen_unique_id");
         assert_eq!(i.next().unwrap().to_selinux(), "get_info");
         assert_eq!(i.next().unwrap().to_selinux(), "grant");
-        assert_eq!(i.next().unwrap().to_selinux(), "list");
         assert_eq!(i.next().unwrap().to_selinux(), "manage_blob");
         assert_eq!(i.next().unwrap().to_selinux(), "rebind");
         assert_eq!(i.next().unwrap().to_selinux(), "req_forced_op");
@@ -865,13 +849,11 @@ mod tests {
             KeyPerm::manage_blob(),
             KeyPerm::req_forced_op(),
             KeyPerm::gen_unique_id(),
-            KeyPerm::list(),
             KeyPerm::update(),
             KeyPerm::use_(), // Test if macro accepts the comma at the end of the list.
         ];
         let mut i = v.into_iter();
         assert_eq!(i.next().unwrap().to_selinux(), "gen_unique_id");
-        assert_eq!(i.next().unwrap().to_selinux(), "list");
         assert_eq!(i.next().unwrap().to_selinux(), "manage_blob");
         assert_eq!(i.next().unwrap().to_selinux(), "req_forced_op");
         assert_eq!(i.next().unwrap().to_selinux(), "update");
@@ -894,7 +876,6 @@ mod tests {
             KeyPerm::gen_unique_id(),
             KeyPerm::grant(),
             KeyPerm::get_info(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -902,7 +883,6 @@ mod tests {
         let v2 = key_perm_set![
             KeyPerm::manage_blob(),
             KeyPerm::delete(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -915,7 +895,6 @@ mod tests {
         let v1 = key_perm_set![
             KeyPerm::manage_blob(),
             KeyPerm::delete(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -923,7 +902,6 @@ mod tests {
         let v2 = key_perm_set![
             KeyPerm::manage_blob(),
             KeyPerm::delete(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -937,7 +915,6 @@ mod tests {
             KeyPerm::manage_blob(),
             KeyPerm::delete(),
             KeyPerm::grant(), // only in v1
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -946,7 +923,6 @@ mod tests {
             KeyPerm::manage_blob(),
             KeyPerm::delete(),
             KeyPerm::req_forced_op(), // only in v2
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
@@ -959,7 +935,6 @@ mod tests {
         let v1 = key_perm_set![KeyPerm::manage_blob(), KeyPerm::delete(), KeyPerm::grant(),];
         let v2 = key_perm_set![
             KeyPerm::req_forced_op(),
-            KeyPerm::list(),
             KeyPerm::rebind(),
             KeyPerm::update(),
             KeyPerm::use_(),
