@@ -18,18 +18,37 @@ rust_library {
     srcs: ["src/lib.rs"],
 
     rustlibs: [
-        "libandroid_hardware_keymint",
-        "libandroid_security_keystore2",
+        "android.hardware.security.keymint-V1-rust",
+        "android.hardware.security.secureclock-V1-rust",
+        "android.security.apc-rust",
+        "android.security.authorization-rust",
+        "android.security.compat-rust",
+        "android.system.keystore2-V1-rust",
         "libanyhow",
         "libbinder_rs",
+        "libkeystore2_aaid-rust",
+        "libkeystore2_apc_compat-rust",
+        "libkeystore2_crypto_rust",
+        "libkeystore2_km_compat",
         "libkeystore2_selinux",
         "liblazy_static",
+        "liblibc",
         "liblibsqlite3_sys",
         "liblog_rust",
         "librand",
         "librusqlite",
         "libthiserror",
     ],
+}
+
+rust_library {
+    name: "libkeystore2_test_utils",
+    crate_name: "keystore2_test_utils",
+    srcs: ["test_utils/lib.rs"],
+    rustlibs: [
+        "liblog_rust",
+        "librand",
+    ]
 }
 
 rust_test {
@@ -39,45 +58,39 @@ rust_test {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rustlibs: [
+        "android.hardware.security.keymint-V1-rust",
+        "android.hardware.security.secureclock-V1-rust",
+        "android.security.apc-rust",
+        "android.security.authorization-rust",
+        "android.security.compat-rust",
+        "android.system.keystore2-V1-rust",
         "libandroid_logger",
-        "libandroid_hardware_keymint",
-        "libandroid_security_keystore2",
         "libanyhow",
         "libbinder_rs",
+        "libkeystore2_aaid-rust",
+        "libkeystore2_apc_compat-rust",
+        "libkeystore2_crypto_rust",
+        "libkeystore2_km_compat",
         "libkeystore2_selinux",
+        "libkeystore2_test_utils",
         "liblazy_static",
+        "liblibc",
         "liblibsqlite3_sys",
         "liblog_rust",
+        "librand",
         "librusqlite",
         "libthiserror",
     ],
 }
 
-// This is a placeholder for the libraries that will be generated from the AIDL specs
-// eventually.
-rust_library {
-    name: "libandroid_hardware_keymint",
-    crate_name: "android_hardware_keymint",
-
-    srcs: ["src/android_hardware_keymint.rs"],
-
+rust_binary {
+    name: "keystore2",
+    srcs: ["src/keystore2_main.rs"],
     rustlibs: [
+        "libandroid_logger",
         "libbinder_rs",
-        "liblazy_static",
+        "libkeystore2",
+        "liblog_rust",
     ],
-}
-
-// This is a placeholder for the libraries that will be generated from the AIDL specs
-// eventually.
-rust_library {
-    name: "libandroid_security_keystore2",
-    crate_name: "android_security_keystore2",
-
-    srcs: ["src/android_security_keystore2.rs"],
-
-    rustlibs: [
-        "libandroid_hardware_keymint",
-        "libbinder_rs",
-        "liblazy_static",
-    ],
+    init_rc: ["keystore2.rc"],
 }
