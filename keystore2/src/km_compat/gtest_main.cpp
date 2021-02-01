@@ -14,24 +14,8 @@
  * limitations under the License.
  */
 
-package android.security;
-
-import android.security.ByteArray;
-import android.hardware.keymint.KeyParameter;
-
-/**
- * Internal interface for performing device attestation.
- *
- * @hide
- */
-interface IAttestationManager {
-    /**
-     * Attest a provided list of device identifiers.
-     *
-     * @return The signed certificate chain, with each individual certificate encoded as a byte
-     *         array.
-     */
-    ByteArray[] attestDevice(
-            in KeyParameter[] deviceIdentifiers, boolean useIndividualAttestation,
-            in byte[] attestationChallenge, int securityLevel);
+#include <gtest/gtest.h>
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

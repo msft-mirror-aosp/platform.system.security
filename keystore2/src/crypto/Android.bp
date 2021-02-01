@@ -18,9 +18,14 @@ rust_library {
     srcs: ["lib.rs"],
     rustlibs: [
         "libkeystore2_crypto_bindgen",
+        "liblog_rust",
+        "libnix",
+        "libthiserror",
     ],
-    static_libs: ["libkeystore2_crypto"],
-    shared_libs: ["libcrypto"],
+    shared_libs: [
+        "libkeystore2_crypto",
+        "libcrypto",
+    ],
 }
 
 cc_library {
@@ -29,7 +34,7 @@ cc_library {
         "crypto.cpp",
         "certificate_utils.cpp",
     ],
-    export_include_dirs: ["include",],
+    export_include_dirs: ["include"],
     shared_libs: [
         "libcrypto",
         "liblog",
@@ -42,6 +47,30 @@ rust_bindgen {
     crate_name: "keystore2_crypto_bindgen",
     source_stem: "bindings",
     host_supported: true,
+    shared_libs: ["libcrypto"],
+    bindgen_flags: [
+        "--size_t-is-usize",
+        "--whitelist-function", "randomBytes",
+        "--whitelist-function", "AES_gcm_encrypt",
+        "--whitelist-function", "AES_gcm_decrypt",
+        "--whitelist-function", "CreateKeyId",
+        "--whitelist-function", "generateKeyFromPassword",
+        "--whitelist-function", "HKDFExtract",
+        "--whitelist-function", "HKDFExpand",
+        "--whitelist-function", "ECDHComputeKey",
+        "--whitelist-function", "ECKEYGenerateKey",
+        "--whitelist-function", "ECKEYDeriveFromSecret",
+        "--whitelist-function", "EC_KEY_get0_public_key",
+        "--whitelist-function", "ECPOINTPoint2Oct",
+        "--whitelist-function", "ECPOINTOct2Point",
+        "--whitelist-function", "EC_KEY_free",
+        "--whitelist-function", "EC_POINT_free",
+        "--whitelist-type", "EC_KEY",
+        "--whitelist-type", "EC_POINT",
+        "--whitelist-var", "EC_MAX_BYTES",
+        "--whitelist-var", "EVP_MAX_MD_SIZE",
+    ],
+    cflags: ["-DBORINGSSL_NO_CXX"],
 }
 
 rust_test {
@@ -52,7 +81,9 @@ rust_test {
     auto_gen_config: true,
     rustlibs: [
         "libkeystore2_crypto_bindgen",
-        "libkeystore2_crypto_rust",
+        "liblog_rust",
+        "libnix",
+        "libthiserror",
     ],
     static_libs: [
         "libkeystore2_crypto",
@@ -60,11 +91,12 @@ rust_test {
     shared_libs: [
         "libc++",
         "libcrypto",
-	"liblog",
+        "liblog",
     ],
 }
 
 cc_test {
+    name: "keystore2_crypto_test",
     cflags: [
         "-Wall",
         "-Werror",
@@ -74,11 +106,11 @@ cc_test {
         "tests/certificate_utils_test.cpp",
         "tests/gtest_main.cpp",
     ],
+    test_suites: ["general-tests"],
     static_libs: [
         "libkeystore2_crypto",
     ],
     shared_libs: [
         "libcrypto",
     ],
-    name: "keystore2_crypto_test",
 }
