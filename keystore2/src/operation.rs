@@ -125,24 +125,25 @@
 //! or it transitions to its end-of-life, which means we may get a free slot.
 //! Either way, we have to revaluate the pruning scores.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
-    time::Duration,
-    time::Instant,
-};
-
+use crate::enforcements::AuthInfo;
 use crate::error::{map_km_error, map_or_log_err, Error, ErrorCode, ResponseCode};
 use crate::utils::Asp;
-use android_hardware_keymint::aidl::android::hardware::keymint::{
+use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     ByteArray::ByteArray, IKeyMintOperation::IKeyMintOperation,
-    KeyParameter::KeyParameter as KmParam, KeyParameterArray::KeyParameterArray, Tag::Tag,
+    KeyParameter::KeyParameter as KmParam, KeyParameterArray::KeyParameterArray,
+    KeyParameterValue::KeyParameterValue as KmParamValue, Tag::Tag,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreOperation::BnKeystoreOperation, IKeystoreOperation::IKeystoreOperation,
 };
 use anyhow::{anyhow, Context, Result};
 use binder::{IBinder, Interface};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    time::Duration,
+    time::Instant,
+};
 
 /// Operations have `Outcome::Unknown` as long as they are active. They transition
 /// to one of the other variants exactly once. The distinction in outcome is mainly
@@ -167,6 +168,7 @@ pub struct Operation {
     last_usage: Mutex<Instant>,
     outcome: Mutex<Outcome>,
     owner: u32, // Uid of the operation's owner.
+    auth_info: Mutex<AuthInfo>,
 }
 
 struct PruningInfo {
@@ -180,13 +182,19 @@ const MAX_RECEIVE_DATA: usize = 0x8000;
 
 impl Operation {
     /// Constructor
-    pub fn new(index: usize, km_op: Box<dyn IKeyMintOperation>, owner: u32) -> Self {
+    pub fn new(
+        index: usize,
+        km_op: Box<dyn IKeyMintOperation>,
+        owner: u32,
+        auth_info: AuthInfo,
+    ) -> Self {
         Self {
             index,
             km_op: Asp::new(km_op.as_binder()),
             last_usage: Mutex::new(Instant::now()),
             outcome: Mutex::new(Outcome::Unknown),
             owner,
+            auth_info: Mutex::new(auth_info),
         }
     }
 
@@ -319,8 +327,7 @@ impl Operation {
         let params = KeyParameterArray {
             params: vec![KmParam {
                 tag: Tag::ASSOCIATED_DATA,
-                blob: aad_input.into(),
-                ..Default::default()
+                value: KmParamValue::Blob(aad_input.into()),
             }],
         };
 
@@ -330,15 +337,20 @@ impl Operation {
         let km_op: Box<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
 
+        let (hat, tst) = self
+            .auth_info
+            .lock()
+            .unwrap()
+            .before_update()
+            .context("In update_aad: Trying to get auth tokens.")?;
+
         self.update_outcome(
             &mut *outcome,
             map_km_error(km_op.update(
                 Some(&params),
                 None,
-                // TODO Get auth token from enforcement module if required.
-                None,
-                // TODO Get verification token from enforcement module if required.
-                None,
+                hat.as_ref(),
+                tst.as_ref(),
                 &mut out_params,
                 &mut output,
             )),
@@ -361,15 +373,20 @@ impl Operation {
         let km_op: Box<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
 
+        let (hat, tst) = self
+            .auth_info
+            .lock()
+            .unwrap()
+            .before_update()
+            .context("In update: Trying to get auth tokens.")?;
+
         self.update_outcome(
             &mut *outcome,
             map_km_error(km_op.update(
                 None,
                 Some(input),
-                // TODO Get auth token from enforcement module if required.
-                None,
-                // TODO Get verification token from enforcement module if required.
-                None,
+                hat.as_ref(),
+                tst.as_ref(),
                 &mut out_params,
                 &mut output,
             )),
@@ -377,7 +394,13 @@ impl Operation {
         .context("In update: KeyMint::update failed.")?;
 
         match output {
-            Some(blob) => Ok(Some(blob.data)),
+            Some(blob) => {
+                if blob.data.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(blob.data))
+                }
+            }
             None => Ok(None),
         }
     }
@@ -396,6 +419,13 @@ impl Operation {
         let km_op: Box<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In finish: Failed to get KeyMintOperation.")?;
 
+        let (hat, tst) = self
+            .auth_info
+            .lock()
+            .unwrap()
+            .before_finish()
+            .context("In finish: Trying to get auth tokens.")?;
+
         let output = self
             .update_outcome(
                 &mut *outcome,
@@ -403,14 +433,14 @@ impl Operation {
                     None,
                     input,
                     signature,
-                    // TODO Get auth token from enforcement module if required.
-                    None,
-                    // TODO Get verification token from enforcement module if required.
-                    None,
+                    hat.as_ref(),
+                    tst.as_ref(),
                     &mut out_params,
                 )),
             )
             .context("In finish: KeyMint::finish failed.")?;
+
+        self.auth_info.lock().unwrap().after_finish().context("In finish.")?;
 
         // At this point the operation concluded successfully.
         *outcome = Outcome::Success;
@@ -469,6 +499,7 @@ impl OperationDb {
         &self,
         km_op: Box<dyn IKeyMintOperation>,
         owner: u32,
+        auth_info: AuthInfo,
     ) -> Arc<Operation> {
         // We use unwrap because we don't allow code that can panic while locked.
         let mut operations = self.operations.lock().expect("In create_operation.");
@@ -481,12 +512,12 @@ impl OperationDb {
             s.upgrade().is_none()
         }) {
             Some(free_slot) => {
-                let new_op = Arc::new(Operation::new(index - 1, km_op, owner));
+                let new_op = Arc::new(Operation::new(index - 1, km_op, owner, auth_info));
                 *free_slot = Arc::downgrade(&new_op);
                 new_op
             }
             None => {
-                let new_op = Arc::new(Operation::new(operations.len(), km_op, owner));
+                let new_op = Arc::new(Operation::new(operations.len(), km_op, owner, auth_info));
                 operations.push(Arc::downgrade(&new_op));
                 new_op
             }

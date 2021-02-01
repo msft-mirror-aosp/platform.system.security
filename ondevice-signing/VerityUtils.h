@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-package android.security;
+#pragma once
 
-/**
- * Simple data holder for a byte array, allowing for multidimensional arrays in AIDL.
- *
- * @hide
- */
-parcelable ByteArray {
-    byte[] data;
-}
+#include <android-base/result.h>
+
+#include "KeymasterSigningKey.h"
+
+android::base::Result<void> verifyAllFilesInVerity(const std::string& path);
+android::base::Result<void> addFilesToVerityRecursive(const std::string& path,
+                                                      const KeymasterSigningKey& key);

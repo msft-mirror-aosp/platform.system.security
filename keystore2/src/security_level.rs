@@ -16,11 +16,12 @@
 
 //! This crate implements the IKeystoreSecurityLevel interface.
 
-use android_hardware_keymint::aidl::android::hardware::keymint::{
-    Algorithm::Algorithm, ByteArray::ByteArray, Certificate::Certificate as KmCertificate,
-    HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
-    KeyCharacteristics::KeyCharacteristics, KeyFormat::KeyFormat, KeyParameter::KeyParameter,
-    KeyPurpose::KeyPurpose, SecurityLevel::SecurityLevel, Tag::Tag,
+use crate::gc::Gc;
+use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
+    Algorithm::Algorithm, HardwareAuthenticatorType::HardwareAuthenticatorType,
+    IKeyMintDevice::IKeyMintDevice, KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
+    KeyParameter::KeyParameter, KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel,
+    Tag::Tag,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     AuthenticatorSpec::AuthenticatorSpec, CreateOperationResponse::CreateOperationResponse,
@@ -30,9 +31,15 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters,
 };
 
-use crate::permission::KeyPerm;
-use crate::utils::{check_key_permission, Asp};
+use crate::globals::ENFORCEMENTS;
+use crate::key_parameter::KeyParameter as KsKeyParam;
+use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
+use crate::utils::{check_key_permission, uid_to_android_user, Asp};
 use crate::{database::KeyIdGuard, globals::DB};
+use crate::{
+    database::{DateTime, KeyMetaData, KeyMetaEntry, KeyType},
+    permission::KeyPerm,
+};
 use crate::{
     database::{KeyEntry, KeyEntryLoadBits, SubComponentType},
     operation::KeystoreOperation,
@@ -52,8 +59,6 @@ pub struct KeystoreSecurityLevel {
     operation_db: OperationDb,
 }
 
-static KEYMINT_SERVICE_NAME: &str = "android.hardware.keymint.IKeyMintDevice";
-
 // Blob of 32 zeroes used as empty masking key.
 static ZERO_BLOB_32: &[u8] = &[0; 32];
 
@@ -65,18 +70,10 @@ impl KeystoreSecurityLevel {
     pub fn new_native_binder(
         security_level: SecurityLevel,
     ) -> Result<impl IKeystoreSecurityLevel + Send> {
-        let service_name = format!("{}/default", KEYMINT_SERVICE_NAME);
-        let keymint: Box<dyn IKeyMintDevice> =
-            binder::get_interface(&service_name).map_err(|e| {
-                anyhow!(format!(
-                    "Could not get KeyMint instance: {} failed with error code {:?}",
-                    service_name, e
-                ))
-            })?;
-
         let result = BnKeystoreSecurityLevel::new_binder(Self {
             security_level,
-            keymint: Asp::new(keymint.as_binder()),
+            keymint: crate::globals::get_keymint_device(security_level)
+                .context("In KeystoreSecurityLevel::new_native_binder.")?,
             operation_db: OperationDb::new(),
         });
         result.as_binder().set_requesting_sid(true);
@@ -86,75 +83,64 @@ impl KeystoreSecurityLevel {
     fn store_new_key(
         &self,
         key: KeyDescriptor,
-        key_characteristics: KeyCharacteristics,
-        km_cert_chain: Option<Vec<KmCertificate>>,
-        blob: ByteArray,
+        creation_result: KeyCreationResult,
+        user_id: u32,
     ) -> Result<KeyMetadata> {
-        let (cert, cert_chain): (Option<Vec<u8>>, Option<Vec<u8>>) = match km_cert_chain {
-            Some(mut chain) => (
-                match chain.len() {
-                    0 => None,
-                    _ => Some(chain.remove(0).encodedCertificate),
-                },
-                match chain.len() {
-                    0 => None,
-                    _ => Some(
-                        chain
-                            .iter()
-                            .map(|c| c.encodedCertificate.iter())
-                            .flatten()
-                            .copied()
-                            .collect(),
-                    ),
-                },
-            ),
-            None => (None, None),
-        };
+        let KeyCreationResult {
+            keyBlob: key_blob,
+            keyCharacteristics: key_characteristics,
+            certificateChain: mut certificate_chain,
+        } = creation_result;
 
-        let key_parameters =
-            key_characteristics_to_internal(key_characteristics, self.security_level);
+        let (cert, cert_chain): (Option<Vec<u8>>, Option<Vec<u8>>) = (
+            match certificate_chain.len() {
+                0 => None,
+                _ => Some(certificate_chain.remove(0).encodedCertificate),
+            },
+            match certificate_chain.len() {
+                0 => None,
+                _ => Some(
+                    certificate_chain
+                        .iter()
+                        .map(|c| c.encodedCertificate.iter())
+                        .flatten()
+                        .copied()
+                        .collect(),
+                ),
+            },
+        );
+
+        let mut key_parameters = key_characteristics_to_internal(key_characteristics);
+
+        key_parameters.push(KsKeyParam::new(
+            KsKeyParamValue::UserID(user_id as i32),
+            SecurityLevel::SOFTWARE,
+        ));
+
+        let creation_date = DateTime::now().context("Trying to make creation time.")?;
 
         let key = match key.domain {
             Domain::BLOB => {
-                KeyDescriptor { domain: Domain::BLOB, blob: Some(blob.data), ..Default::default() }
+                KeyDescriptor { domain: Domain::BLOB, blob: Some(key_blob), ..Default::default() }
             }
             _ => DB
-                .with(|db| {
+                .with::<_, Result<KeyDescriptor>>(|db| {
+                    let mut metadata = KeyMetaData::new();
+                    metadata.add(KeyMetaEntry::CreationDate(creation_date));
+
                     let mut db = db.borrow_mut();
-                    let key_id = db
-                        .create_key_entry(key.domain, key.nspace)
-                        .context("Trying to create a key entry.")?;
-                    db.insert_blob(
-                        &key_id,
-                        SubComponentType::KM_BLOB,
-                        &blob.data,
-                        self.security_level,
-                    )
-                    .context("Trying to insert km blob.")?;
-                    if let Some(c) = &cert {
-                        db.insert_blob(&key_id, SubComponentType::CERT, c, self.security_level)
-                            .context("Trying to insert cert blob.")?;
-                    }
-                    if let Some(c) = &cert_chain {
-                        db.insert_blob(
-                            &key_id,
-                            SubComponentType::CERT_CHAIN,
-                            c,
-                            self.security_level,
+                    let (need_gc, key_id) = db
+                        .store_new_key(
+                            key,
+                            &key_parameters,
+                            &key_blob,
+                            cert.as_deref(),
+                            cert_chain.as_deref(),
+                            &metadata,
                         )
-                        .context("Trying to insert cert chain blob.")?;
-                    }
-                    db.insert_keyparameter(&key_id, &key_parameters)
-                        .context("Trying to insert key parameters.")?;
-                    match &key.alias {
-                        Some(alias) => db
-                            .rebind_alias(&key_id, alias, key.domain, key.nspace)
-                            .context("Failed to rebind alias.")?,
-                        None => {
-                            return Err(error::Error::sys()).context(
-                                "Alias must be specified. (This should have been checked earlier.)",
-                            )
-                        }
+                        .context("In store_new_key.")?;
+                    if need_gc {
+                        Gc::notify_gc();
                     }
                     Ok(KeyDescriptor {
                         domain: Domain::KEY_ID,
@@ -171,7 +157,7 @@ impl KeystoreSecurityLevel {
             certificate: cert,
             certificateChain: cert_chain,
             authorizations: crate::utils::key_parameters_to_authorizations(key_parameters),
-            ..Default::default()
+            modificationTimeMs: creation_date.to_millis_epoch(),
         })
     }
 
@@ -186,7 +172,7 @@ impl KeystoreSecurityLevel {
         // so that we can use it by reference like the blob provided by the key descriptor.
         // Otherwise, we would have to clone the blob from the key descriptor.
         let scoping_blob: Vec<u8>;
-        let (km_blob, key_id_guard) = match key.domain {
+        let (km_blob, key_properties, key_id_guard) = match key.domain {
             Domain::BLOB => {
                 check_key_permission(KeyPerm::use_(), key, &None)
                     .context("In create_operation: checking use permission for Domain::BLOB.")?;
@@ -201,6 +187,7 @@ impl KeystoreSecurityLevel {
                         }
                     },
                     None,
+                    None,
                 )
             }
             _ => {
@@ -208,6 +195,7 @@ impl KeystoreSecurityLevel {
                     .with::<_, Result<(KeyIdGuard, KeyEntry)>>(|db| {
                         db.borrow_mut().load_key_entry(
                             key.clone(),
+                            KeyType::Client,
                             KeyEntryLoadBits::KM,
                             caller_uid,
                             |k, av| check_key_permission(KeyPerm::use_(), k, &av),
@@ -223,19 +211,37 @@ impl KeystoreSecurityLevel {
                         ))
                     }
                 };
-                (&scoping_blob, Some(key_id_guard))
+                (
+                    &scoping_blob,
+                    Some((key_id_guard.id(), key_entry.into_key_parameters())),
+                    Some(key_id_guard),
+                )
             }
         };
-
-        // TODO Authorize begin operation.
-        // Check if we need an authorization token.
-        // Lookup authorization token and request VerificationToken if required.
 
         let purpose = operation_parameters.iter().find(|p| p.tag == Tag::PURPOSE).map_or(
             Err(Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context("In create_operation: No operation purpose specified."),
-            |kp| Ok(KeyPurpose(kp.integer)),
+            |kp| match kp.value {
+                KeyParameterValue::KeyPurpose(p) => Ok(p),
+                _ => Err(Error::Km(ErrorCode::INVALID_ARGUMENT))
+                    .context("In create_operation: Malformed KeyParameter."),
+            },
         )?;
+
+        let (immediate_hat, mut auth_info) = ENFORCEMENTS
+            .authorize_create(
+                purpose,
+                key_properties.as_ref(),
+                operation_parameters.as_ref(),
+                // TODO b/178222844 Replace this with the configuration returned by
+                //      KeyMintDevice::getHardwareInfo.
+                //      For now we assume that strongbox implementations need secure timestamps.
+                self.security_level == SecurityLevel::STRONGBOX,
+            )
+            .context("In create_operation.")?;
+
+        let immediate_hat = immediate_hat.unwrap_or_default();
 
         let km_dev: Box<dyn IKeyMintDevice> = self
             .keymint
@@ -253,7 +259,7 @@ impl KeystoreSecurityLevel {
                         purpose,
                         blob,
                         &operation_parameters,
-                        &Default::default(),
+                        &immediate_hat,
                     )) {
                         Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
                             self.operation_db.prune(caller_uid)?;
@@ -265,8 +271,12 @@ impl KeystoreSecurityLevel {
             )
             .context("In create_operation: Failed to begin operation.")?;
 
+        let operation_challenge = auth_info.finalize_create_authorization(begin_result.challenge);
+
         let operation = match begin_result.operation {
-            Some(km_op) => self.operation_db.create_operation(km_op, caller_uid),
+            Some(km_op) => {
+                self.operation_db.create_operation(km_op, caller_uid, auth_info)
+            },
             None => return Err(Error::sys()).context("In create_operation: Begin operation returned successfully, but did not return a valid operation."),
         };
 
@@ -276,16 +286,28 @@ impl KeystoreSecurityLevel {
                 .into_interface()
                 .context("In create_operation: Failed to create IKeystoreOperation.")?;
 
-        // TODO we need to the enforcement module to determine if we need to return the challenge.
-        // We return None for now because we don't support auth bound keys yet.
         Ok(CreateOperationResponse {
             iOperation: Some(op_binder),
-            operationChallenge: None,
+            operationChallenge: operation_challenge,
             parameters: match begin_result.params.len() {
                 0 => None,
                 _ => Some(KeyParameters { keyParameter: begin_result.params }),
             },
         })
+    }
+
+    fn add_attestation_parameters(uid: u32, params: &[KeyParameter]) -> Result<Vec<KeyParameter>> {
+        let mut result = params.to_vec();
+        if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
+            let aaid = keystore2_aaid::get_aaid(uid).map_err(|e| {
+                anyhow!(format!("In add_attestation_parameters: get_aaid returned status {}.", e))
+            })?;
+            result.push(KeyParameter {
+                tag: Tag::ATTESTATION_APPLICATION_ID,
+                value: KeyParameterValue::Blob(aaid),
+            });
+        }
+        Ok(result)
     }
 
     fn generate_key(
@@ -300,11 +322,12 @@ impl KeystoreSecurityLevel {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context("In generate_key: Alias must be specified");
         }
+        let caller_uid = ThreadState::get_calling_uid();
 
         let key = match key.domain {
             Domain::APP => KeyDescriptor {
                 domain: key.domain,
-                nspace: ThreadState::get_calling_uid() as i64,
+                nspace: caller_uid as i64,
                 alias: key.alias.clone(),
                 blob: None,
             },
@@ -314,20 +337,17 @@ impl KeystoreSecurityLevel {
         // generate_key requires the rebind permission.
         check_key_permission(KeyPerm::rebind(), &key, &None).context("In generate_key.")?;
 
-        let km_dev: Box<dyn IKeyMintDevice> = self.keymint.get_interface()?;
-        map_km_error(km_dev.addRngEntropy(entropy))?;
-        let mut blob: ByteArray = Default::default();
-        let mut key_characteristics: KeyCharacteristics = Default::default();
-        let mut certificate_chain: Vec<KmCertificate> = Default::default();
-        map_km_error(km_dev.generateKey(
-            &params,
-            &mut blob,
-            &mut key_characteristics,
-            &mut certificate_chain,
-        ))?;
+        let params = Self::add_attestation_parameters(caller_uid, params)
+            .context("In generate_key: Trying to get aaid.")?;
 
-        self.store_new_key(key, key_characteristics, Some(certificate_chain), blob)
-            .context("In generate_key.")
+        let km_dev: Box<dyn IKeyMintDevice> = self.keymint.get_interface()?;
+        map_km_error(km_dev.addRngEntropy(entropy))
+            .context("In generate_key: Trying to add entropy.")?;
+        let creation_result = map_km_error(km_dev.generateKey(&params))
+            .context("In generate_key: While generating Key")?;
+
+        let user_id = uid_to_android_user(caller_uid);
+        self.store_new_key(key, creation_result, user_id).context("In generate_key.")
     }
 
     fn import_key(
@@ -342,11 +362,12 @@ impl KeystoreSecurityLevel {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context("In import_key: Alias must be specified");
         }
+        let caller_uid = ThreadState::get_calling_uid();
 
         let key = match key.domain {
             Domain::APP => KeyDescriptor {
                 domain: key.domain,
-                nspace: ThreadState::get_calling_uid() as i64,
+                nspace: caller_uid as i64,
                 alias: key.alias.clone(),
                 blob: None,
             },
@@ -356,35 +377,32 @@ impl KeystoreSecurityLevel {
         // import_key requires the rebind permission.
         check_key_permission(KeyPerm::rebind(), &key, &None).context("In import_key.")?;
 
-        let mut blob: ByteArray = Default::default();
-        let mut key_characteristics: KeyCharacteristics = Default::default();
-        let mut certificate_chain: Vec<KmCertificate> = Default::default();
+        let params = Self::add_attestation_parameters(caller_uid, params)
+            .context("In import_key: Trying to get aaid.")?;
 
         let format = params
             .iter()
             .find(|p| p.tag == Tag::ALGORITHM)
             .ok_or(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
             .context("No KeyParameter 'Algorithm'.")
-            .and_then(|p| match Algorithm(p.integer) {
-                Algorithm::AES | Algorithm::HMAC | Algorithm::TRIPLE_DES => Ok(KeyFormat::RAW),
-                Algorithm::RSA | Algorithm::EC => Ok(KeyFormat::PKCS8),
-                algorithm => Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
-                    .context(format!("Unknown Algorithm {:?}.", algorithm)),
+            .and_then(|p| match &p.value {
+                KeyParameterValue::Algorithm(Algorithm::AES)
+                | KeyParameterValue::Algorithm(Algorithm::HMAC)
+                | KeyParameterValue::Algorithm(Algorithm::TRIPLE_DES) => Ok(KeyFormat::RAW),
+                KeyParameterValue::Algorithm(Algorithm::RSA)
+                | KeyParameterValue::Algorithm(Algorithm::EC) => Ok(KeyFormat::PKCS8),
+                v => Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
+                    .context(format!("Unknown Algorithm {:?}.", v)),
             })
             .context("In import_key.")?;
 
-        let km_dev: Box<dyn IKeyMintDevice> = self.keymint.get_interface()?;
-        map_km_error(km_dev.importKey(
-            &params,
-            format,
-            key_data,
-            &mut blob,
-            &mut key_characteristics,
-            &mut certificate_chain,
-        ))?;
+        let km_dev: Box<dyn IKeyMintDevice> =
+            self.keymint.get_interface().context("In import_key: Trying to get the KM device")?;
+        let creation_result = map_km_error(km_dev.importKey(&params, format, key_data))
+            .context("In import_key: Trying to call importKey")?;
 
-        self.store_new_key(key, key_characteristics, Some(certificate_chain), blob)
-            .context("In import_key.")
+        let user_id = uid_to_android_user(caller_uid);
+        self.store_new_key(key, creation_result, user_id).context("In import_key.")
     }
 
     fn import_wrapped_key(
@@ -395,7 +413,7 @@ impl KeystoreSecurityLevel {
         params: &[KeyParameter],
         authenticators: &[AuthenticatorSpec],
     ) -> Result<KeyMetadata> {
-        if key.domain != Domain::BLOB && key.alias.is_none() {
+        if !(key.domain == Domain::BLOB && key.alias.is_some()) {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context("In import_wrapped_key: Alias must be specified.");
         }
@@ -415,10 +433,11 @@ impl KeystoreSecurityLevel {
             }
         };
 
+        let caller_uid = ThreadState::get_calling_uid();
         let key = match key.domain {
             Domain::APP => KeyDescriptor {
                 domain: key.domain,
-                nspace: ThreadState::get_calling_uid() as i64,
+                nspace: caller_uid as i64,
                 alias: key.alias.clone(),
                 blob: None,
             },
@@ -432,8 +451,9 @@ impl KeystoreSecurityLevel {
             .with(|db| {
                 db.borrow_mut().load_key_entry(
                     wrapping_key.clone(),
+                    KeyType::Client,
                     KeyEntryLoadBits::KM,
-                    ThreadState::get_calling_uid(),
+                    caller_uid,
                     |k, av| check_key_permission(KeyPerm::use_(), k, &av),
                 )
             })
@@ -473,29 +493,29 @@ impl KeystoreSecurityLevel {
         let masking_key = masking_key.unwrap_or(ZERO_BLOB_32);
 
         let km_dev: Box<dyn IKeyMintDevice> = self.keymint.get_interface()?;
-        let ((blob, key_characteristics), _) = self.upgrade_keyblob_if_required_with(
-            &*km_dev,
-            Some(wrapping_key_id_guard),
-            wrapping_key_blob,
-            &[],
-            |wrapping_blob| {
-                let mut blob: ByteArray = Default::default();
-                let mut key_characteristics: KeyCharacteristics = Default::default();
-                map_km_error(km_dev.importWrappedKey(
-                    wrapped_data,
-                    wrapping_key_blob,
-                    masking_key,
-                    &params,
-                    pw_sid,
-                    fp_sid,
-                    &mut blob,
-                    &mut key_characteristics,
-                ))?;
-                Ok((blob, key_characteristics))
-            },
-        )?;
+        let (creation_result, _) = self
+            .upgrade_keyblob_if_required_with(
+                &*km_dev,
+                Some(wrapping_key_id_guard),
+                wrapping_key_blob,
+                &[],
+                |wrapping_blob| {
+                    let creation_result = map_km_error(km_dev.importWrappedKey(
+                        wrapped_data,
+                        wrapping_key_blob,
+                        masking_key,
+                        &params,
+                        pw_sid,
+                        fp_sid,
+                    ))?;
+                    Ok(creation_result)
+                },
+            )
+            .context("In import_wrapped_key.")?;
 
-        self.store_new_key(key, key_characteristics, None, blob).context("In import_wrapped_key.")
+        let user_id = uid_to_android_user(caller_uid);
+        self.store_new_key(key, creation_result, user_id)
+            .context("In import_wrapped_key: Trying to store the new key.")
     }
 
     fn upgrade_keyblob_if_required_with<T, F>(
@@ -517,9 +537,8 @@ impl KeystoreSecurityLevel {
                     DB.with(|db| {
                         db.borrow_mut().insert_blob(
                             &key_id_guard,
-                            SubComponentType::KM_BLOB,
+                            SubComponentType::KEY_BLOB,
                             &upgraded_blob,
-                            self.security_level,
                         )
                     })
                     .context(concat!(
