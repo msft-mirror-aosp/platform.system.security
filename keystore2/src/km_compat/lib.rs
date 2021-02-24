@@ -34,14 +34,14 @@ mod tests {
         KeyParameterArray::KeyParameterArray, KeyParameterValue::KeyParameterValue,
         KeyPurpose::KeyPurpose, PaddingMode::PaddingMode, SecurityLevel::SecurityLevel, Tag::Tag,
     };
-    use android_hardware_security_keymint::binder;
+    use android_hardware_security_keymint::binder::{self, Strong};
     use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 
     static COMPAT_NAME: &str = "android.security.compat";
 
-    fn get_device() -> Option<Box<dyn IKeyMintDevice>> {
+    fn get_device() -> Option<Strong<dyn IKeyMintDevice>> {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
+        let compat_service: Strong<dyn IKeystoreCompatService> =
             binder::get_interface(COMPAT_NAME).ok()?;
         compat_service.getKeyMintDevice(SecurityLevel::TRUSTED_ENVIRONMENT).ok()
     }
@@ -71,10 +71,15 @@ mod tests {
 
     // TODO: If I only need the key itself, don't return the other things.
     fn generate_key(legacy: &dyn IKeyMintDevice, kps: Vec<KeyParameter>) -> KeyCreationResult {
-        let creation_result = legacy.generateKey(&kps).expect("Failed to generate key");
+        let creation_result =
+            legacy.generateKey(&kps, None /* attest_key */).expect("Failed to generate key");
         assert_ne!(creation_result.keyBlob.len(), 0);
         creation_result
     }
+
+    // Per RFC 5280 4.1.2.5, an undefined expiration (not-after) field should be set to GeneralizedTime
+    // 999912312359559, which is 253402300799000 ms from Jan 1, 1970.
+    const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
 
     fn generate_rsa_key(legacy: &dyn IKeyMintDevice, encrypt: bool, attest: bool) -> Vec<u8> {
         let mut kps = vec![
@@ -96,6 +101,14 @@ mod tests {
             KeyParameter {
                 tag: Tag::PURPOSE,
                 value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN),
+            },
+            KeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+            KeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
             },
         ];
         if encrypt {
@@ -151,7 +164,8 @@ mod tests {
         }];
         let kf = KeyFormat::RAW;
         let kd = [0; 16];
-        let creation_result = legacy.importKey(&kps, kf, &kd).expect("Failed to import key");
+        let creation_result =
+            legacy.importKey(&kps, kf, &kd, None /* attest_key */).expect("Failed to import key");
         assert_ne!(creation_result.keyBlob.len(), 0);
         assert_eq!(creation_result.certificateChain.len(), 0);
     }
@@ -309,9 +323,15 @@ mod tests {
     #[test]
     fn test_secure_clock() {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let secure_clock = compat_service.getSecureClock().unwrap();
+        let compat_service: binder::Strong<dyn IKeystoreCompatService> =
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let secure_clock = match compat_service.getSecureClock() {
+            Ok(sc) => sc,
+            _ => return,
+        };
 
         let challenge = 42;
         let result = secure_clock.generateTimeStamp(challenge);
@@ -324,10 +344,16 @@ mod tests {
     #[test]
     fn test_shared_secret() {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let shared_secret =
-            compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let compat_service: binder::Strong<dyn IKeystoreCompatService> =
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let shared_secret = match compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT)
+        {
+            Ok(ss) => ss,
+            _ => return,
+        };
 
         let result = shared_secret.getSharedSecretParameters();
         assert!(result.is_ok(), "{:?}", result);

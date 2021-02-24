@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "system_security_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["system_security_license"],
+}
+
 aidl_interface {
     name: "android.security.attestationmanager",
     srcs: [ "android/security/attestationmanager/*.aidl", ],
@@ -70,6 +79,45 @@ aidl_interface {
         "android.hardware.security.secureclock",
         "android.hardware.security.sharedsecret",
     ],
+    unstable: true,
+    backend: {
+        java: {
+            sdk_version: "module_current",
+        },
+        rust: {
+            enabled: true,
+        },
+        ndk: {
+            enabled: true,
+        }
+    },
+}
+
+aidl_interface {
+    name: "android.security.remoteprovisioning",
+    srcs: [ "android/security/remoteprovisioning/*.aidl" ],
+    imports: [
+        "android.hardware.security.keymint",
+    ],
+    unstable: true,
+    backend: {
+        java: {
+            enabled: true,
+            sdk_version: "module_current",
+            platform_apis: true,
+        },
+        ndk: {
+            enabled: true,
+        },
+        rust: {
+            enabled: true,
+        },
+    },
+}
+
+aidl_interface {
+    name: "android.security.usermanager",
+    srcs: [ "android/security/usermanager/*.aidl" ],
     unstable: true,
     backend: {
         java: {
