@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-rust_library {
-    name: "libkeystore2",
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "system_security_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["system_security_license"],
+}
+
+rust_defaults {
+    name: "libkeystore2_defaults",
     crate_name: "keystore2",
     srcs: ["src/lib.rs"],
 
@@ -23,6 +32,8 @@ rust_library {
         "android.security.apc-rust",
         "android.security.authorization-rust",
         "android.security.compat-rust",
+        "android.security.remoteprovisioning-rust",
+        "android.security.usermanager-rust",
         "android.system.keystore2-V1-rust",
         "libanyhow",
         "libbinder_rs",
@@ -31,6 +42,8 @@ rust_library {
         "libkeystore2_crypto_rust",
         "libkeystore2_km_compat",
         "libkeystore2_selinux",
+        "libkeystore2_system_property-rust",
+        "libkeystore2_vintf_rust",
         "liblazy_static",
         "liblibc",
         "liblibsqlite3_sys",
@@ -39,6 +52,11 @@ rust_library {
         "librusqlite",
         "libthiserror",
     ],
+}
+
+rust_library {
+    name: "libkeystore2",
+    defaults: ["libkeystore2_defaults"],
 }
 
 rust_library {
@@ -54,32 +72,13 @@ rust_library {
 rust_test {
     name: "keystore2_test",
     crate_name: "keystore2",
-    srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    compile_multilib: "first",
+    defaults: ["libkeystore2_defaults"],
     rustlibs: [
-        "android.hardware.security.keymint-V1-rust",
-        "android.hardware.security.secureclock-V1-rust",
-        "android.security.apc-rust",
-        "android.security.authorization-rust",
-        "android.security.compat-rust",
-        "android.system.keystore2-V1-rust",
         "libandroid_logger",
-        "libanyhow",
-        "libbinder_rs",
-        "libkeystore2_aaid-rust",
-        "libkeystore2_apc_compat-rust",
-        "libkeystore2_crypto_rust",
-        "libkeystore2_km_compat",
-        "libkeystore2_selinux",
         "libkeystore2_test_utils",
-        "liblazy_static",
-        "liblibc",
-        "liblibsqlite3_sys",
-        "liblog_rust",
-        "librand",
-        "librusqlite",
-        "libthiserror",
     ],
 }
 
@@ -91,6 +90,7 @@ rust_binary {
         "libbinder_rs",
         "libkeystore2",
         "liblog_rust",
+        "libvpnprofilestore-rust",
     ],
     init_rc: ["keystore2.rc"],
 }

@@ -1,3 +1,12 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "system_security_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["system_security_license"],
+}
+
 cc_defaults {
     name: "identity_defaults",
     cflags: [
@@ -39,8 +48,8 @@ cc_binary {
         "libkeystore-attestation-application-id",
     ],
     static_libs: [
-        "android.hardware.identity-unstable-cpp",
-        "android.hardware.keymaster-unstable-cpp",
+        "android.hardware.identity-V3-cpp",
+        "android.hardware.keymaster-V3-cpp",
         "libcppbor",
     ]
 }

@@ -24,7 +24,6 @@
 
 using ::aidl::android::hardware::security::keymint::Algorithm;
 using ::aidl::android::hardware::security::keymint::BlockMode;
-using ::aidl::android::hardware::security::keymint::ByteArray;
 using ::aidl::android::hardware::security::keymint::Certificate;
 using ::aidl::android::hardware::security::keymint::Digest;
 using ::aidl::android::hardware::security::keymint::ErrorCode;
@@ -47,7 +46,7 @@ static std::vector<uint8_t> generateAESKey(std::shared_ptr<KeyMintDevice> device
         KMV1::makeKeyParameter(KMV1::TAG_PURPOSE, KeyPurpose::DECRYPT),
     });
     KeyCreationResult creationResult;
-    auto status = device->generateKey(keyParams, &creationResult);
+    auto status = device->generateKey(keyParams, std::nullopt /* attest_key */, &creationResult);
     if (!status.isOk()) {
         return {};
     }
@@ -100,18 +99,19 @@ TEST(SlotTest, TestSlots) {
     // Calling finish should free up a slot.
     auto last = operations.back();
     operations.pop_back();
-    std::optional<KeyParameterArray> kpa;
     std::vector<uint8_t> byteVec;
-    auto status = last->finish(std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                               &kpa, &byteVec);
+    auto status = last->finish(std::nullopt /* input */, std::nullopt /* signature */,
+                               std::nullopt /* authToken */, std::nullopt /* timestampToken */,
+                               std::nullopt /* confirmationToken */, &byteVec);
     ASSERT_TRUE(status.isOk());
     result = begin(device, true);
     ASSERT_TRUE(std::holds_alternative<BeginResult>(result));
     operations.push_back(std::get<BeginResult>(result).operation);
 
     // Calling finish and abort on an already-finished operation should not free up another slot.
-    status = last->finish(std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                          &kpa, &byteVec);
+    status = last->finish(std::nullopt /* input */, std::nullopt /* signature */,
+                          std::nullopt /* authToken */, std::nullopt /* timestampToken */,
+                          std::nullopt /* confirmationToken */, &byteVec);
     ASSERT_TRUE(!status.isOk());
     status = last->abort();
     ASSERT_TRUE(!status.isOk());
@@ -130,8 +130,9 @@ TEST(SlotTest, TestSlots) {
     operations.push_back(std::get<BeginResult>(result).operation);
 
     // Calling finish and abort on an already-aborted operation should not free up another slot.
-    status = last->finish(std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                          &kpa, &byteVec);
+    status = last->finish(std::nullopt /* input */, std::nullopt /* signature */,
+                          std::nullopt /* authToken */, std::nullopt /* timestampToken */,
+                          std::nullopt /* confirmationToken */, &byteVec);
     ASSERT_TRUE(!status.isOk());
     status = last->abort();
     ASSERT_TRUE(!status.isOk());
@@ -140,23 +141,23 @@ TEST(SlotTest, TestSlots) {
     ASSERT_EQ(std::get<ScopedAStatus>(result).getServiceSpecificError(),
               static_cast<int32_t>(ErrorCode::TOO_MANY_OPERATIONS));
 
-    // Generating a certificate with signWith also uses a slot.
+    // Generating a certificate with signWith uses a slot but falls back to not using one.
     auto kps = std::vector<KeyParameter>({
         KMV1::makeKeyParameter(KMV1::TAG_ALGORITHM, Algorithm::RSA),
         KMV1::makeKeyParameter(KMV1::TAG_KEY_SIZE, 2048),
         KMV1::makeKeyParameter(KMV1::TAG_RSA_PUBLIC_EXPONENT, 65537),
         KMV1::makeKeyParameter(KMV1::TAG_DIGEST, Digest::SHA_2_256),
         KMV1::makeKeyParameter(KMV1::TAG_PURPOSE, KeyPurpose::SIGN),
+        KMV1::makeKeyParameter(KMV1::TAG_CERTIFICATE_NOT_BEFORE, 0),
+        KMV1::makeKeyParameter(KMV1::TAG_CERTIFICATE_NOT_AFTER, 253402300799000),
         KMV1::makeKeyParameter(KMV1::TAG_NO_AUTH_REQUIRED, true),
     });
     KeyCreationResult creationResult;
-    status = device->generateKey(kps, &creationResult);
-    ASSERT_TRUE(!status.isOk());
-    ASSERT_EQ(status.getServiceSpecificError(),
-              static_cast<int32_t>(ErrorCode::TOO_MANY_OPERATIONS));
+    status = device->generateKey(kps, std::nullopt /* attest_key */, &creationResult);
+    ASSERT_TRUE(status.isOk());
     // But generating a certificate with signCert does not use a slot.
     kps.pop_back();
-    status = device->generateKey(kps, &creationResult);
+    status = device->generateKey(kps, std::nullopt /* attest_key */, &creationResult);
     ASSERT_TRUE(status.isOk());
 
     // Destructing operations should free up their slots.

@@ -66,9 +66,12 @@ bool Keymaster::initialize() {
         }
     }
 
+    if (devToUse == nullptr) {
+        LOG(WARNING) << "Didn't find a keymaster to use.";
+    }
     mDevice = devToUse;
 
-    return true;
+    return mDevice != nullptr;
 }
 
 std::optional<Keymaster> Keymaster::getInstance() {

@@ -14,13 +14,10 @@
 
 //! This is the Keystore 2.0 Enforcements module.
 // TODO: more description to follow.
+use crate::database::{AuthTokenEntry, MonotonicRawTime};
 use crate::error::{map_binder_status, Error, ErrorCode};
 use crate::globals::{get_timestamp_service, ASYNC_TASK, DB, ENFORCEMENTS};
 use crate::key_parameter::{KeyParameter, KeyParameterValue};
-use crate::{
-    database::{AuthTokenEntry, MonotonicRawTime},
-    gc::Gc,
-};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, ErrorCode::ErrorCode as Ec, HardwareAuthToken::HardwareAuthToken,
     HardwareAuthenticatorType::HardwareAuthenticatorType,
@@ -29,14 +26,22 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
     ISecureClock::ISecureClock, TimeStampToken::TimeStampToken,
 };
-use android_system_keystore2::aidl::android::system::keystore2::OperationChallenge::OperationChallenge;
-use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
-use std::sync::{
-    mpsc::{channel, Receiver, Sender},
-    Arc, Mutex, Weak,
+use android_system_keystore2::aidl::android::system::keystore2::{
+    IKeystoreSecurityLevel::KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING,
+    OperationChallenge::OperationChallenge,
 };
-use std::time::SystemTime;
+use android_system_keystore2::binder::Strong;
+use anyhow::{Context, Result};
+use keystore2_system_property::PropertyWatcher;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        mpsc::{channel, Receiver, Sender, TryRecvError},
+        Arc, Mutex, Weak,
+    },
+    time::SystemTime,
+};
 
 #[derive(Debug)]
 enum AuthRequestState {
@@ -133,6 +138,7 @@ pub struct AuthInfo {
     state: DeferredAuthState,
     /// An optional key id required to update the usage count if the key usage is limited.
     key_usage_limited: Option<i64>,
+    confirmation_token_receiver: Option<Arc<Mutex<Option<Receiver<Vec<u8>>>>>>,
 }
 
 struct TokenReceiverMap {
@@ -198,7 +204,7 @@ impl TokenReceiver {
 }
 
 fn get_timestamp_token(challenge: i64) -> Result<TimeStampToken, Error> {
-    let dev: Box<dyn ISecureClock> = get_timestamp_service()
+    let dev: Strong<dyn ISecureClock> = get_timestamp_service()
         .expect(concat!(
             "Secure Clock service must be present ",
             "if TimeStampTokens are required."
@@ -240,7 +246,7 @@ impl AuthInfo {
                 let token_receiver = TokenReceiver(Arc::downgrade(&auth_request));
                 ENFORCEMENTS.register_op_auth_receiver(challenge, token_receiver);
 
-                ASYNC_TASK.queue_hi(move || timestamp_token_request(challenge, sender));
+                ASYNC_TASK.queue_hi(move |_| timestamp_token_request(challenge, sender));
                 self.state = DeferredAuthState::Waiting(auth_request);
                 Some(OperationChallenge { challenge })
             }
@@ -248,7 +254,7 @@ impl AuthInfo {
                 let hat = (*hat).clone();
                 let (sender, receiver) = channel::<Result<TimeStampToken, Error>>();
                 let auth_request = AuthRequest::timestamp(hat, receiver);
-                ASYNC_TASK.queue_hi(move || timestamp_token_request(challenge, sender));
+                ASYNC_TASK.queue_hi(move |_| timestamp_token_request(challenge, sender));
                 self.state = DeferredAuthState::Waiting(auth_request);
                 None
             }
@@ -264,8 +270,32 @@ impl AuthInfo {
 
     /// This function is the authorization hook called before operation finish.
     /// It returns the auth tokens required by the operation to commence finish.
-    pub fn before_finish(&mut self) -> Result<(Option<HardwareAuthToken>, Option<TimeStampToken>)> {
-        self.get_auth_tokens()
+    /// The third token is a confirmation token.
+    pub fn before_finish(
+        &mut self,
+    ) -> Result<(Option<HardwareAuthToken>, Option<TimeStampToken>, Option<Vec<u8>>)> {
+        let mut confirmation_token: Option<Vec<u8>> = None;
+        if let Some(ref confirmation_token_receiver) = self.confirmation_token_receiver {
+            let locked_receiver = confirmation_token_receiver.lock().unwrap();
+            if let Some(ref receiver) = *locked_receiver {
+                loop {
+                    match receiver.try_recv() {
+                        // As long as we get tokens we loop and discard all but the most
+                        // recent one.
+                        Ok(t) => confirmation_token = Some(t),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            log::error!(concat!(
+                                "We got disconnected from the APC service, ",
+                                "this should never happen."
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.get_auth_tokens().map(|(hat, tst)| (hat, tst, confirmation_token))
     }
 
     /// This function is the authorization hook called after finish succeeded.
@@ -276,16 +306,12 @@ impl AuthInfo {
         if let Some(key_id) = self.key_usage_limited {
             // On the last successful use, the key gets deleted. In this case we
             // have to notify the garbage collector.
-            let need_gc = DB
-                .with(|db| {
-                    db.borrow_mut()
-                        .check_and_update_key_usage_count(key_id)
-                        .context("Trying to update key usage count.")
-                })
-                .context("In after_finish.")?;
-            if need_gc {
-                Gc::notify_gc();
-            }
+            DB.with(|db| {
+                db.borrow_mut()
+                    .check_and_update_key_usage_count(key_id)
+                    .context("Trying to update key usage count.")
+            })
+            .context("In after_finish.")?;
         }
         Ok(())
     }
@@ -327,6 +353,7 @@ impl AuthInfo {
 }
 
 /// Enforcements data structure
+#[derive(Default)]
 pub struct Enforcements {
     /// This hash set contains the user ids for whom the device is currently unlocked. If a user id
     /// is not in the set, it implies that the device is locked for the user.
@@ -337,15 +364,22 @@ pub struct Enforcements {
     /// stale, because the operation gets dropped before an auth token is received, the map
     /// is cleaned up in regular intervals.
     op_auth_map: TokenReceiverMap,
+    /// The enforcement module will try to get a confirmation token from this channel whenever
+    /// an operation that requires confirmation finishes.
+    confirmation_token_receiver: Arc<Mutex<Option<Receiver<Vec<u8>>>>>,
+    /// Highest boot level seen in keystore.boot_level; used to enforce MAX_BOOT_LEVEL tag.
+    boot_level: AtomicI32,
 }
 
 impl Enforcements {
-    /// Creates an enforcement object with the two data structures it holds and the sender as None.
-    pub fn new() -> Self {
-        Enforcements {
-            device_unlocked_set: Mutex::new(HashSet::new()),
-            op_auth_map: Default::default(),
-        }
+    /// Install the confirmation token receiver. The enforcement module will try to get a
+    /// confirmation token from this channel whenever an operation that requires confirmation
+    /// finishes.
+    pub fn install_confirmation_token_receiver(
+        &self,
+        confirmation_token_receiver: Receiver<Vec<u8>>,
+    ) {
+        *self.confirmation_token_receiver.lock().unwrap() = Some(confirmation_token_receiver);
     }
 
     /// Checks if a create call is authorized, given key parameters and operation parameters.
@@ -371,7 +405,11 @@ impl Enforcements {
             None => {
                 return Ok((
                     None,
-                    AuthInfo { state: DeferredAuthState::NoAuthRequired, key_usage_limited: None },
+                    AuthInfo {
+                        state: DeferredAuthState::NoAuthRequired,
+                        key_usage_limited: None,
+                        confirmation_token_receiver: None,
+                    },
                 ))
             }
         };
@@ -431,6 +469,8 @@ impl Enforcements {
         let mut allow_while_on_body = false;
         let mut unlocked_device_required = false;
         let mut key_usage_limited: Option<i64> = None;
+        let mut confirmation_token_receiver: Option<Arc<Mutex<Option<Receiver<Vec<u8>>>>>> = None;
+        let mut max_boot_level: Option<i32> = None;
 
         // iterate through key parameters, recording information we need for authorization
         // enforcements later, or enforcing authorizations in place, where applicable
@@ -494,6 +534,12 @@ impl Enforcements {
                     // in the database again and check and update the counter.
                     key_usage_limited = Some(key_id);
                 }
+                KeyParameterValue::TrustedConfirmationRequired => {
+                    confirmation_token_receiver = Some(self.confirmation_token_receiver.clone());
+                }
+                KeyParameterValue::MaxBootLevel(level) => {
+                    max_boot_level = Some(*level);
+                }
                 // NOTE: as per offline discussion, sanitizing key parameters and rejecting
                 // create operation if any non-allowed tags are present, is not done in
                 // authorize_create (unlike in legacy keystore where AuthorizeBegin is rejected if
@@ -547,10 +593,21 @@ impl Enforcements {
             }
         }
 
+        if let Some(level) = max_boot_level {
+            if level < self.boot_level.load(Ordering::SeqCst) {
+                return Err(Error::Km(Ec::BOOT_LEVEL_EXCEEDED))
+                    .context("In authorize_create: boot level is too late.");
+            }
+        }
+
         if !unlocked_device_required && no_auth_required {
             return Ok((
                 None,
-                AuthInfo { state: DeferredAuthState::NoAuthRequired, key_usage_limited },
+                AuthInfo {
+                    state: DeferredAuthState::NoAuthRequired,
+                    key_usage_limited,
+                    confirmation_token_receiver,
+                },
             ));
         }
 
@@ -625,7 +682,9 @@ impl Enforcements {
             (None, _, true) => (None, DeferredAuthState::OpAuthRequired),
             (None, _, false) => (None, DeferredAuthState::NoAuthRequired),
         })
-        .map(|(hat, state)| (hat, AuthInfo { state, key_usage_limited }))
+        .map(|(hat, state)| {
+            (hat, AuthInfo { state, key_usage_limited, confirmation_token_receiver })
+        })
     }
 
     fn find_auth_token<F>(p: F) -> Result<Option<(AuthTokenEntry, MonotonicRawTime)>>
@@ -694,11 +753,47 @@ impl Enforcements {
     fn register_op_auth_receiver(&self, challenge: i64, recv: TokenReceiver) {
         self.op_auth_map.add_receiver(challenge, recv);
     }
-}
 
-impl Default for Enforcements {
-    fn default() -> Self {
-        Self::new()
+    /// Given the set of key parameters and flags, check if super encryption is required.
+    pub fn super_encryption_required(key_parameters: &[KeyParameter], flags: Option<i32>) -> bool {
+        let auth_bound = key_parameters.iter().any(|kp| kp.get_tag() == Tag::USER_SECURE_ID);
+
+        let skip_lskf_binding = if let Some(flags) = flags {
+            (flags & KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING) != 0
+        } else {
+            false
+        };
+
+        auth_bound && !skip_lskf_binding
+    }
+
+    /// Watch the `keystore.boot_level` system property, and keep self.boot_level up to date.
+    /// Blocks waiting for system property changes, so must be run in its own thread.
+    pub fn watch_boot_level(&self) -> Result<()> {
+        let mut w = PropertyWatcher::new("keystore.boot_level")?;
+        loop {
+            fn parse_value(_name: &str, value: &str) -> Result<Option<i32>> {
+                Ok(if value == "end" { None } else { Some(value.parse::<i32>()?) })
+            }
+            match w.read(parse_value)? {
+                Some(level) => {
+                    let old = self.boot_level.fetch_max(level, Ordering::SeqCst);
+                    log::info!(
+                        "Read keystore.boot_level: {}; boot level {} -> {}",
+                        level,
+                        old,
+                        std::cmp::max(old, level)
+                    );
+                }
+                None => {
+                    log::info!("keystore.boot_level is `end`, finishing.");
+                    self.boot_level.fetch_max(i32::MAX, Ordering::SeqCst);
+                    break;
+                }
+            }
+            w.wait()?;
+        }
+        Ok(())
     }
 }
 

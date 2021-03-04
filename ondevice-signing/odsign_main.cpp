@@ -39,7 +39,7 @@ using android::base::Result;
 const std::string kSigningKeyBlob = "/data/misc/odsign/key.blob";
 const std::string kSigningKeyCert = "/data/misc/odsign/key.cert";
 
-const std::string kArtArtifactsDir = "/data/misc/apexdata/com.android.art/system";
+const std::string kArtArtifactsDir = "/data/misc/apexdata/com.android.art/dalvik-cache";
 
 static const char* kOdrefreshPath = "/apex/com.android.art/bin/odrefresh";
 
@@ -50,6 +50,7 @@ static const bool kForceCompilation = false;
 Result<void> addCertToFsVerityKeyring(const std::string& path) {
     const char* const argv[] = {kFsVerityInitPath, "--load-extra-key", "fsv_ods"};
 
+    // NOLINTNEXTLINE(android-cloexec-open): Deliberately not O_CLOEXEC
     int fd = open(path.c_str(), O_RDONLY);
     pid_t pid = fork();
     if (pid == 0) {
@@ -91,7 +92,7 @@ Result<KeymasterSigningKey> loadAndVerifyExistingKey() {
     return KeymasterSigningKey::loadFromBlobAndVerify(kSigningKeyBlob);
 }
 
-Result<void> verifyAndLoadExistingCert(const KeymasterSigningKey& key) {
+Result<void> verifyExistingCert(const KeymasterSigningKey& key) {
     if (access(kSigningKeyCert.c_str(), F_OK) < 0) {
         return ErrnoError() << "Key certificate not found: " << kSigningKeyCert;
     }
@@ -107,11 +108,6 @@ Result<void> verifyAndLoadExistingCert(const KeymasterSigningKey& key) {
     if (publicKeyFromExistingCert.value() != trustedPublicKey.value()) {
         return Error() << "Public key of existing certificate at " << kSigningKeyCert
                        << " does not match signing public key.";
-    }
-
-    auto cert_add_result = addCertToFsVerityKeyring(kSigningKeyCert);
-    if (!cert_add_result.ok()) {
-        return cert_add_result.error();
     }
 
     // At this point, we know the cert matches
@@ -174,7 +170,7 @@ int main(int /* argc */, char** /* argv */) {
         LOG(INFO) << "Found and verified existing key: " << kSigningKeyBlob;
     }
 
-    auto existing_cert = verifyAndLoadExistingCert(key.value());
+    auto existing_cert = verifyExistingCert(key.value());
     if (!existing_cert.ok()) {
         LOG(WARNING) << existing_cert.error().message();
 
@@ -185,14 +181,14 @@ int main(int /* argc */, char** /* argv */) {
             // TODO apparently the key become invalid - delete the blob / cert
             return -1;
         }
-        auto cert_add_result = addCertToFsVerityKeyring(kSigningKeyCert);
-        if (!cert_add_result.ok()) {
-            LOG(ERROR) << "Failed to add certificate to fs-verity keyring: "
-                       << cert_add_result.error().message();
-            return -1;
-        }
     } else {
         LOG(INFO) << "Found and verified existing public key certificate: " << kSigningKeyCert;
+    }
+    auto cert_add_result = addCertToFsVerityKeyring(kSigningKeyCert);
+    if (!cert_add_result.ok()) {
+        LOG(ERROR) << "Failed to add certificate to fs-verity keyring: "
+                   << cert_add_result.error().message();
+        return -1;
     }
 
     auto verityStatus = verifyAllFilesInVerity(kArtArtifactsDir);

@@ -31,41 +31,55 @@ mod tests {
         Algorithm::Algorithm, BeginResult::BeginResult, BlockMode::BlockMode, Digest::Digest,
         ErrorCode::ErrorCode, HardwareAuthToken::HardwareAuthToken, IKeyMintDevice::IKeyMintDevice,
         KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat, KeyParameter::KeyParameter,
-        KeyParameterArray::KeyParameterArray, KeyParameterValue::KeyParameterValue,
-        KeyPurpose::KeyPurpose, PaddingMode::PaddingMode, SecurityLevel::SecurityLevel, Tag::Tag,
+        KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
+        SecurityLevel::SecurityLevel, Tag::Tag,
     };
-    use android_hardware_security_keymint::binder;
+    use android_hardware_security_keymint::binder::{self, Strong};
     use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 
     static COMPAT_NAME: &str = "android.security.compat";
 
-    fn get_device() -> Box<dyn IKeyMintDevice> {
+    fn get_device() -> Option<Strong<dyn IKeyMintDevice>> {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        compat_service.getKeyMintDevice(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap()
+        let compat_service: Strong<dyn IKeystoreCompatService> =
+            binder::get_interface(COMPAT_NAME).ok()?;
+        compat_service.getKeyMintDevice(SecurityLevel::TRUSTED_ENVIRONMENT).ok()
+    }
+
+    macro_rules! get_device_or_skip_test {
+        () => {
+            match get_device() {
+                Some(dev) => dev,
+                None => return,
+            }
+        };
     }
 
     #[test]
     fn test_get_hardware_info() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let hinfo = legacy.getHardwareInfo();
         assert!(hinfo.is_ok());
     }
 
     #[test]
     fn test_add_rng_entropy() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let result = legacy.addRngEntropy(&[42; 16]);
         assert!(result.is_ok(), "{:?}", result);
     }
 
     // TODO: If I only need the key itself, don't return the other things.
     fn generate_key(legacy: &dyn IKeyMintDevice, kps: Vec<KeyParameter>) -> KeyCreationResult {
-        let creation_result = legacy.generateKey(&kps).expect("Failed to generate key");
+        let creation_result =
+            legacy.generateKey(&kps, None /* attest_key */).expect("Failed to generate key");
         assert_ne!(creation_result.keyBlob.len(), 0);
         creation_result
     }
+
+    // Per RFC 5280 4.1.2.5, an undefined expiration (not-after) field should be set to GeneralizedTime
+    // 999912312359559, which is 253402300799000 ms from Jan 1, 1970.
+    const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
 
     fn generate_rsa_key(legacy: &dyn IKeyMintDevice, encrypt: bool, attest: bool) -> Vec<u8> {
         let mut kps = vec![
@@ -87,6 +101,14 @@ mod tests {
             KeyParameter {
                 tag: Tag::PURPOSE,
                 value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN),
+            },
+            KeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+            KeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
             },
         ];
         if encrypt {
@@ -117,39 +139,40 @@ mod tests {
 
     #[test]
     fn test_generate_key_no_encrypt() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         generate_rsa_key(legacy.as_ref(), false, false);
     }
 
     #[test]
     fn test_generate_key_encrypt() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         generate_rsa_key(legacy.as_ref(), true, false);
     }
 
     #[test]
     fn test_generate_key_attested() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         generate_rsa_key(legacy.as_ref(), false, true);
     }
 
     #[test]
     fn test_import_key() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let kps = [KeyParameter {
             tag: Tag::ALGORITHM,
             value: KeyParameterValue::Algorithm(Algorithm::AES),
         }];
         let kf = KeyFormat::RAW;
         let kd = [0; 16];
-        let creation_result = legacy.importKey(&kps, kf, &kd).expect("Failed to import key");
+        let creation_result =
+            legacy.importKey(&kps, kf, &kd, None /* attest_key */).expect("Failed to import key");
         assert_ne!(creation_result.keyBlob.len(), 0);
         assert_eq!(creation_result.certificateChain.len(), 0);
     }
 
     #[test]
     fn test_import_wrapped_key() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let result = legacy.importWrappedKey(&[], &[], &[], &[], 0, 0);
         // For this test we only care that there was no crash.
         assert!(result.is_ok() || result.is_err());
@@ -157,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_key() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let blob = generate_rsa_key(legacy.as_ref(), false, false);
         let result = legacy.upgradeKey(&blob, &[]);
         // For this test we only care that there was no crash.
@@ -166,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_delete_key() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let blob = generate_rsa_key(legacy.as_ref(), false, false);
         let result = legacy.deleteKey(&blob);
         assert!(result.is_ok(), "{:?}", result);
@@ -174,14 +197,14 @@ mod tests {
 
     #[test]
     fn test_delete_all_keys() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let result = legacy.deleteAllKeys();
         assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]
     fn test_destroy_attestation_ids() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let result = legacy.destroyAttestationIds();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().service_specific_error(), ErrorCode::UNIMPLEMENTED.0,);
@@ -243,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_begin_abort() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let blob = generate_aes_key(legacy.as_ref());
         let begin_result = begin(legacy.as_ref(), &blob, KeyPurpose::ENCRYPT, None);
         let operation = begin_result.operation.unwrap();
@@ -255,54 +278,72 @@ mod tests {
 
     #[test]
     fn test_begin_update_finish() {
-        let legacy = get_device();
+        let legacy = get_device_or_skip_test!();
         let blob = generate_aes_key(legacy.as_ref());
 
         let begin_result = begin(legacy.as_ref(), &blob, KeyPurpose::ENCRYPT, None);
         let operation = begin_result.operation.unwrap();
-        let params = KeyParameterArray {
-            params: vec![KeyParameter {
-                tag: Tag::ASSOCIATED_DATA,
-                value: KeyParameterValue::Blob(b"foobar".to_vec()),
-            }],
-        };
+
+        let update_aad_result = operation.updateAad(
+            &b"foobar".to_vec(),
+            None, /* authToken */
+            None, /* timestampToken */
+        );
+        assert!(update_aad_result.is_ok(), "{:?}", update_aad_result);
+
         let message = [42; 128];
-        let mut out_params = None;
-        let result =
-            operation.finish(Some(&params), Some(&message), None, None, None, &mut out_params);
+        let result = operation.finish(
+            Some(&message),
+            None, /* signature */
+            None, /* authToken */
+            None, /* timestampToken */
+            None, /* confirmationToken */
+        );
         assert!(result.is_ok(), "{:?}", result);
         let ciphertext = result.unwrap();
         assert!(!ciphertext.is_empty());
-        assert!(out_params.is_some());
 
         let begin_result =
             begin(legacy.as_ref(), &blob, KeyPurpose::DECRYPT, Some(begin_result.params));
+
         let operation = begin_result.operation.unwrap();
-        let mut out_params = None;
-        let mut output = None;
+
+        let update_aad_result = operation.updateAad(
+            &b"foobar".to_vec(),
+            None, /* authToken */
+            None, /* timestampToken */
+        );
+        assert!(update_aad_result.is_ok(), "{:?}", update_aad_result);
+
         let result = operation.update(
-            Some(&params),
-            Some(&ciphertext),
-            None,
-            None,
-            &mut out_params,
-            &mut output,
+            &ciphertext,
+            None, /* authToken */
+            None, /* timestampToken */
         );
         assert!(result.is_ok(), "{:?}", result);
-        assert_eq!(result.unwrap(), message.len() as i32);
-        assert!(output.is_some());
-        assert_eq!(output.unwrap().data, message.to_vec());
-        let result = operation.finish(Some(&params), None, None, None, None, &mut out_params);
+        assert_eq!(result.unwrap(), message);
+        let result = operation.finish(
+            None, /* input */
+            None, /* signature */
+            None, /* authToken */
+            None, /* timestampToken */
+            None, /* confirmationToken */
+        );
         assert!(result.is_ok(), "{:?}", result);
-        assert!(out_params.is_some());
     }
 
     #[test]
     fn test_secure_clock() {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let secure_clock = compat_service.getSecureClock().unwrap();
+        let compat_service: binder::Strong<dyn IKeystoreCompatService> =
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let secure_clock = match compat_service.getSecureClock() {
+            Ok(sc) => sc,
+            _ => return,
+        };
 
         let challenge = 42;
         let result = secure_clock.generateTimeStamp(challenge);
@@ -315,10 +356,16 @@ mod tests {
     #[test]
     fn test_shared_secret() {
         add_keymint_device_service();
-        let compat_service: Box<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let shared_secret =
-            compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let compat_service: binder::Strong<dyn IKeystoreCompatService> =
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let shared_secret = match compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT)
+        {
+            Ok(ss) => ss,
+            _ => return,
+        };
 
         let result = shared_secret.getSharedSecretParameters();
         assert!(result.is_ok(), "{:?}", result);

@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::permission;
 use crate::permission::{KeyPerm, KeyPermSet, KeystorePerm};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    KeyCharacteristics::KeyCharacteristics, SecurityLevel::SecurityLevel, Tag::Tag,
+    KeyCharacteristics::KeyCharacteristics,
 };
 use android_security_apc::aidl::android::security::apc::{
     IProtectedConfirmation::{FLAG_UI_OPTION_INVERTED, FLAG_UI_OPTION_MAGNIFIED},
@@ -103,7 +103,7 @@ impl Asp {
     }
 
     /// Clones the owned SpIBinder and attempts to convert it into the requested interface.
-    pub fn get_interface<T: FromIBinder + ?Sized>(&self) -> anyhow::Result<Box<T>> {
+    pub fn get_interface<T: FromIBinder + ?Sized>(&self) -> anyhow::Result<binder::Strong<T>> {
         // We can use unwrap here because we never panic when locked, so the mutex
         // can never be poisoned.
         let lock = self.0.lock().unwrap();
@@ -131,10 +131,6 @@ pub fn key_characteristics_to_internal(
         .flat_map(|aidl_key_char| {
             let sec_level = aidl_key_char.securityLevel;
             aidl_key_char.authorizations.into_iter().map(move |aidl_kp| {
-                let sec_level = match (aidl_kp.tag, sec_level) {
-                    (Tag::ORIGIN, SecurityLevel::SOFTWARE) => SecurityLevel::TRUSTED_ENVIRONMENT,
-                    _ => sec_level,
-                };
                 crate::key_parameter::KeyParameter::new(aidl_kp.into(), sec_level)
             })
         })
