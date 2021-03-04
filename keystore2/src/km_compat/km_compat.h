@@ -18,6 +18,7 @@
 
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
+#include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/secureclock/BnSecureClock.h>
 #include <aidl/android/hardware/security/sharedsecret/BnSharedSecret.h>
 #include <aidl/android/security/compat/BnKeystoreCompatService.h>
@@ -27,8 +28,8 @@
 
 #include "certificate_utils.h"
 
+using ::aidl::android::hardware::security::keymint::AttestationKey;
 using ::aidl::android::hardware::security::keymint::BeginResult;
-using ::aidl::android::hardware::security::keymint::ByteArray;
 using ::aidl::android::hardware::security::keymint::Certificate;
 using ::aidl::android::hardware::security::keymint::HardwareAuthToken;
 using ::aidl::android::hardware::security::keymint::KeyCharacteristics;
@@ -36,11 +37,11 @@ using ::aidl::android::hardware::security::keymint::KeyCreationResult;
 using ::aidl::android::hardware::security::keymint::KeyFormat;
 using ::aidl::android::hardware::security::keymint::KeyMintHardwareInfo;
 using ::aidl::android::hardware::security::keymint::KeyParameter;
-using ::aidl::android::hardware::security::keymint::KeyParameterArray;
 using ::aidl::android::hardware::security::keymint::KeyPurpose;
 using KeyMintSecurityLevel = ::aidl::android::hardware::security::keymint::SecurityLevel;
 using V4_0_ErrorCode = ::android::hardware::keymaster::V4_0::ErrorCode;
 using ::aidl::android::hardware::security::keymint::IKeyMintDevice;
+using KMV1_ErrorCode = ::aidl::android::hardware::security::keymint::ErrorCode;
 using ::aidl::android::hardware::security::secureclock::ISecureClock;
 using ::aidl::android::hardware::security::secureclock::TimeStampToken;
 using ::aidl::android::hardware::security::sharedsecret::ISharedSecret;
@@ -88,9 +89,11 @@ class KeyMintDevice : public aidl::android::hardware::security::keymint::BnKeyMi
     ScopedAStatus getHardwareInfo(KeyMintHardwareInfo* _aidl_return) override;
     ScopedAStatus addRngEntropy(const std::vector<uint8_t>& in_data) override;
     ScopedAStatus generateKey(const std::vector<KeyParameter>& in_keyParams,
+                              const std::optional<AttestationKey>& in_attestationKey,
                               KeyCreationResult* out_creationResult) override;
     ScopedAStatus importKey(const std::vector<KeyParameter>& in_inKeyParams,
                             KeyFormat in_inKeyFormat, const std::vector<uint8_t>& in_inKeyData,
+                            const std::optional<AttestationKey>& in_attestationKey,
                             KeyCreationResult* out_creationResult) override;
     ScopedAStatus importWrappedKey(const std::vector<uint8_t>& in_inWrappedKeyData,
                                    const std::vector<uint8_t>& in_inWrappingKeyBlob,
@@ -108,19 +111,27 @@ class KeyMintDevice : public aidl::android::hardware::security::keymint::BnKeyMi
                         const std::vector<KeyParameter>& in_inParams,
                         const HardwareAuthToken& in_inAuthToken,
                         BeginResult* _aidl_return) override;
+    ScopedAStatus deviceLocked(bool passwordOnly,
+                               const std::optional<TimeStampToken>& timestampToken) override;
+    ScopedAStatus earlyBootEnded() override;
+
+    ScopedAStatus performOperation(const std::vector<uint8_t>& request,
+                                   std::vector<uint8_t>* response) override;
 
     // These are public to allow testing code to use them directly.
     // This class should not be used publicly anyway.
-
-    std::variant<std::vector<Certificate>, V4_0_ErrorCode>
+    std::variant<std::vector<Certificate>, KMV1_ErrorCode>
     getCertificate(const std::vector<KeyParameter>& keyParams, const std::vector<uint8_t>& keyBlob);
 
     void setNumFreeSlots(uint8_t numFreeSlots);
 
   private:
-    std::optional<V4_0_ErrorCode> signCertificate(const std::vector<KeyParameter>& keyParams,
+    std::optional<KMV1_ErrorCode> signCertificate(const std::vector<KeyParameter>& keyParams,
                                                   const std::vector<uint8_t>& keyBlob, X509* cert);
     KeyMintSecurityLevel securityLevel_;
+
+    // Software-based KeyMint device used to implement ECDH.
+    std::shared_ptr<IKeyMintDevice> softKeyMintDevice_;
 };
 
 class KeyMintOperation : public aidl::android::hardware::security::keymint::BnKeyMintOperation {
@@ -135,19 +146,22 @@ class KeyMintOperation : public aidl::android::hardware::security::keymint::BnKe
         : mDevice(device), mOperationHandle(operationHandle), mOperationSlot(slots, isActive) {}
     ~KeyMintOperation();
 
-    ScopedAStatus update(const std::optional<KeyParameterArray>& in_inParams,
-                         const std::optional<std::vector<uint8_t>>& in_input,
-                         const std::optional<HardwareAuthToken>& in_inAuthToken,
-                         const std::optional<TimeStampToken>& in_inTimestampToken,
-                         std::optional<KeyParameterArray>* out_outParams,
-                         std::optional<ByteArray>* out_output, int32_t* _aidl_return);
-    ScopedAStatus finish(const std::optional<KeyParameterArray>& in_inParams,
-                         const std::optional<std::vector<uint8_t>>& in_input,
-                         const std::optional<std::vector<uint8_t>>& in_inSignature,
-                         const std::optional<HardwareAuthToken>& in_authToken,
-                         const std::optional<TimeStampToken>& in_inTimestampToken,
-                         std::optional<KeyParameterArray>* out_outParams,
-                         std::vector<uint8_t>* _aidl_return);
+    ScopedAStatus updateAad(const std::vector<uint8_t>& input,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            const std::optional<TimeStampToken>& timestampToken) override;
+
+    ScopedAStatus update(const std::vector<uint8_t>& input,
+                         const std::optional<HardwareAuthToken>& authToken,
+                         const std::optional<TimeStampToken>& timestampToken,
+                         std::vector<uint8_t>* output) override;
+
+    ScopedAStatus finish(const std::optional<std::vector<uint8_t>>& input,
+                         const std::optional<std::vector<uint8_t>>& signature,
+                         const std::optional<HardwareAuthToken>& authToken,
+                         const std::optional<TimeStampToken>& timeStampToken,
+                         const std::optional<std::vector<uint8_t>>& confirmationToken,
+                         std::vector<uint8_t>* output) override;
+
     ScopedAStatus abort();
 };
 

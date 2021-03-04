@@ -42,17 +42,30 @@ DEFINE_OPENSSL_OBJECT_POINTER(RSA_PSS_PARAMS);
 DEFINE_OPENSSL_OBJECT_POINTER(AUTHORITY_KEYID);
 DEFINE_OPENSSL_OBJECT_POINTER(BASIC_CONSTRAINTS);
 DEFINE_OPENSSL_OBJECT_POINTER(X509_ALGOR);
+DEFINE_OPENSSL_OBJECT_POINTER(BIGNUM);
 
 }  // namespace
 
-std::variant<CertUtilsError, X509_NAME_Ptr> makeCommonName(const std::string& name) {
+constexpr const char kDefaultCommonName[] = "Default Common Name";
+
+std::variant<CertUtilsError, X509_NAME_Ptr>
+makeCommonName(std::optional<std::reference_wrapper<const std::vector<uint8_t>>> name) {
+    if (name) {
+        const uint8_t* p = name->get().data();
+        X509_NAME_Ptr x509_name(d2i_X509_NAME(nullptr, &p, name->get().size()));
+        if (!x509_name) {
+            return CertUtilsError::MemoryAllocation;
+        }
+        return x509_name;
+    }
+
     X509_NAME_Ptr x509_name(X509_NAME_new());
     if (!x509_name) {
-        return CertUtilsError::BoringSsl;
+        return CertUtilsError::MemoryAllocation;
     }
     if (!X509_NAME_add_entry_by_txt(x509_name.get(), "CN", MBSTRING_ASC,
-                                    reinterpret_cast<const uint8_t*>(name.c_str()), name.length(),
-                                    -1 /* loc */, 0 /* set */)) {
+                                    reinterpret_cast<const uint8_t*>(kDefaultCommonName),
+                                    sizeof(kDefaultCommonName) - 1, -1 /* loc */, 0 /* set */)) {
         return CertUtilsError::BoringSsl;
     }
     return x509_name;
@@ -154,18 +167,56 @@ makeKeyUsageExtension(bool is_signing_key, bool is_encryption_key, bool is_cert_
     return key_usage;
 }
 
+template <typename Out, typename In> static Out saturate(In in) {
+    if constexpr (std::is_signed_v<Out> == std::is_signed_v<In>) {
+        if constexpr (sizeof(Out) >= sizeof(In)) {
+            // Same sign, and In fits into Out. Cast is lossless.
+            return static_cast<Out>(in);
+        } else {
+            // Out is smaller than In we may need to truncate.
+            // We pick the smaller of `out::max()` and the greater of `out::min()` and `in`.
+            return static_cast<Out>(
+                std::min(static_cast<In>(std::numeric_limits<Out>::max()),
+                         std::max(static_cast<In>(std::numeric_limits<Out>::min()), in)));
+        }
+    } else {
+        // So we have different signs. This puts the lower bound at 0 because either input or output
+        // is unsigned. The upper bound is max of the smaller type or, if they are equal the max of
+        // the signed type.
+        if constexpr (std::is_signed_v<Out>) {
+            if constexpr (sizeof(Out) > sizeof(In)) {
+                return static_cast<Out>(in);
+            } else {
+                // Because `out` is the signed one, the lower bound of `in` is 0 and fits into
+                // `out`. We just have to compare the maximum and we do it in type In because it has
+                // a greater range than Out, so Out::max() is guaranteed to fit.
+                return static_cast<Out>(
+                    std::min(static_cast<In>(std::numeric_limits<Out>::max()), in));
+            }
+        } else {
+            // Out is unsigned. So we can return 0 if in is negative.
+            if (in < 0) return 0;
+            if constexpr (sizeof(Out) >= sizeof(In)) {
+                // If Out is wider or equal we can assign lossless.
+                return static_cast<Out>(in);
+            } else {
+                // Otherwise we have to take the minimum of Out::max() and `in`.
+                return static_cast<Out>(
+                    std::min(static_cast<In>(std::numeric_limits<Out>::max()), in));
+            }
+        }
+    }
+}
+
 // Creates a rump certificate structure with serial, subject and issuer names, as well as
 // activation and expiry date.
 // Callers should pass an empty X509_Ptr and check the return value for CertUtilsError::Ok (0)
 // before accessing the result.
 std::variant<CertUtilsError, X509_Ptr>
-makeCertRump(const uint32_t serial, const char subject[], const uint64_t activeDateTimeMilliSeconds,
-             const uint64_t usageExpireDateTimeMilliSeconds) {
-
-    // Sanitize pointer arguments.
-    if (!subject || strlen(subject) == 0) {
-        return CertUtilsError::InvalidArgument;
-    }
+makeCertRump(std::optional<std::reference_wrapper<const std::vector<uint8_t>>> serial,
+             std::optional<std::reference_wrapper<const std::vector<uint8_t>>> subject,
+             const int64_t activeDateTimeMilliSeconds,
+             const int64_t usageExpireDateTimeMilliSeconds) {
 
     // Create certificate structure.
     X509_Ptr certificate(X509_new());
@@ -178,9 +229,23 @@ makeCertRump(const uint32_t serial, const char subject[], const uint64_t activeD
         return CertUtilsError::BoringSsl;
     }
 
+    BIGNUM_Ptr bn_serial;
+    if (serial) {
+        bn_serial = BIGNUM_Ptr(BN_bin2bn(serial->get().data(), serial->get().size(), nullptr));
+        if (!bn_serial) {
+            return CertUtilsError::MemoryAllocation;
+        }
+    } else {
+        bn_serial = BIGNUM_Ptr(BN_new());
+        if (!bn_serial) {
+            return CertUtilsError::MemoryAllocation;
+        }
+        BN_zero(bn_serial.get());
+    }
+
     // Set the certificate serialNumber
     ASN1_INTEGER_Ptr serialNumber(ASN1_INTEGER_new());
-    if (!serialNumber || !ASN1_INTEGER_set(serialNumber.get(), serial) ||
+    if (!serialNumber || !BN_to_ASN1_INTEGER(bn_serial.get(), serialNumber.get()) ||
         !X509_set_serialNumber(certificate.get(), serialNumber.get() /* Don't release; copied */))
         return CertUtilsError::BoringSsl;
 
@@ -194,16 +259,16 @@ makeCertRump(const uint32_t serial, const char subject[], const uint64_t activeD
         return std::get<CertUtilsError>(subjectName);
     }
 
+    time_t notBeforeTime = saturate<time_t>(activeDateTimeMilliSeconds / 1000);
     // Set activation date.
     ASN1_TIME_Ptr notBefore(ASN1_TIME_new());
-    if (!notBefore || !ASN1_TIME_set(notBefore.get(), activeDateTimeMilliSeconds / 1000) ||
+    if (!notBefore || !ASN1_TIME_set(notBefore.get(), notBeforeTime) ||
         !X509_set_notBefore(certificate.get(), notBefore.get() /* Don't release; copied */))
         return CertUtilsError::BoringSsl;
 
     // Set expiration date.
     time_t notAfterTime;
-    notAfterTime = (time_t)std::min((uint64_t)std::numeric_limits<time_t>::max(),
-                                    usageExpireDateTimeMilliSeconds / 1000);
+    notAfterTime = saturate<time_t>(usageExpireDateTimeMilliSeconds / 1000);
 
     ASN1_TIME_Ptr notAfter(ASN1_TIME_new());
     if (!notAfter || !ASN1_TIME_set(notAfter.get(), notAfterTime) ||
@@ -215,8 +280,10 @@ makeCertRump(const uint32_t serial, const char subject[], const uint64_t activeD
 }
 
 std::variant<CertUtilsError, X509_Ptr>
-makeCert(const EVP_PKEY* evp_pkey, const uint32_t serial, const char subject[],
-         const uint64_t activeDateTimeMilliSeconds, const uint64_t usageExpireDateTimeMilliSeconds,
+makeCert(const EVP_PKEY* evp_pkey,
+         std::optional<std::reference_wrapper<const std::vector<uint8_t>>> serial,
+         std::optional<std::reference_wrapper<const std::vector<uint8_t>>> subject,
+         const int64_t activeDateTimeMilliSeconds, const int64_t usageExpireDateTimeMilliSeconds,
          bool addSubjectKeyIdEx, std::optional<KeyUsageExtension> keyUsageEx,
          std::optional<BasicConstraintsExtension> basicConstraints) {
 

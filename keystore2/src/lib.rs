@@ -16,6 +16,7 @@
 #![recursion_limit = "256"]
 
 pub mod apc;
+pub mod async_task;
 pub mod authorization;
 pub mod database;
 pub mod enforcements;
@@ -24,13 +25,15 @@ pub mod globals;
 /// Internal Representation of Key Parameter and convenience functions.
 pub mod key_parameter;
 pub mod legacy_blob;
+pub mod legacy_migrator;
 pub mod operation;
 pub mod permission;
+pub mod remote_provisioning;
 pub mod security_level;
 pub mod service;
+pub mod user_manager;
 pub mod utils;
 
-mod async_task;
 mod db_utils;
 mod gc;
 mod super_key;

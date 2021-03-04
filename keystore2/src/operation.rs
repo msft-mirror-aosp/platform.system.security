@@ -129,15 +129,13 @@ use crate::enforcements::AuthInfo;
 use crate::error::{map_km_error, map_or_log_err, Error, ErrorCode, ResponseCode};
 use crate::utils::Asp;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    ByteArray::ByteArray, IKeyMintOperation::IKeyMintOperation,
-    KeyParameter::KeyParameter as KmParam, KeyParameterArray::KeyParameterArray,
-    KeyParameterValue::KeyParameterValue as KmParamValue, Tag::Tag,
+    IKeyMintOperation::IKeyMintOperation,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreOperation::BnKeystoreOperation, IKeystoreOperation::IKeystoreOperation,
 };
 use anyhow::{anyhow, Context, Result};
-use binder::{IBinder, Interface};
+use binder::IBinder;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -184,7 +182,7 @@ impl Operation {
     /// Constructor
     pub fn new(
         index: usize,
-        km_op: Box<dyn IKeyMintOperation>,
+        km_op: binder::Strong<dyn IKeyMintOperation>,
         owner: u32,
         auth_info: AuthInfo,
     ) -> Self {
@@ -247,13 +245,14 @@ impl Operation {
         }
         *locked_outcome = Outcome::Pruned;
 
-        let km_op: Box<dyn IKeyMintOperation> = match self.km_op.get_interface() {
-            Ok(km_op) => km_op,
-            Err(e) => {
-                log::error!("In prune: Failed to get KeyMintOperation interface.\n    {:?}", e);
-                return Err(Error::sys());
-            }
-        };
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            match self.km_op.get_interface() {
+                Ok(km_op) => km_op,
+                Err(e) => {
+                    log::error!("In prune: Failed to get KeyMintOperation interface.\n    {:?}", e);
+                    return Err(Error::sys());
+                }
+            };
 
         // We abort the operation. If there was an error we log it but ignore it.
         if let Err(e) = map_km_error(km_op.abort()) {
@@ -324,17 +323,7 @@ impl Operation {
         Self::check_input_length(aad_input).context("In update_aad")?;
         self.touch();
 
-        let params = KeyParameterArray {
-            params: vec![KmParam {
-                tag: Tag::ASSOCIATED_DATA,
-                value: KmParamValue::Blob(aad_input.into()),
-            }],
-        };
-
-        let mut out_params: Option<KeyParameterArray> = None;
-        let mut output: Option<ByteArray> = None;
-
-        let km_op: Box<dyn IKeyMintOperation> =
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
 
         let (hat, tst) = self
@@ -346,14 +335,7 @@ impl Operation {
 
         self.update_outcome(
             &mut *outcome,
-            map_km_error(km_op.update(
-                Some(&params),
-                None,
-                hat.as_ref(),
-                tst.as_ref(),
-                &mut out_params,
-                &mut output,
-            )),
+            map_km_error(km_op.updateAad(aad_input, hat.as_ref(), tst.as_ref())),
         )
         .context("In update_aad: KeyMint::update failed.")?;
 
@@ -367,10 +349,7 @@ impl Operation {
         Self::check_input_length(input).context("In update")?;
         self.touch();
 
-        let mut out_params: Option<KeyParameterArray> = None;
-        let mut output: Option<ByteArray> = None;
-
-        let km_op: Box<dyn IKeyMintOperation> =
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
 
         let (hat, tst) = self
@@ -380,28 +359,17 @@ impl Operation {
             .before_update()
             .context("In update: Trying to get auth tokens.")?;
 
-        self.update_outcome(
-            &mut *outcome,
-            map_km_error(km_op.update(
-                None,
-                Some(input),
-                hat.as_ref(),
-                tst.as_ref(),
-                &mut out_params,
-                &mut output,
-            )),
-        )
-        .context("In update: KeyMint::update failed.")?;
+        let output = self
+            .update_outcome(
+                &mut *outcome,
+                map_km_error(km_op.update(input, hat.as_ref(), tst.as_ref())),
+            )
+            .context("In update: KeyMint::update failed.")?;
 
-        match output {
-            Some(blob) => {
-                if blob.data.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(blob.data))
-                }
-            }
-            None => Ok(None),
+        if output.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output))
         }
     }
 
@@ -414,12 +382,10 @@ impl Operation {
         }
         self.touch();
 
-        let mut out_params: Option<KeyParameterArray> = None;
-
-        let km_op: Box<dyn IKeyMintOperation> =
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In finish: Failed to get KeyMintOperation.")?;
 
-        let (hat, tst) = self
+        let (hat, tst, confirmation_token) = self
             .auth_info
             .lock()
             .unwrap()
@@ -430,12 +396,11 @@ impl Operation {
             .update_outcome(
                 &mut *outcome,
                 map_km_error(km_op.finish(
-                    None,
                     input,
                     signature,
                     hat.as_ref(),
                     tst.as_ref(),
-                    &mut out_params,
+                    confirmation_token.as_deref(),
                 )),
             )
             .context("In finish: KeyMint::finish failed.")?;
@@ -458,7 +423,7 @@ impl Operation {
     fn abort(&self, outcome: Outcome) -> Result<()> {
         let mut locked_outcome = self.check_active().context("In abort")?;
         *locked_outcome = outcome;
-        let km_op: Box<dyn IKeyMintOperation> =
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
             self.km_op.get_interface().context("In abort: Failed to get KeyMintOperation.")?;
 
         map_km_error(km_op.abort()).context("In abort: KeyMint::abort failed.")
@@ -497,7 +462,7 @@ impl OperationDb {
     /// owner uid and returns a new Operation wrapped in a `std::sync::Arc`.
     pub fn create_operation(
         &self,
-        km_op: Box<dyn IKeyMintOperation>,
+        km_op: binder::public_api::Strong<dyn IKeyMintOperation>,
         owner: u32,
         auth_info: AuthInfo,
     ) -> Arc<Operation> {
@@ -753,7 +718,9 @@ impl KeystoreOperation {
     /// BnKeystoreOperation proxy object. It also
     /// calls `IBinder::set_requesting_sid` on the new interface, because
     /// we need it for checking Keystore permissions.
-    pub fn new_native_binder(operation: Arc<Operation>) -> impl IKeystoreOperation + Send {
+    pub fn new_native_binder(
+        operation: Arc<Operation>,
+    ) -> binder::public_api::Strong<dyn IKeystoreOperation> {
         let result =
             BnKeystoreOperation::new_binder(Self { operation: Mutex::new(Some(operation)) });
         result.as_binder().set_requesting_sid(true);
