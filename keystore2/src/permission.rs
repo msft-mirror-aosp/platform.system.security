@@ -291,7 +291,7 @@ implement_permission!(
         AddAuth = 1,    selinux name: add_auth;
         /// Checked when an app is uninstalled or wiped.
         ClearNs = 2,    selinux name: clear_ns;
-        /// Checked when Keystore 2.0 gets locked.
+        /// Checked when the user state is queried from Keystore 2.0.
         GetState = 4,   selinux name: get_state;
         /// Checked when Keystore 2.0 is asked to list a namespace that the caller
         /// does not have the get_info permission for.
@@ -308,6 +308,8 @@ implement_permission!(
         ChangePassword = 0x100,    selinux name: change_password;
         /// Checked when a UID is cleared.
         ClearUID = 0x200,    selinux name: clear_uid;
+        /// Checked when Credstore calls IKeystoreAuthorization to obtain auth tokens.
+        GetAuthToken = 0x400,  selinux name: get_auth_token;
     }
 );
 

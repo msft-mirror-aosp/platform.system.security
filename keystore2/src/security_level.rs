@@ -18,7 +18,7 @@
 
 use crate::globals::get_keymint_device;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    Algorithm::Algorithm, AttestationKey::AttestationKey,
+    Algorithm::Algorithm, AttestationKey::AttestationKey, Certificate::Certificate,
     HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
     KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyParameter::KeyParameter,
@@ -32,12 +32,16 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters,
 };
 
-use crate::database::{CertificateInfo, KeyIdGuard};
+use crate::database::{CertificateInfo, KeyIdGuard, KeystoreDB};
 use crate::globals::{DB, ENFORCEMENTS, LEGACY_MIGRATOR, SUPER_KEY};
 use crate::key_parameter::KeyParameter as KsKeyParam;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
+use crate::remote_provisioning::RemProvState;
 use crate::super_key::{KeyBlob, SuperKeyManager};
-use crate::utils::{check_key_permission, uid_to_android_user, Asp};
+use crate::utils::{
+    check_device_attestation_permissions, check_key_permission, is_device_id_attestation_tag,
+    uid_to_android_user, Asp,
+};
 use crate::{
     database::{
         BlobMetaData, BlobMetaEntry, DateTime, KeyEntry, KeyEntryLoadBits, KeyMetaData,
@@ -53,7 +57,7 @@ use crate::{
 };
 use anyhow::{anyhow, Context, Result};
 use binder::{IBinder, Strong, ThreadState};
-use keystore2_crypto::parse_issuer_subject_from_certificate;
+use keystore2_crypto::parse_subject_from_certificate;
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -63,6 +67,7 @@ pub struct KeystoreSecurityLevel {
     hw_info: KeyMintHardwareInfo,
     km_uuid: Uuid,
     operation_db: OperationDb,
+    rem_prov_state: RemProvState,
 }
 
 // Blob of 32 zeroes used as empty masking key.
@@ -88,6 +93,7 @@ impl KeystoreSecurityLevel {
             hw_info,
             km_uuid,
             operation_db: OperationDb::new(),
+            rem_prov_state: RemProvState::new(security_level, km_uuid),
         });
         result.as_binder().set_requesting_sid(true);
         Ok((result, km_uuid))
@@ -131,33 +137,34 @@ impl KeystoreSecurityLevel {
             SecurityLevel::SOFTWARE,
         ));
 
-        let (key_blob, mut blob_metadata) = DB
-            .with(|db| {
-                SUPER_KEY.handle_super_encryption_on_key_init(
-                    &mut db.borrow_mut(),
-                    &LEGACY_MIGRATOR,
-                    &(key.domain),
-                    &key_parameters,
-                    flags,
-                    user_id,
-                    &key_blob,
-                )
-            })
-            .context("In store_new_key. Failed to handle super encryption.")?;
-
         let creation_date = DateTime::now().context("Trying to make creation time.")?;
 
         let key = match key.domain {
-            Domain::BLOB => {
-                KeyDescriptor { domain: Domain::BLOB, blob: Some(key_blob), ..Default::default() }
-            }
+            Domain::BLOB => KeyDescriptor {
+                domain: Domain::BLOB,
+                blob: Some(key_blob.to_vec()),
+                ..Default::default()
+            },
             _ => DB
                 .with::<_, Result<KeyDescriptor>>(|db| {
+                    let mut db = db.borrow_mut();
+
+                    let (key_blob, mut blob_metadata) = SUPER_KEY
+                        .handle_super_encryption_on_key_init(
+                            &mut db,
+                            &LEGACY_MIGRATOR,
+                            &(key.domain),
+                            &key_parameters,
+                            flags,
+                            user_id,
+                            &key_blob,
+                        )
+                        .context("In store_new_key. Failed to handle super encryption.")?;
+
                     let mut key_metadata = KeyMetaData::new();
                     key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
                     blob_metadata.add(BlobMetaEntry::KmUuid(self.km_uuid));
 
-                    let mut db = db.borrow_mut();
                     let key_id = db
                         .store_new_key(
                             &key,
@@ -355,6 +362,15 @@ impl KeystoreSecurityLevel {
             ))?;
         }
 
+        // If the caller requests any device identifier attestation tag, check that they hold the
+        // correct Android permission.
+        if params.iter().any(|kp| is_device_id_attestation_tag(kp.tag)) {
+            check_device_attestation_permissions().context(concat!(
+                "In add_certificate_parameters: ",
+                "Caller does not have the permission to attest device identifiers."
+            ))?;
+        }
+
         // If we are generating/importing an asymmetric key, we need to make sure
         // that NOT_BEFORE and NOT_AFTER are present.
         match params.iter().find(|kp| kp.tag == Tag::ALGORITHM) {
@@ -404,26 +420,57 @@ impl KeystoreSecurityLevel {
 
         // generate_key requires the rebind permission.
         check_key_permission(KeyPerm::rebind(), &key, &None).context("In generate_key.")?;
-
-        let attest_key = match attest_key_descriptor {
-            None => None,
-            Some(key) => Some(
-                self.get_attest_key(key, caller_uid)
-                    .context("In generate_key: Trying to load attest key")?,
-            ),
+        let (attest_key, cert_chain) = match (key.domain, attest_key_descriptor) {
+            (Domain::BLOB, None) => (None, None),
+            _ => DB
+                .with::<_, Result<(Option<AttestationKey>, Option<Certificate>)>>(|db| {
+                    self.get_attest_key_and_cert_chain(
+                        &key,
+                        caller_uid,
+                        attest_key_descriptor,
+                        params,
+                        &mut db.borrow_mut(),
+                    )
+                })
+                .context("In generate_key: Trying to get an attestation key")?,
         };
-
         let params = Self::add_certificate_parameters(caller_uid, params, &key)
             .context("In generate_key: Trying to get aaid.")?;
 
         let km_dev: Strong<dyn IKeyMintDevice> = self.keymint.get_interface()?;
         map_km_error(km_dev.addRngEntropy(entropy))
             .context("In generate_key: Trying to add entropy.")?;
-        let creation_result = map_km_error(km_dev.generateKey(&params, attest_key.as_ref()))
+        let mut creation_result = map_km_error(km_dev.generateKey(&params, attest_key.as_ref()))
             .context("In generate_key: While generating Key")?;
-
+        // The certificate chain ultimately gets flattened into a big DER encoded byte array,
+        // so providing that blob upfront in a single certificate entry should be fine.
+        if let Some(cert) = cert_chain {
+            creation_result.certificateChain.push(cert);
+        }
         let user_id = uid_to_android_user(caller_uid);
         self.store_new_key(key, creation_result, user_id, Some(flags)).context("In generate_key.")
+    }
+
+    fn get_attest_key_and_cert_chain(
+        &self,
+        key: &KeyDescriptor,
+        caller_uid: u32,
+        attest_key_descriptor: Option<&KeyDescriptor>,
+        params: &[KeyParameter],
+        db: &mut KeystoreDB,
+    ) -> Result<(Option<AttestationKey>, Option<Certificate>)> {
+        match attest_key_descriptor {
+            None => self
+                .rem_prov_state
+                .get_remote_provisioning_key_and_certs(&key, caller_uid, params, db),
+            Some(attest_key) => Ok((
+                Some(
+                    self.get_attest_key(&attest_key, caller_uid)
+                        .context("In generate_key: Trying to load attest key")?,
+                ),
+                None,
+            )),
+        }
     }
 
     fn get_attest_key(&self, key: &KeyDescriptor, caller_uid: u32) -> Result<AttestationKey> {
@@ -431,7 +478,7 @@ impl KeystoreSecurityLevel {
             .load_attest_key_blob_and_cert(&key, caller_uid)
             .context("In get_attest_key: Failed to load blob and cert")?;
 
-        let issuer_subject: Vec<u8> = parse_issuer_subject_from_certificate(&cert)
+        let issuer_subject: Vec<u8> = parse_subject_from_certificate(&cert)
             .context("In get_attest_key: Failed to parse subject from certificate.")?;
 
         Ok(AttestationKey {
