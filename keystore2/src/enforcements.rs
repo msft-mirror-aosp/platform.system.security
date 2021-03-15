@@ -14,6 +14,7 @@
 
 //! This is the Keystore 2.0 Enforcements module.
 // TODO: more description to follow.
+use crate::authorization::Error as AuthzError;
 use crate::database::{AuthTokenEntry, MonotonicRawTime};
 use crate::error::{map_binder_status, Error, ErrorCode};
 use crate::globals::{get_timestamp_service, ASYNC_TASK, DB, ENFORCEMENTS};
@@ -26,20 +27,22 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
     ISecureClock::ISecureClock, TimeStampToken::TimeStampToken,
 };
+use android_security_authorization::aidl::android::security::authorization::ResponseCode::ResponseCode as AuthzResponseCode;
 use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreSecurityLevel::KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING,
     OperationChallenge::OperationChallenge,
 };
 use android_system_keystore2::binder::Strong;
 use anyhow::{Context, Result};
-use std::sync::{
-    mpsc::{channel, Receiver, Sender},
-    Arc, Mutex, Weak,
-};
-use std::time::SystemTime;
+use keystore2_system_property::PropertyWatcher;
 use std::{
     collections::{HashMap, HashSet},
-    sync::mpsc::TryRecvError,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        mpsc::{channel, Receiver, Sender, TryRecvError},
+        Arc, Mutex, Weak,
+    },
+    time::SystemTime,
 };
 
 #[derive(Debug)]
@@ -217,7 +220,7 @@ fn timestamp_token_request(challenge: i64, sender: Sender<Result<TimeStampToken,
     if let Err(e) = sender.send(get_timestamp_token(challenge)) {
         log::info!(
             concat!(
-                "In timestamp_token_request: Operation hung up ",
+                "In timestamp_token_request: Receiver hung up ",
                 "before timestamp token could be delivered. {:?}"
             ),
             e
@@ -352,6 +355,7 @@ impl AuthInfo {
 }
 
 /// Enforcements data structure
+#[derive(Default)]
 pub struct Enforcements {
     /// This hash set contains the user ids for whom the device is currently unlocked. If a user id
     /// is not in the set, it implies that the device is locked for the user.
@@ -365,18 +369,11 @@ pub struct Enforcements {
     /// The enforcement module will try to get a confirmation token from this channel whenever
     /// an operation that requires confirmation finishes.
     confirmation_token_receiver: Arc<Mutex<Option<Receiver<Vec<u8>>>>>,
+    /// Highest boot level seen in keystore.boot_level; used to enforce MAX_BOOT_LEVEL tag.
+    boot_level: AtomicI32,
 }
 
 impl Enforcements {
-    /// Creates an enforcement object with the two data structures it holds and the sender as None.
-    pub fn new() -> Self {
-        Enforcements {
-            device_unlocked_set: Mutex::new(HashSet::new()),
-            op_auth_map: Default::default(),
-            confirmation_token_receiver: Default::default(),
-        }
-    }
-
     /// Install the confirmation token receiver. The enforcement module will try to get a
     /// confirmation token from this channel whenever an operation that requires confirmation
     /// finishes.
@@ -475,6 +472,7 @@ impl Enforcements {
         let mut unlocked_device_required = false;
         let mut key_usage_limited: Option<i64> = None;
         let mut confirmation_token_receiver: Option<Arc<Mutex<Option<Receiver<Vec<u8>>>>>> = None;
+        let mut max_boot_level: Option<i32> = None;
 
         // iterate through key parameters, recording information we need for authorization
         // enforcements later, or enforcing authorizations in place, where applicable
@@ -541,6 +539,9 @@ impl Enforcements {
                 KeyParameterValue::TrustedConfirmationRequired => {
                     confirmation_token_receiver = Some(self.confirmation_token_receiver.clone());
                 }
+                KeyParameterValue::MaxBootLevel(level) => {
+                    max_boot_level = Some(*level);
+                }
                 // NOTE: as per offline discussion, sanitizing key parameters and rejecting
                 // create operation if any non-allowed tags are present, is not done in
                 // authorize_create (unlike in legacy keystore where AuthorizeBegin is rejected if
@@ -591,6 +592,13 @@ impl Enforcements {
             if self.is_device_locked(user_id) {
                 return Err(Error::Km(Ec::DEVICE_LOCKED))
                     .context("In authorize_create: device is locked.");
+            }
+        }
+
+        if let Some(level) = max_boot_level {
+            if level < self.boot_level.load(Ordering::SeqCst) {
+                return Err(Error::Km(Ec::BOOT_LEVEL_EXCEEDED))
+                    .context("In authorize_create: boot level is too late.");
             }
         }
 
@@ -760,11 +768,94 @@ impl Enforcements {
 
         auth_bound && !skip_lskf_binding
     }
-}
 
-impl Default for Enforcements {
-    fn default() -> Self {
-        Self::new()
+    /// Finds a matching auth token along with a timestamp token.
+    /// This method looks through auth-tokens cached by keystore which satisfy the given
+    /// authentication information (i.e. |secureUserId|).
+    /// The most recent matching auth token which has a |challenge| field which matches
+    /// the passed-in |challenge| parameter is returned.
+    /// In this case the |authTokenMaxAgeMillis| parameter is not used.
+    ///
+    /// Otherwise, the most recent matching auth token which is younger than |authTokenMaxAgeMillis|
+    /// is returned.
+    pub fn get_auth_tokens(
+        &self,
+        challenge: i64,
+        secure_user_id: i64,
+        auth_token_max_age_millis: i64,
+    ) -> Result<(HardwareAuthToken, TimeStampToken)> {
+        let auth_type = HardwareAuthenticatorType::ANY;
+        let sids: Vec<i64> = vec![secure_user_id];
+        // Filter the matching auth tokens by challenge
+        let result = Self::find_auth_token(|hat: &AuthTokenEntry| {
+            (challenge == hat.challenge()) && hat.satisfies(&sids, auth_type)
+        })
+        .context(
+            "In get_auth_tokens: Failed to get a matching auth token filtered by challenge.",
+        )?;
+
+        let auth_token = if let Some((auth_token_entry, _)) = result {
+            auth_token_entry.take_auth_token()
+        } else {
+            // Filter the matching auth tokens by age.
+            if auth_token_max_age_millis != 0 {
+                let now_in_millis = MonotonicRawTime::now().milli_seconds();
+                let result = Self::find_auth_token(|auth_token_entry: &AuthTokenEntry| {
+                    let token_valid = now_in_millis
+                        .checked_sub(auth_token_entry.time_received().milli_seconds())
+                        .map_or(false, |token_age_in_millis| {
+                            token_age_in_millis > auth_token_max_age_millis
+                        });
+                    token_valid && auth_token_entry.satisfies(&sids, auth_type)
+                })
+                .context(
+                    "In get_auth_tokens: Failed to get a matching auth token filtered by age.",
+                )?;
+
+                if let Some((auth_token_entry, _)) = result {
+                    auth_token_entry.take_auth_token()
+                } else {
+                    return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND))
+                        .context("In get_auth_tokens: No auth token found.");
+                }
+            } else {
+                return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND))
+                    .context("In get_auth_tokens: Passed-in auth token max age is zero.");
+            }
+        };
+        // Wait and obtain the timestamp token from secure clock service.
+        let tst = get_timestamp_token(challenge)
+            .context("In get_auth_tokens. Error in getting timestamp token.")?;
+        Ok((auth_token, tst))
+    }
+
+    /// Watch the `keystore.boot_level` system property, and keep self.boot_level up to date.
+    /// Blocks waiting for system property changes, so must be run in its own thread.
+    pub fn watch_boot_level(&self) -> Result<()> {
+        let mut w = PropertyWatcher::new("keystore.boot_level")?;
+        loop {
+            fn parse_value(_name: &str, value: &str) -> Result<Option<i32>> {
+                Ok(if value == "end" { None } else { Some(value.parse::<i32>()?) })
+            }
+            match w.read(parse_value)? {
+                Some(level) => {
+                    let old = self.boot_level.fetch_max(level, Ordering::SeqCst);
+                    log::info!(
+                        "Read keystore.boot_level: {}; boot level {} -> {}",
+                        level,
+                        old,
+                        std::cmp::max(old, level)
+                    );
+                }
+                None => {
+                    log::info!("keystore.boot_level is `end`, finishing.");
+                    self.boot_level.fetch_max(i32::MAX, Ordering::SeqCst);
+                    break;
+                }
+            }
+            w.wait()?;
+        }
+        Ok(())
     }
 }
 

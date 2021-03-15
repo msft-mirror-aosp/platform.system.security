@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 The Android Open Source Project
+ * Copyright (C) 2021 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,16 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
 
-#include <android-base/result.h>
-
-#include "SigningKey.h"
-
-android::base::Result<void> addCertToFsVerityKeyring(const std::string& path);
-android::base::Result<std::vector<uint8_t>> createDigest(const std::string& path);
-android::base::Result<std::map<std::string, std::string>>
-verifyAllFilesInVerity(const std::string& path);
-android::base::Result<std::map<std::string, std::string>>
-addFilesToVerityRecursive(const std::string& path, const SigningKey& key);
+#include "sys/system_properties.h"
