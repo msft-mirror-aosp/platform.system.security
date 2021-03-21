@@ -581,11 +581,14 @@ impl CertificateInfo {
 
 /// This type represents a certificate chain with a private key corresponding to the leaf
 /// certificate. TODO(jbires): This will be used in a follow-on CL, for now it's used in the tests.
-#[allow(dead_code)]
 pub struct CertificateChain {
-    private_key: ZVec,
-    batch_cert: ZVec,
-    cert_chain: ZVec,
+    /// A KM key blob
+    pub private_key: ZVec,
+    /// A batch cert for private_key
+    pub batch_cert: Vec<u8>,
+    /// A full certificate chain from root signing authority to private_key, including batch_cert
+    /// for convenience.
+    pub cert_chain: Vec<u8>,
 }
 
 /// This type represents a Keystore 2.0 key entry.
@@ -730,9 +733,19 @@ impl MonotonicRawTime {
         Self(get_current_time_in_seconds())
     }
 
+    /// Constructs a new MonotonicRawTime from a given number of seconds.
+    pub fn from_secs(val: i64) -> Self {
+        Self(val)
+    }
+
     /// Returns the integer value of MonotonicRawTime as i64
     pub fn seconds(&self) -> i64 {
         self.0
+    }
+
+    /// Returns the value of MonotonicRawTime in milli seconds as i64
+    pub fn milli_seconds(&self) -> i64 {
+        self.0 * 1000
     }
 
     /// Like i64::checked_sub.
@@ -786,6 +799,11 @@ impl AuthTokenEntry {
     /// Returns the time that this auth token was received.
     pub fn time_received(&self) -> MonotonicRawTime {
         self.time_received
+    }
+
+    /// Returns the challenge value of the auth token.
+    pub fn challenge(&self) -> i64 {
+        self.auth_token.challenge
     }
 }
 
@@ -1776,6 +1794,33 @@ impl KeystoreDB {
         .context("In delete_expired_attestation_keys: ")
     }
 
+    /// Deletes all remotely provisioned attestation keys in the system, regardless of the state
+    /// they are in. This is useful primarily as a testing mechanism.
+    pub fn delete_all_attestation_keys(&mut self) -> Result<i64> {
+        self.with_transaction(TransactionBehavior::Immediate, |tx| {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM persistent.keyentry
+                    WHERE key_type IS ?;",
+                )
+                .context("Failed to prepare statement")?;
+            let keys_to_delete = stmt
+                .query_map(params![KeyType::Attestation], |row| Ok(row.get(0)?))?
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .context("Failed to execute statement")?;
+            let num_deleted = keys_to_delete
+                .iter()
+                .map(|id| Self::mark_unreferenced(&tx, *id))
+                .collect::<Result<Vec<bool>>>()
+                .context("Failed to execute mark_unreferenced on a keyid")?
+                .into_iter()
+                .filter(|result| *result)
+                .count() as i64;
+            Ok(num_deleted).do_gc(num_deleted != 0)
+        })
+        .context("In delete_all_attestation_keys: ")
+    }
+
     /// Counts the number of keys that will expire by the provided epoch date and the number of
     /// keys not currently assigned to a domain.
     pub fn get_attestation_pool_status(
@@ -1914,8 +1959,8 @@ impl KeystoreDB {
             }
             Ok(Some(CertificateChain {
                 private_key: ZVec::try_from(km_blob)?,
-                batch_cert: ZVec::try_from(batch_cert_blob)?,
-                cert_chain: ZVec::try_from(cert_chain_blob)?,
+                batch_cert: batch_cert_blob,
+                cert_chain: cert_chain_blob,
             }))
             .no_gc()
         })
@@ -3212,8 +3257,8 @@ mod tests {
         assert_eq!(true, chain.is_some());
         let cert_chain = chain.unwrap();
         assert_eq!(cert_chain.private_key.to_vec(), loaded_values.priv_key);
-        assert_eq!(cert_chain.batch_cert.to_vec(), loaded_values.batch_cert);
-        assert_eq!(cert_chain.cert_chain.to_vec(), loaded_values.cert_chain);
+        assert_eq!(cert_chain.batch_cert, loaded_values.batch_cert);
+        assert_eq!(cert_chain.cert_chain, loaded_values.cert_chain);
         Ok(())
     }
 
@@ -3306,8 +3351,8 @@ mod tests {
             db.retrieve_attestation_key_and_cert_chain(Domain::APP, namespace, &KEYSTORE_UUID)?;
         assert!(cert_chain.is_some());
         let value = cert_chain.unwrap();
-        assert_eq!(entry_values.batch_cert, value.batch_cert.to_vec());
-        assert_eq!(entry_values.cert_chain, value.cert_chain.to_vec());
+        assert_eq!(entry_values.batch_cert, value.batch_cert);
+        assert_eq!(entry_values.cert_chain, value.cert_chain);
         assert_eq!(entry_values.priv_key, value.private_key.to_vec());
 
         cert_chain = db.retrieve_attestation_key_and_cert_chain(
@@ -3333,6 +3378,23 @@ mod tests {
         // There shound be 3 blob entries left, because we deleted two of the attestation
         // key entries with three blobs each.
         assert_eq!(blob_entry_row_count, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_all_attestation_keys() -> Result<()> {
+        let mut db = new_test_db()?;
+        load_attestation_key_pool(&mut db, 45 /* expiration */, 1 /* namespace */, 0x02)?;
+        load_attestation_key_pool(&mut db, 80 /* expiration */, 2 /* namespace */, 0x03)?;
+        db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
+        let result = db.delete_all_attestation_keys()?;
+
+        // Give the garbage collector half a second to catch up.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Attestation keys should be deleted, and the regular key should remain.
+        assert_eq!(result, 2);
 
         Ok(())
     }

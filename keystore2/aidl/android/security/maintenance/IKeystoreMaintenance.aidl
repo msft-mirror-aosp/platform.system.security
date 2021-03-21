@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package android.security.usermanager;
+package android.security.maintenance;
 
 import android.system.keystore2.Domain;
+import android.security.maintenance.UserState;
 
 // TODO: mark the interface with @SensitiveData when the annotation is ready (b/176110256).
 
 /**
- * IKeystoreUserManager interface exposes the methods for adding/removing users and changing the
+ * IKeystoreMaintenance interface exposes the methods for adding/removing users and changing the
  * user's password.
  * @hide
  */
-interface IKeystoreUserManager {
+interface IKeystoreMaintenance {
 
     /**
      * Allows LockSettingsService to inform keystore about adding a new user.
@@ -75,4 +76,17 @@ interface IKeystoreUserManager {
      * @hide
      */
      void clearNamespace(Domain domain, long nspace);
+
+    /**
+     * Allows querying user state, given user id.
+     * Callers require 'GetState' permission.
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'GetState'
+     *                                     permission.
+     * `ResponseCode::SYSTEM_ERROR` - if an error occurred when querying the user state.
+     *
+     * @param userId - Android user id
+     * @hide
+     */
+    UserState getState(in int userId);
 }
