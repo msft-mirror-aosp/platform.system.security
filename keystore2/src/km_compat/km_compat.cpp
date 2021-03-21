@@ -216,6 +216,8 @@ bool prefixedKeyBlobIsSoftKeyMint(const std::vector<uint8_t>& prefixedBlob) {
  */
 bool isNewAndKeystoreEnforceable(const KMV1::KeyParameter& param) {
     switch (param.tag) {
+    case KMV1::Tag::MAX_BOOT_LEVEL:
+        return true;
     case KMV1::Tag::USAGE_COUNT_LIMIT:
         return true;
     default:
@@ -511,15 +513,23 @@ ScopedAStatus KeyMintDevice::importKey(const std::vector<KeyParameter>& inKeyPar
 
 ScopedAStatus
 KeyMintDevice::importWrappedKey(const std::vector<uint8_t>& in_inWrappedKeyData,
-                                const std::vector<uint8_t>& in_inWrappingKeyBlob,  //
+                                const std::vector<uint8_t>& in_inPrefixedWrappingKeyBlob,
                                 const std::vector<uint8_t>& in_inMaskingKey,
                                 const std::vector<KeyParameter>& in_inUnwrappingParams,
                                 int64_t in_inPasswordSid, int64_t in_inBiometricSid,
                                 KeyCreationResult* out_creationResult) {
+    const std::vector<uint8_t>& wrappingKeyBlob =
+        prefixedKeyBlobRemovePrefix(in_inPrefixedWrappingKeyBlob);
+    if (prefixedKeyBlobIsSoftKeyMint(in_inPrefixedWrappingKeyBlob)) {
+        return softKeyMintDevice_->importWrappedKey(
+            in_inWrappedKeyData, wrappingKeyBlob, in_inMaskingKey, in_inUnwrappingParams,
+            in_inPasswordSid, in_inBiometricSid, out_creationResult);
+    }
+
     auto legacyUnwrappingParams = convertKeyParametersToLegacy(in_inUnwrappingParams);
     KMV1::ErrorCode errorCode;
     auto result = mDevice->importWrappedKey(
-        in_inWrappedKeyData, in_inWrappingKeyBlob, in_inMaskingKey, legacyUnwrappingParams,
+        in_inWrappedKeyData, wrappingKeyBlob, in_inMaskingKey, legacyUnwrappingParams,
         in_inPasswordSid, in_inBiometricSid,
         [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& keyBlob,
             const V4_0_KeyCharacteristics& keyCharacteristics) {
@@ -540,11 +550,12 @@ ScopedAStatus KeyMintDevice::upgradeKey(const std::vector<uint8_t>& in_inKeyBlob
                                         std::vector<uint8_t>* _aidl_return) {
     auto legacyUpgradeParams = convertKeyParametersToLegacy(in_inUpgradeParams);
     V4_0_ErrorCode errorCode;
+
     auto result =
-        mDevice->upgradeKey(in_inKeyBlobToUpgrade, legacyUpgradeParams,
+        mDevice->upgradeKey(prefixedKeyBlobRemovePrefix(in_inKeyBlobToUpgrade), legacyUpgradeParams,
                             [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& upgradedKeyBlob) {
                                 errorCode = error;
-                                *_aidl_return = upgradedKeyBlob;
+                                *_aidl_return = keyBlobPrefix(upgradedKeyBlob, false);
                             });
     if (!result.isOk()) {
         LOG(ERROR) << __func__ << " transaction failed. " << result.description();
@@ -556,7 +567,7 @@ ScopedAStatus KeyMintDevice::upgradeKey(const std::vector<uint8_t>& in_inKeyBlob
 ScopedAStatus KeyMintDevice::deleteKey(const std::vector<uint8_t>& prefixedKeyBlob) {
     const std::vector<uint8_t>& keyBlob = prefixedKeyBlobRemovePrefix(prefixedKeyBlob);
     if (prefixedKeyBlobIsSoftKeyMint(prefixedKeyBlob)) {
-        return softKeyMintDevice_->deleteKey(prefixedKeyBlob);
+        return softKeyMintDevice_->deleteKey(keyBlob);
     }
 
     auto result = mDevice->deleteKey(keyBlob);
@@ -723,7 +734,7 @@ KeyMintOperation::finish(const std::optional<std::vector<uint8_t>>& in_input,
 
     KMV1::ErrorCode errorCode;
     auto result = mDevice->finish(
-        mOperationHandle, {} /* inParams */, input, signature, authToken, verificationToken,
+        mOperationHandle, inParams, input, signature, authToken, verificationToken,
         [&](V4_0_ErrorCode error, auto /* outParams */, const hidl_vec<uint8_t>& output) {
             errorCode = convert(error);
             *out_output = output;

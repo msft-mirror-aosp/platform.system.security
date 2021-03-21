@@ -40,7 +40,7 @@ using ::android::base::StderrLogger;
 using ::android::security::identity::CredentialStoreFactory;
 
 int main(int argc, char* argv[]) {
-    InitLogging(argv, StderrLogger);
+    InitLogging(argv);
 
     CHECK(argc == 2) << "A directory must be specified";
     string data_dir = string(argv[1]);
@@ -52,11 +52,6 @@ int main(int argc, char* argv[]) {
     auto ret = sm->addService(String16("android.security.identity"), factory);
     CHECK(ret == ::android::OK) << "Couldn't register binder service";
     LOG(ERROR) << "Registered binder service";
-
-    // This is needed for binder callbacks from keystore on a ICredstoreTokenCallback binder.
-    android::ProcessState::self()->startThreadPool();
-
-    IPCThreadState::self()->joinThreadPool();
 
     return 0;
 }
