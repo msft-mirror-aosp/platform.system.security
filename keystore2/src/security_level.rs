@@ -37,6 +37,7 @@ use crate::database::{CertificateInfo, KeyIdGuard};
 use crate::globals::{DB, ENFORCEMENTS, LEGACY_MIGRATOR, SUPER_KEY};
 use crate::key_parameter::KeyParameter as KsKeyParam;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
+use crate::metrics::log_key_creation_event_stats;
 use crate::remote_provisioning::RemProvState;
 use crate::super_key::{KeyBlob, SuperKeyManager};
 use crate::utils::{
@@ -49,6 +50,7 @@ use crate::{
         KeyMetaEntry, KeyType, SubComponentType, Uuid,
     },
     operation::KeystoreOperation,
+    operation::LoggingInfo,
     operation::OperationDb,
     permission::KeyPerm,
 };
@@ -300,7 +302,8 @@ impl KeystoreSecurityLevel {
             .upgrade_keyblob_if_required_with(
                 &*km_dev,
                 key_id_guard,
-                &(&km_blob, &blob_metadata),
+                &km_blob,
+                &blob_metadata,
                 &operation_parameters,
                 |blob| loop {
                     match map_km_error(km_dev.begin(
@@ -321,9 +324,12 @@ impl KeystoreSecurityLevel {
 
         let operation_challenge = auth_info.finalize_create_authorization(begin_result.challenge);
 
+        let op_params: Vec<KeyParameter> = operation_parameters.to_vec();
+
         let operation = match begin_result.operation {
             Some(km_op) => {
-                self.operation_db.create_operation(km_op, caller_uid, auth_info, forced)
+                self.operation_db.create_operation(km_op, caller_uid, auth_info, forced,
+                    LoggingInfo::new(purpose, op_params, upgraded_blob.is_some()))
             },
             None => return Err(Error::sys()).context("In create_operation: Begin operation returned successfully, but did not return a valid operation."),
         };
@@ -462,7 +468,8 @@ impl KeystoreSecurityLevel {
                 .upgrade_keyblob_if_required_with(
                     &*km_dev,
                     Some(key_id_guard),
-                    &(&KeyBlob::Ref(&blob), &blob_metadata),
+                    &KeyBlob::Ref(&blob),
+                    &blob_metadata,
                     &params,
                     |blob| {
                         let attest_key = Some(AttestationKey {
@@ -651,7 +658,8 @@ impl KeystoreSecurityLevel {
             .upgrade_keyblob_if_required_with(
                 &*km_dev,
                 Some(wrapping_key_id_guard),
-                &(&wrapping_key_blob, &wrapping_blob_metadata),
+                &wrapping_key_blob,
+                &wrapping_blob_metadata,
                 &[],
                 |wrapping_blob| {
                     let creation_result = map_km_error(km_dev.importWrappedKey(
@@ -671,48 +679,62 @@ impl KeystoreSecurityLevel {
             .context("In import_wrapped_key: Trying to store the new key.")
     }
 
+    fn store_upgraded_keyblob(
+        key_id_guard: KeyIdGuard,
+        km_uuid: Option<&Uuid>,
+        key_blob: &KeyBlob,
+        upgraded_blob: &[u8],
+    ) -> Result<()> {
+        let (upgraded_blob_to_be_stored, new_blob_metadata) =
+            SuperKeyManager::reencrypt_if_required(key_blob, &upgraded_blob)
+                .context("In store_upgraded_keyblob: Failed to handle super encryption.")?;
+
+        let mut new_blob_metadata = new_blob_metadata.unwrap_or_else(BlobMetaData::new);
+        if let Some(uuid) = km_uuid {
+            new_blob_metadata.add(BlobMetaEntry::KmUuid(*uuid));
+        }
+
+        DB.with(|db| {
+            let mut db = db.borrow_mut();
+            db.set_blob(
+                &key_id_guard,
+                SubComponentType::KEY_BLOB,
+                Some(&upgraded_blob_to_be_stored),
+                Some(&new_blob_metadata),
+            )
+        })
+        .context("In store_upgraded_keyblob: Failed to insert upgraded blob into the database.")
+    }
+
     fn upgrade_keyblob_if_required_with<T, F>(
         &self,
         km_dev: &dyn IKeyMintDevice,
         key_id_guard: Option<KeyIdGuard>,
-        blob_info: &(&KeyBlob, &BlobMetaData),
+        key_blob: &KeyBlob,
+        blob_metadata: &BlobMetaData,
         params: &[KeyParameter],
         f: F,
     ) -> Result<(T, Option<Vec<u8>>)>
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        match f(blob_info.0) {
+        match f(key_blob) {
             Err(Error::Km(ErrorCode::KEY_REQUIRES_UPGRADE)) => {
-                let upgraded_blob = map_km_error(km_dev.upgradeKey(blob_info.0, params))
+                let upgraded_blob = map_km_error(km_dev.upgradeKey(key_blob, params))
                     .context("In upgrade_keyblob_if_required_with: Upgrade failed.")?;
 
-                let (upgraded_blob_to_be_stored, blob_metadata) =
-                    SuperKeyManager::reencrypt_on_upgrade_if_required(blob_info.0, &upgraded_blob)
-                        .context(
-                        "In upgrade_keyblob_if_required_with: Failed to handle super encryption.",
+                if let Some(kid) = key_id_guard {
+                    Self::store_upgraded_keyblob(
+                        kid,
+                        blob_metadata.km_uuid(),
+                        key_blob,
+                        &upgraded_blob,
+                    )
+                    .context(
+                        "In upgrade_keyblob_if_required_with: store_upgraded_keyblob failed",
                     )?;
-
-                let mut blob_metadata = blob_metadata.unwrap_or_else(BlobMetaData::new);
-                if let Some(uuid) = blob_info.1.km_uuid() {
-                    blob_metadata.add(BlobMetaEntry::KmUuid(*uuid));
                 }
 
-                key_id_guard.map_or(Ok(()), |key_id_guard| {
-                    DB.with(|db| {
-                        let mut db = db.borrow_mut();
-                        db.set_blob(
-                            &key_id_guard,
-                            SubComponentType::KEY_BLOB,
-                            Some(&upgraded_blob_to_be_stored),
-                            Some(&blob_metadata),
-                        )
-                    })
-                    .context(concat!(
-                        "In upgrade_keyblob_if_required_with: ",
-                        "Failed to insert upgraded blob into the database.",
-                    ))
-                })?;
                 match f(&upgraded_blob) {
                     Ok(v) => Ok((v, Some(upgraded_blob))),
                     Err(e) => Err(e).context(concat!(
@@ -721,11 +743,75 @@ impl KeystoreSecurityLevel {
                     )),
                 }
             }
-            Err(e) => {
-                Err(e).context("In upgrade_keyblob_if_required_with: Failed perform operation.")
+            result => {
+                if let Some(kid) = key_id_guard {
+                    if key_blob.force_reencrypt() {
+                        Self::store_upgraded_keyblob(
+                            kid,
+                            blob_metadata.km_uuid(),
+                            key_blob,
+                            key_blob,
+                        )
+                        .context(concat!(
+                            "In upgrade_keyblob_if_required_with: ",
+                            "store_upgraded_keyblob failed in forced reencrypt"
+                        ))?;
+                    }
+                }
+                result
+                    .map(|v| (v, None))
+                    .context("In upgrade_keyblob_if_required_with: Called closure failed.")
             }
-            Ok(v) => Ok((v, None)),
         }
+    }
+
+    fn convert_storage_key_to_ephemeral(&self, storage_key: &KeyDescriptor) -> Result<Vec<u8>> {
+        if storage_key.domain != Domain::BLOB {
+            return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT)).context(concat!(
+                "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: ",
+                "Key must be of Domain::BLOB"
+            ));
+        }
+        let key_blob = storage_key
+            .blob
+            .as_ref()
+            .ok_or(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
+            .context(
+                "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: No key blob specified",
+            )?;
+
+        // convert_storage_key_to_ephemeral requires the associated permission
+        check_key_permission(KeyPerm::convert_storage_key_to_ephemeral(), storage_key, &None)
+            .context("In convert_storage_key_to_ephemeral: Check permission")?;
+
+        let km_dev: Strong<dyn IKeyMintDevice> = self.keymint.get_interface().context(concat!(
+            "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: ",
+            "Getting keymint device interface"
+        ))?;
+        map_km_error(km_dev.convertStorageKeyToEphemeral(key_blob))
+            .context("In keymint device convertStorageKeyToEphemeral")
+    }
+
+    fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
+        if key.domain != Domain::BLOB {
+            return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
+                .context("In IKeystoreSecurityLevel delete_key: Key must be of Domain::BLOB");
+        }
+
+        let key_blob = key
+            .blob
+            .as_ref()
+            .ok_or(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
+            .context("In IKeystoreSecurityLevel delete_key: No key blob specified")?;
+
+        check_key_permission(KeyPerm::delete(), key, &None)
+            .context("In IKeystoreSecurityLevel delete_key: Checking delete permissions")?;
+
+        let km_dev: Strong<dyn IKeyMintDevice> = self
+            .keymint
+            .get_interface()
+            .context("In IKeystoreSecurityLevel delete_key: Getting keymint device interface")?;
+        map_km_error(km_dev.deleteKey(&key_blob)).context("In keymint device deleteKey")
     }
 }
 
@@ -748,7 +834,9 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         flags: i32,
         entropy: &[u8],
     ) -> binder::public_api::Result<KeyMetadata> {
-        map_or_log_err(self.generate_key(key, attestation_key, params, flags, entropy), Ok)
+        let result = self.generate_key(key, attestation_key, params, flags, entropy);
+        log_key_creation_event_stats(params, &result);
+        map_or_log_err(result, Ok)
     }
     fn importKey(
         &self,
@@ -758,7 +846,9 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         flags: i32,
         key_data: &[u8],
     ) -> binder::public_api::Result<KeyMetadata> {
-        map_or_log_err(self.import_key(key, attestation_key, params, flags, key_data), Ok)
+        let result = self.import_key(key, attestation_key, params, flags, key_data);
+        log_key_creation_event_stats(params, &result);
+        map_or_log_err(result, Ok)
     }
     fn importWrappedKey(
         &self,
@@ -768,9 +858,18 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         params: &[KeyParameter],
         authenticators: &[AuthenticatorSpec],
     ) -> binder::public_api::Result<KeyMetadata> {
-        map_or_log_err(
-            self.import_wrapped_key(key, wrapping_key, masking_key, params, authenticators),
-            Ok,
-        )
+        let result =
+            self.import_wrapped_key(key, wrapping_key, masking_key, params, authenticators);
+        log_key_creation_event_stats(params, &result);
+        map_or_log_err(result, Ok)
+    }
+    fn convertStorageKeyToEphemeral(
+        &self,
+        storage_key: &KeyDescriptor,
+    ) -> binder::public_api::Result<Vec<u8>> {
+        map_or_log_err(self.convert_storage_key_to_ephemeral(storage_key), Ok)
+    }
+    fn deleteKey(&self, key: &KeyDescriptor) -> binder::public_api::Result<()> {
+        map_or_log_err(self.delete_key(key), Ok)
     }
 }
