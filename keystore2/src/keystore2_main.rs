@@ -14,18 +14,18 @@
 
 //! This crate implements the Keystore 2.0 service entry point.
 
-use keystore2::apc::ApcManager;
 use keystore2::authorization::AuthorizationManager;
 use keystore2::entropy;
 use keystore2::globals::ENFORCEMENTS;
+use keystore2::maintenance::Maintenance;
 use keystore2::remote_provisioning::RemoteProvisioningService;
 use keystore2::service::KeystoreService;
-use keystore2::user_manager::Maintenance;
+use keystore2::{apc::ApcManager, shared_secret_negotiation};
 use log::{error, info};
 use std::{panic, path::Path, sync::mpsc::channel};
 use vpnprofilestore::VpnProfileStore;
 
-static KS2_SERVICE_NAME: &str = "android.system.keystore2";
+static KS2_SERVICE_NAME: &str = "android.system.keystore2.IKeystoreService/default";
 static APC_SERVICE_NAME: &str = "android.security.apc";
 static AUTHORIZATION_SERVICE_NAME: &str = "android.security.authorization";
 static REMOTE_PROVISIONING_SERVICE_NAME: &str = "android.security.remoteprovisioning";
@@ -76,6 +76,7 @@ fn main() {
     });
 
     entropy::register_feeder();
+    shared_secret_negotiation::perform_shared_secret_negotiation();
 
     info!("Starting thread pool now.");
     binder::ProcessState::start_thread_pool();

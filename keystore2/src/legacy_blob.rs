@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! This module implements methods to load legacy keystore key blob files.
 
 use crate::{
@@ -26,7 +24,7 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     SecurityLevel::SecurityLevel, Tag::Tag, TagType::TagType,
 };
 use anyhow::{Context, Result};
-use keystore2_crypto::{aes_gcm_decrypt, derive_key_from_password, ZVec};
+use keystore2_crypto::{aes_gcm_decrypt, Password, ZVec};
 use std::collections::{HashMap, HashSet};
 use std::{convert::TryInto, fs::File, path::Path, path::PathBuf};
 use std::{
@@ -216,7 +214,7 @@ impl LegacyBlobLoader {
     // flags (1 Byte)
     // info (1 Byte)
     // initialization_vector (16 Bytes)
-    // integrity (MD5 digest or gcb tag) (16 Bytes)
+    // integrity (MD5 digest or gcm tag) (16 Bytes)
     // length (4 Bytes)
     const COMMON_HEADER_SIZE: usize = 4 + Self::IV_SIZE + Self::GCM_TAG_LENGTH + 4;
 
@@ -227,7 +225,7 @@ impl LegacyBlobLoader {
     const LENGTH_OFFSET: usize = 4 + Self::IV_SIZE + Self::GCM_TAG_LENGTH;
     const IV_OFFSET: usize = 4;
     const AEAD_TAG_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
-    const DIGEST_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
+    const _DIGEST_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
 
     /// Construct a new LegacyBlobLoader with a root path of `path` relative to which it will
     /// expect legacy key blob files.
@@ -965,8 +963,7 @@ impl LegacyBlobLoader {
                             let decrypted = match key_manager
                                 .get_per_boot_key_by_user_id(uid_to_android_user(uid))
                             {
-                                Some(key) => aes_gcm_decrypt(data, iv, tag, &(key.get_key()))
-                                    .context(
+                                Some(key) => key.aes_gcm_decrypt(data, iv, tag).context(
                                     "In load_by_uid_alias: while trying to decrypt legacy blob.",
                                 )?,
                                 None => {
@@ -1036,22 +1033,29 @@ impl LegacyBlobLoader {
     }
 
     /// Load and decrypt legacy super key blob.
-    pub fn load_super_key(&self, user_id: u32, pw: &[u8]) -> Result<Option<ZVec>> {
+    pub fn load_super_key(&self, user_id: u32, pw: &Password) -> Result<Option<ZVec>> {
         let path = self.make_super_key_filename(user_id);
         let blob = Self::read_generic_blob(&path)
             .context("In load_super_key: While loading super key.")?;
 
         let blob = match blob {
             Some(blob) => match blob {
-                Blob {
-                    value: BlobValue::PwEncrypted { iv, tag, data, salt, key_size }, ..
-                } => {
-                    let key = derive_key_from_password(pw, Some(&salt), key_size)
-                        .context("In load_super_key: Failed to derive key from password.")?;
-                    let blob = aes_gcm_decrypt(&data, &iv, &tag, &key).context(
-                        "In load_super_key: while trying to decrypt legacy super key blob.",
-                    )?;
-                    Some(blob)
+                Blob { flags, value: BlobValue::PwEncrypted { iv, tag, data, salt, key_size } } => {
+                    if (flags & flags::ENCRYPTED) != 0 {
+                        let key = pw
+                            .derive_key(Some(&salt), key_size)
+                            .context("In load_super_key: Failed to derive key from password.")?;
+                        let blob = aes_gcm_decrypt(&data, &iv, &tag, &key).context(
+                            "In load_super_key: while trying to decrypt legacy super key blob.",
+                        )?;
+                        Some(blob)
+                    } else {
+                        // In 2019 we had some unencrypted super keys due to b/141955555.
+                        Some(
+                            data.try_into()
+                                .context("In load_super_key: Trying to convert key into ZVec")?,
+                        )
+                    }
                 }
                 _ => {
                     return Err(KsError::Rc(ResponseCode::VALUE_CORRUPTED)).context(
@@ -1294,7 +1298,7 @@ mod test {
             Some(&error::Error::Rc(ResponseCode::LOCKED))
         );
 
-        key_manager.unlock_user_key(&mut db, 0, PASSWORD, &legacy_blob_loader)?;
+        key_manager.unlock_user_key(&mut db, 0, &(PASSWORD.into()), &legacy_blob_loader)?;
 
         if let (Some((Blob { flags, value: _ }, _params)), Some(cert), Some(chain)) =
             legacy_blob_loader.load_by_uid_alias(10223, "authbound", Some(&key_manager))?

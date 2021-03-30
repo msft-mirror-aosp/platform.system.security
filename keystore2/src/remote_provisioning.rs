@@ -23,9 +23,10 @@ use std::collections::HashMap;
 
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey, Certificate::Certificate,
-    IRemotelyProvisionedComponent::IRemotelyProvisionedComponent, KeyParameter::KeyParameter,
-    KeyParameterValue::KeyParameterValue, MacedPublicKey::MacedPublicKey,
-    ProtectedData::ProtectedData, SecurityLevel::SecurityLevel, Tag::Tag,
+    DeviceInfo::DeviceInfo, IRemotelyProvisionedComponent::IRemotelyProvisionedComponent,
+    KeyParameter::KeyParameter, KeyParameterValue::KeyParameterValue,
+    MacedPublicKey::MacedPublicKey, ProtectedData::ProtectedData, SecurityLevel::SecurityLevel,
+    Tag::Tag,
 };
 use android_security_remoteprovisioning::aidl::android::security::remoteprovisioning::{
     AttestationPoolStatus::AttestationPoolStatus, IRemoteProvisioning::BnRemoteProvisioning,
@@ -165,26 +166,26 @@ impl RemProvState {
     ///
     /// It returns the ResponseCode `OUT_OF_KEYS` if there is not one key currently assigned to the
     /// `caller_uid` and there are none available to assign.
-    pub fn get_remote_provisioning_key_and_certs(
+    pub fn get_remotely_provisioned_attestation_key_and_certs(
         &self,
         key: &KeyDescriptor,
         caller_uid: u32,
         params: &[KeyParameter],
         db: &mut KeystoreDB,
-    ) -> Result<(Option<AttestationKey>, Option<Certificate>)> {
+    ) -> Result<Option<(AttestationKey, Certificate)>> {
         if !self.is_asymmetric_key(params) || !self.check_rem_prov_enabled(db)? {
             // There is no remote provisioning component for this security level on the
             // device. Return None so the underlying KM instance knows to use its
             // factory provisioned key instead. Alternatively, it's not an asymmetric key
             // and therefore will not be attested.
-            Ok((None, None))
+            Ok(None)
         } else {
             match self.get_rem_prov_attest_key(&key, caller_uid, db).context(concat!(
                 "In get_remote_provisioning_key_and_certs: Failed to get ",
                 "attestation key"
             ))? {
-                Some(cert_chain) => Ok((
-                    Some(AttestationKey {
+                Some(cert_chain) => Ok(Some((
+                    AttestationKey {
                         keyBlob: cert_chain.private_key.to_vec(),
                         attestKeyParams: vec![],
                         issuerSubjectName: parse_subject_from_certificate(&cert_chain.batch_cert)
@@ -192,10 +193,10 @@ impl RemProvState {
                             "In get_remote_provisioning_key_and_certs: Failed to ",
                             "parse subject."
                         ))?,
-                    }),
-                    Some(Certificate { encodedCertificate: cert_chain.cert_chain }),
-                )),
-                None => Ok((None, None)),
+                    },
+                    Certificate { encodedCertificate: cert_chain.cert_chain },
+                ))),
+                None => Ok(None),
             }
         }
     }
@@ -261,6 +262,7 @@ impl RemoteProvisioningService {
     /// challenge will ensure freshness. A `test_mode` flag will instruct the remote provisioning
     /// HAL if it is okay to accept EEKs that aren't signed by something that chains back to the
     /// baked in root of trust in the underlying IRemotelyProvisionedComponent instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_csr(
         &self,
         test_mode: bool,
@@ -269,6 +271,7 @@ impl RemoteProvisioningService {
         challenge: &[u8],
         sec_level: SecurityLevel,
         protected_data: &mut ProtectedData,
+        device_info: &mut DeviceInfo,
     ) -> Result<Vec<u8>> {
         let dev = self.get_dev_by_sec_level(&sec_level)?;
         let (_, _, uuid) = get_keymint_device(&sec_level)?;
@@ -280,13 +283,12 @@ impl RemoteProvisioningService {
                 .map(|key| MacedPublicKey { macedKey: key.to_vec() })
                 .collect())
         })?;
-        let mut mac = Vec::<u8>::with_capacity(32);
-        map_rem_prov_error(dev.generateCertificateRequest(
+        let mut mac = map_rem_prov_error(dev.generateCertificateRequest(
             test_mode,
             &keys_to_sign,
             eek,
             challenge,
-            &mut mac,
+            device_info,
             protected_data,
         ))
         .context("In generate_csr: Failed to generate csr")?;
@@ -399,9 +401,18 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         challenge: &[u8],
         sec_level: SecurityLevel,
         protected_data: &mut ProtectedData,
+        device_info: &mut DeviceInfo,
     ) -> binder::public_api::Result<Vec<u8>> {
         map_or_log_err(
-            self.generate_csr(test_mode, num_csr, eek, challenge, sec_level, protected_data),
+            self.generate_csr(
+                test_mode,
+                num_csr,
+                eek,
+                challenge,
+                sec_level,
+                protected_data,
+                device_info,
+            ),
             Ok,
         )
     }
