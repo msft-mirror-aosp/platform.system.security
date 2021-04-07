@@ -55,6 +55,7 @@ aidl_interface {
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         }
     },
 }
@@ -71,6 +72,9 @@ aidl_interface {
         rust: {
             enabled: true,
         },
+        ndk: {
+            enabled: true,
+        }
     },
 }
 
@@ -93,6 +97,7 @@ aidl_interface {
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         }
     },
 }
@@ -135,6 +140,7 @@ aidl_interface {
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         }
     },
 }
