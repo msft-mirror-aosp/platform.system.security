@@ -129,7 +129,7 @@ bool KeystoreKey::initialize() {
     if (sm == nullptr) {
         return false;
     }
-    auto service = sm->getService(String16("android.system.keystore2"));
+    auto service = sm->getService(String16("android.system.keystore2.IKeystoreService/default"));
     if (service == nullptr) {
         return false;
     }
@@ -239,5 +239,10 @@ Result<std::string> KeystoreKey::sign(const std::string& message) const {
 }
 
 Result<std::vector<uint8_t>> KeystoreKey::getPublicKey() const {
-    return extractPublicKeyFromX509(mKeyMetadata.certificate.value());
+    auto cert = mKeyMetadata.certificate;
+    if (cert) {
+        return extractPublicKeyFromX509(cert.value());
+    } else {
+        return Error() << "Key did not have a certificate";
+    }
 }

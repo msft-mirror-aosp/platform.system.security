@@ -90,6 +90,8 @@
 //!  * The termination condition which has an empty in list.
 //!  * The public interface, which does not have @marker and calls itself with an empty out list.
 
+#![allow(clippy::from_over_into, clippy::needless_question_mark)]
+
 use std::convert::TryInto;
 
 use crate::db_utils::SqlField;
@@ -776,7 +778,7 @@ macro_rules! implement_key_parameter_value {
 
 implement_key_parameter_value! {
 /// KeyParameterValue holds a value corresponding to one of the Tags defined in
-/// the AIDL spec at hardware/interfaces/keymint
+/// the AIDL spec at hardware/interfaces/security/keymint
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum KeyParameterValue {
     /// Associated with Tag:INVALID

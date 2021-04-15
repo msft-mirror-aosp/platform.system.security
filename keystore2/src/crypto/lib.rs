@@ -20,9 +20,9 @@ mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
     extractSubjectFromCertificate, generateKeyFromPassword, randomBytes, AES_gcm_decrypt,
-    AES_gcm_encrypt, ECDHComputeKey, ECKEYDeriveFromSecret, ECKEYGenerateKey, ECPOINTOct2Point,
-    ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free, HKDFExpand, HKDFExtract,
-    EC_KEY, EC_MAX_BYTES, EC_POINT, EVP_MAX_MD_SIZE,
+    AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey,
+    ECKEYParsePrivateKey, ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key,
+    EC_POINT_free, HKDFExpand, HKDFExtract, EC_KEY, EC_MAX_BYTES, EC_POINT, EVP_MAX_MD_SIZE,
 };
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -149,42 +149,68 @@ pub fn aes_gcm_encrypt(data: &[u8], key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec
     }
 }
 
-/// Generates a key from the given password and salt.
-/// The salt must be exactly 16 bytes long.
-/// Two key sizes are accepted: 16 and 32 bytes.
-pub fn derive_key_from_password(
-    pw: &[u8],
-    salt: Option<&[u8]>,
-    key_length: usize,
-) -> Result<ZVec, Error> {
-    let salt: *const u8 = match salt {
-        Some(s) => {
-            if s.len() != SALT_LENGTH {
-                return Err(Error::InvalidSaltLength);
-            }
-            s.as_ptr()
-        }
-        None => std::ptr::null(),
-    };
+/// Represents a "password" that can be used to key the PBKDF2 algorithm.
+pub enum Password<'a> {
+    /// Borrow an existing byte array
+    Ref(&'a [u8]),
+    /// Use an owned ZVec to store the key
+    Owned(ZVec),
+}
 
-    match key_length {
-        AES_128_KEY_LENGTH | AES_256_KEY_LENGTH => {}
-        _ => return Err(Error::InvalidKeyLength),
+impl<'a> From<&'a [u8]> for Password<'a> {
+    fn from(pw: &'a [u8]) -> Self {
+        Self::Ref(pw)
+    }
+}
+
+impl<'a> Password<'a> {
+    fn get_key(&'a self) -> &'a [u8] {
+        match self {
+            Self::Ref(b) => b,
+            Self::Owned(z) => &*z,
+        }
     }
 
-    let mut result = ZVec::new(key_length)?;
+    /// Generate a key from the given password and salt.
+    /// The salt must be exactly 16 bytes long.
+    /// Two key sizes are accepted: 16 and 32 bytes.
+    pub fn derive_key(&self, salt: Option<&[u8]>, key_length: usize) -> Result<ZVec, Error> {
+        let pw = self.get_key();
 
-    unsafe {
-        generateKeyFromPassword(
-            result.as_mut_ptr(),
-            result.len(),
-            pw.as_ptr() as *const std::os::raw::c_char,
-            pw.len(),
-            salt,
-        )
-    };
+        let salt: *const u8 = match salt {
+            Some(s) => {
+                if s.len() != SALT_LENGTH {
+                    return Err(Error::InvalidSaltLength);
+                }
+                s.as_ptr()
+            }
+            None => std::ptr::null(),
+        };
 
-    Ok(result)
+        match key_length {
+            AES_128_KEY_LENGTH | AES_256_KEY_LENGTH => {}
+            _ => return Err(Error::InvalidKeyLength),
+        }
+
+        let mut result = ZVec::new(key_length)?;
+
+        unsafe {
+            generateKeyFromPassword(
+                result.as_mut_ptr(),
+                result.len(),
+                pw.as_ptr() as *const std::os::raw::c_char,
+                pw.len(),
+                salt,
+            )
+        };
+
+        Ok(result)
+    }
+
+    /// Try to make another Password object with the same data.
+    pub fn try_clone(&self) -> Result<Password<'static>, Error> {
+        Ok(Password::Owned(ZVec::try_from(self.get_key())?))
+    }
 }
 
 /// Calls the boringssl HKDF_extract function.
@@ -312,14 +338,32 @@ pub fn ec_key_generate_key() -> Result<ECKey, Error> {
     Ok(ECKey(key))
 }
 
-/// Calls the boringssl EC_KEY_derive_from_secret function.
-pub fn ec_key_derive_from_secret(secret: &[u8]) -> Result<ECKey, Error> {
-    // Safety: secret is a valid buffer.
-    let result = unsafe { ECKEYDeriveFromSecret(secret.as_ptr(), secret.len()) };
-    if result.is_null() {
-        return Err(Error::ECKEYDeriveFailed);
+/// Calls the boringssl EC_KEY_marshal_private_key function.
+pub fn ec_key_marshal_private_key(key: &ECKey) -> Result<ZVec, Error> {
+    let len = 39; // Empirically observed length of private key
+    let mut buf = ZVec::new(len)?;
+    // Safety: the key is valid.
+    // This will not write past the specified length of the buffer; if the
+    // len above is too short, it returns 0.
+    let written_len =
+        unsafe { ECKEYMarshalPrivateKey(key.0, buf.as_mut_ptr(), buf.len()) } as usize;
+    if written_len == len {
+        Ok(buf)
+    } else {
+        Err(Error::ECKEYMarshalPrivateKeyFailed)
     }
-    Ok(ECKey(result))
+}
+
+/// Calls the boringssl EC_KEY_parse_private_key function.
+pub fn ec_key_parse_private_key(buf: &[u8]) -> Result<ECKey, Error> {
+    // Safety: this will not read past the specified length of the buffer.
+    // It fails if less than the whole buffer is consumed.
+    let key = unsafe { ECKEYParsePrivateKey(buf.as_ptr(), buf.len()) };
+    if key.is_null() {
+        Err(Error::ECKEYParsePrivateKeyFailed)
+    } else {
+        Ok(ECKey(key))
+    }
 }
 
 /// Calls the boringssl EC_KEY_get0_public_key function.
@@ -493,26 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn test_ec() {
-        let key = ec_key_generate_key();
-        assert!(key.is_ok());
-        assert!(!key.unwrap().0.is_null());
+    fn test_ec() -> Result<(), Error> {
+        let priv0 = ec_key_generate_key()?;
+        assert!(!priv0.0.is_null());
+        let pub0 = ec_key_get0_public_key(&priv0);
 
-        let key = ec_key_derive_from_secret(&[42; 16]);
-        assert!(key.is_ok());
-        let key = key.unwrap();
-        assert!(!key.0.is_null());
+        let priv1 = ec_key_generate_key()?;
+        let pub1 = ec_key_get0_public_key(&priv1);
 
-        let point = ec_key_get0_public_key(&key);
+        let priv0s = ec_key_marshal_private_key(&priv0)?;
+        let pub0s = ec_point_point_to_oct(pub0.get_point())?;
+        let pub1s = ec_point_point_to_oct(pub1.get_point())?;
 
-        let result = ecdh_compute_key(point.get_point(), &key);
-        assert!(result.is_ok());
+        let priv0 = ec_key_parse_private_key(&priv0s)?;
+        let pub0 = ec_point_oct_to_point(&pub0s)?;
+        let pub1 = ec_point_oct_to_point(&pub1s)?;
 
-        let oct = ec_point_point_to_oct(point.get_point());
-        assert!(oct.is_ok());
-        let oct = oct.unwrap();
+        let left_key = ecdh_compute_key(pub0.get_point(), &priv1)?;
+        let right_key = ecdh_compute_key(pub1.get_point(), &priv0)?;
 
-        let point2 = ec_point_oct_to_point(oct.as_slice());
-        assert!(point2.is_ok());
+        assert_eq!(left_key, right_key);
+        Ok(())
     }
 }

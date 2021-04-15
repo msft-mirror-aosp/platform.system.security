@@ -40,8 +40,9 @@ cc_binary {
         "libbase",
         "libbinder",
         "libbinder_ndk",
-        "libkeystore_aidl",
+        "android.hardware.keymaster@4.0",
         "libcredstore_aidl",
+        "libcrypto",
         "libutils",
         "libhidlbase",
         "android.hardware.identity-support-lib",
@@ -49,12 +50,11 @@ cc_binary {
         "libkeystore-attestation-application-id",
         "android.hardware.security.keymint-V1-ndk_platform",
         "android.security.authorization-ndk_platform",
-        "PlatformProperties",
     ],
     static_libs: [
         "android.hardware.identity-V3-cpp",
         "android.hardware.keymaster-V3-cpp",
-        "libcppbor",
+        "libcppbor_external",
     ]
 }
 

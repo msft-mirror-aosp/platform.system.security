@@ -391,20 +391,13 @@ void OperationSlot::freeSlot() {
 // KeyMintDevice implementation
 
 ScopedAStatus KeyMintDevice::getHardwareInfo(KeyMintHardwareInfo* _aidl_return) {
-    // TODO: What do I do about the version number?  Is it the version of the device I get?
-    auto result = mDevice->getHardwareInfo([&](auto securityLevel, const auto& keymasterName,
-                                               const auto& keymasterAuthorName) {
-        securityLevel_ =
-            static_cast<::aidl::android::hardware::security::keymint::SecurityLevel>(securityLevel);
-
-        _aidl_return->securityLevel = securityLevel_;
-        _aidl_return->keyMintName = keymasterName;
-        _aidl_return->keyMintAuthorName = keymasterAuthorName;
-    });
-    if (!result.isOk()) {
-        LOG(ERROR) << __func__ << " transaction failed. " << result.description();
-        return convertErrorCode(KMV1::ErrorCode::UNKNOWN_ERROR);
-    }
+    auto result = mDevice->halVersion();
+    _aidl_return->versionNumber = result.majorVersion * 10 + result.minorVersion;
+    securityLevel_ = convert(result.securityLevel);
+    _aidl_return->securityLevel = securityLevel_;
+    _aidl_return->keyMintName = result.keymasterName;
+    _aidl_return->keyMintAuthorName = result.authorName;
+    _aidl_return->timestampTokenRequired = securityLevel_ == KMV1::SecurityLevel::STRONGBOX;
     return ScopedAStatus::ok();
 }
 
@@ -550,11 +543,12 @@ ScopedAStatus KeyMintDevice::upgradeKey(const std::vector<uint8_t>& in_inKeyBlob
                                         std::vector<uint8_t>* _aidl_return) {
     auto legacyUpgradeParams = convertKeyParametersToLegacy(in_inUpgradeParams);
     V4_0_ErrorCode errorCode;
+
     auto result =
-        mDevice->upgradeKey(in_inKeyBlobToUpgrade, legacyUpgradeParams,
+        mDevice->upgradeKey(prefixedKeyBlobRemovePrefix(in_inKeyBlobToUpgrade), legacyUpgradeParams,
                             [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& upgradedKeyBlob) {
                                 errorCode = error;
-                                *_aidl_return = upgradedKeyBlob;
+                                *_aidl_return = keyBlobPrefix(upgradedKeyBlob, false);
                             });
     if (!result.isOk()) {
         LOG(ERROR) << __func__ << " transaction failed. " << result.description();
@@ -653,6 +647,45 @@ ScopedAStatus KeyMintDevice::earlyBootEnded() {
     } else {
         return convertErrorCode(KMV1::ErrorCode::OK);
     }
+}
+
+ScopedAStatus
+KeyMintDevice::convertStorageKeyToEphemeral(const std::vector<uint8_t>& prefixedStorageKeyBlob,
+                                            std::vector<uint8_t>* ephemeralKeyBlob) {
+    KMV1::ErrorCode km_error;
+
+    /*
+     * Wrapped storage keys cannot be emulated (and they don't need to, because if a platform
+     * supports wrapped storage keys, then the legacy backend will support it too. So error out
+     * if the wrapped storage key given is a soft keymint key.
+     */
+    if (prefixedKeyBlobIsSoftKeyMint(prefixedStorageKeyBlob)) {
+        return convertErrorCode(KMV1::ErrorCode::UNIMPLEMENTED);
+    }
+
+    const std::vector<uint8_t>& storageKeyBlob =
+        prefixedKeyBlobRemovePrefix(prefixedStorageKeyBlob);
+
+    auto hidlCb = [&](V4_0_ErrorCode ret, const hidl_vec<uint8_t>& exportedKeyBlob) {
+        km_error = convert(ret);
+        if (km_error != KMV1::ErrorCode::OK) return;
+        /*
+         * This must return the blob without the prefix since it will be used directly
+         * as a storage encryption key. But this is alright, since this wrapped ephemeral
+         * key shouldn't/won't ever be used with keymint.
+         */
+        *ephemeralKeyBlob = exportedKeyBlob;
+    };
+
+    auto ret = mDevice->exportKey(V4_0_KeyFormat::RAW, storageKeyBlob, {}, {}, hidlCb);
+    if (!ret.isOk()) {
+        LOG(ERROR) << __func__ << " export_key failed: " << ret.description();
+        return convertErrorCode(KMV1::ErrorCode::UNKNOWN_ERROR);
+    }
+    if (km_error != KMV1::ErrorCode::OK)
+        LOG(ERROR) << __func__ << " export_key failed, code " << int32_t(km_error);
+
+    return convertErrorCode(km_error);
 }
 
 ScopedAStatus KeyMintDevice::performOperation(const std::vector<uint8_t>& /* request */,
@@ -1338,7 +1371,7 @@ ScopedAStatus KeystoreCompatService::getSharedSecret(KeyMintSecurityLevel in_sec
 }
 
 ScopedAStatus KeystoreCompatService::getSecureClock(std::shared_ptr<ISecureClock>* _aidl_return) {
-    if (!mSharedSecret) {
+    if (!mSecureClock) {
         // The legacy verification service was always provided by the TEE variant.
         auto clock = SecureClock::createSecureClock(KeyMintSecurityLevel::TRUSTED_ENVIRONMENT);
         if (!clock) {
