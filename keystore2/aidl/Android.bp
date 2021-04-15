@@ -28,11 +28,16 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            sdk_version: "module_current",
+            platform_apis: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
         },
+        ndk: {
+            enabled: true,
+            apps_enabled: false,
+        }
     },
 }
 
@@ -46,13 +51,15 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            sdk_version: "module_current",
+            platform_apis: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         }
     },
 }
@@ -64,10 +71,14 @@ aidl_interface {
     backend: {
         java: {
             enabled: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
         },
+        ndk: {
+            enabled: true,
+        }
     },
 }
 
@@ -82,14 +93,16 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            sdk_version: "module_current",
+            platform_apis: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
         },
         ndk: {
             enabled: true,
-        }
+            apps_enabled: false,
+        },
     },
 }
 
@@ -102,12 +115,12 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            enabled: true,
-            sdk_version: "module_current",
             platform_apis: true,
+            srcs_available: true,
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         },
         rust: {
             enabled: true,
@@ -124,13 +137,15 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            sdk_version: "module_current",
+            platform_apis: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
         },
         ndk: {
             enabled: true,
+            apps_enabled: false,
         }
     },
 }
@@ -141,7 +156,8 @@ aidl_interface {
     unstable: true,
     backend: {
         java: {
-            sdk_version: "module_current",
+            platform_apis: true,
+            srcs_available: true,
         },
         rust: {
             enabled: true,
