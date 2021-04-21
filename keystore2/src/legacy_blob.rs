@@ -14,6 +14,8 @@
 
 //! This module implements methods to load legacy keystore key blob files.
 
+#![allow(clippy::redundant_slicing)]
+
 use crate::{
     error::{Error as KsError, ResponseCode},
     key_parameter::{KeyParameter, KeyParameterValue},
@@ -684,10 +686,18 @@ impl LegacyBlobLoader {
         let user_id = uid_to_android_user(uid);
         path.push(format!("user_{}", user_id));
         let uid_str = uid.to_string();
-        let dir =
-            Self::with_retry_interrupted(|| fs::read_dir(path.as_path())).with_context(|| {
-                format!("In list_vpn_profiles: Failed to open legacy blob database. {:?}", path)
-            })?;
+        let dir = match Self::with_retry_interrupted(|| fs::read_dir(path.as_path())) {
+            Ok(dir) => dir,
+            Err(e) => match e.kind() {
+                ErrorKind::NotFound => return Ok(Default::default()),
+                _ => {
+                    return Err(e).context(format!(
+                        "In list_vpn_profiles: Failed to open legacy blob database. {:?}",
+                        path
+                    ))
+                }
+            },
+        };
         let mut result: Vec<String> = Vec::new();
         for entry in dir {
             let file_name =
@@ -799,10 +809,18 @@ impl LegacyBlobLoader {
     /// encoded with UID prefix.
     fn list_user(&self, user_id: u32) -> Result<Vec<String>> {
         let path = self.make_user_path_name(user_id);
-        let dir =
-            Self::with_retry_interrupted(|| fs::read_dir(path.as_path())).with_context(|| {
-                format!("In list_user: Failed to open legacy blob database. {:?}", path)
-            })?;
+        let dir = match Self::with_retry_interrupted(|| fs::read_dir(path.as_path())) {
+            Ok(dir) => dir,
+            Err(e) => match e.kind() {
+                ErrorKind::NotFound => return Ok(Default::default()),
+                _ => {
+                    return Err(e).context(format!(
+                        "In list_user: Failed to open legacy blob database. {:?}",
+                        path
+                    ))
+                }
+            },
+        };
         let mut result: Vec<String> = Vec::new();
         for entry in dir {
             let file_name = entry.context("In list_user: Trying to access dir entry")?.file_name();
@@ -1138,7 +1156,7 @@ mod test {
             let encoded = LegacyBlobLoader::encode_alias(&alias_str);
             let decoded = match LegacyBlobLoader::decode_alias(&encoded) {
                 Ok(d) => d,
-                Err(_) => panic!(format!("random_alias: {:x?}\nencoded {}", random_alias, encoded)),
+                Err(_) => panic!("random_alias: {:x?}\nencoded {}", random_alias, encoded),
             };
             assert_eq!(random_alias.to_vec(), decoded.bytes().collect::<Vec<u8>>());
         }
@@ -1347,6 +1365,26 @@ mod test {
         // Now it should be empty.
         assert!(legacy_blob_loader.is_empty_user(0)?);
         assert!(legacy_blob_loader.is_empty()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_non_existing_user() -> Result<()> {
+        let temp_dir = TempDir::new("list_non_existing_user")?;
+        let legacy_blob_loader = LegacyBlobLoader::new(temp_dir.path());
+
+        assert!(legacy_blob_loader.list_user(20)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_vpn_profiles_on_non_existing_user() -> Result<()> {
+        let temp_dir = TempDir::new("list_vpn_profiles_on_non_existing_user")?;
+        let legacy_blob_loader = LegacyBlobLoader::new(temp_dir.path());
+
+        assert!(legacy_blob_loader.list_vpn_profiles(20)?.is_empty());
 
         Ok(())
     }

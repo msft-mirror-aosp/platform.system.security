@@ -17,6 +17,7 @@
 use keystore2::entropy;
 use keystore2::globals::ENFORCEMENTS;
 use keystore2::maintenance::Maintenance;
+use keystore2::metrics;
 use keystore2::remote_provisioning::RemoteProvisioningService;
 use keystore2::service::KeystoreService;
 use keystore2::{apc::ApcManager, shared_secret_negotiation};
@@ -69,13 +70,6 @@ fn main() {
     let (confirmation_token_sender, confirmation_token_receiver) = channel();
 
     ENFORCEMENTS.install_confirmation_token_receiver(confirmation_token_receiver);
-
-    info!("Starting boot level watcher.");
-    std::thread::spawn(|| {
-        keystore2::globals::ENFORCEMENTS
-            .watch_boot_level()
-            .unwrap_or_else(|e| error!("watch_boot_level failed: {}", e));
-    });
 
     entropy::register_feeder();
     shared_secret_negotiation::perform_shared_secret_negotiation();
@@ -141,6 +135,13 @@ fn main() {
             );
         },
     );
+
+    std::thread::spawn(|| {
+        match metrics::register_pull_metrics_callbacks() {
+            Err(e) => error!("register_pull_metrics_callbacks failed: {:?}.", e),
+            _ => info!("Pull metrics callbacks successfully registered."),
+        };
+    });
 
     info!("Successfully registered Keystore 2.0 service.");
 
