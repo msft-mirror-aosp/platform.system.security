@@ -18,7 +18,7 @@ use crate::error::Error as KeystoreError;
 use crate::globals::{ENFORCEMENTS, SUPER_KEY, DB, LEGACY_MIGRATOR};
 use crate::permission::KeystorePerm;
 use crate::super_key::UserState;
-use crate::utils::check_keystore_permission;
+use crate::utils::{check_keystore_permission, watchdog as wd};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     HardwareAuthToken::HardwareAuthToken,
 };
@@ -130,7 +130,15 @@ impl AuthorizationManager {
         lock_screen_event: LockScreenEvent,
         user_id: i32,
         password: Option<Password>,
+        unlocking_sids: Option<&[i64]>,
     ) -> Result<()> {
+        log::info!(
+            "on_lock_screen_event({:?}, user_id={:?}, password.is_some()={}, unlocking_sids={:?})",
+            lock_screen_event,
+            user_id,
+            password.is_some(),
+            unlocking_sids
+        );
         match (lock_screen_event, password) {
             (LockScreenEvent::UNLOCK, Some(password)) => {
                 // This corresponds to the unlock() method in legacy keystore API.
@@ -172,14 +180,23 @@ impl AuthorizationManager {
                 check_keystore_permission(KeystorePerm::unlock())
                     .context("In on_lock_screen_event: Unlock.")?;
                 ENFORCEMENTS.set_device_locked(user_id, false);
+                DB.with(|db| {
+                    SUPER_KEY.try_unlock_user_with_biometric(&mut db.borrow_mut(), user_id as u32)
+                })
+                .context("In on_lock_screen_event: try_unlock_user_with_biometric failed")?;
                 Ok(())
             }
             (LockScreenEvent::LOCK, None) => {
                 check_keystore_permission(KeystorePerm::lock())
                     .context("In on_lock_screen_event: Lock")?;
                 ENFORCEMENTS.set_device_locked(user_id, true);
-                SUPER_KEY.lock_screen_lock_bound_key(user_id as u32);
-
+                DB.with(|db| {
+                    SUPER_KEY.lock_screen_lock_bound_key(
+                        &mut db.borrow_mut(),
+                        user_id as u32,
+                        unlocking_sids.unwrap_or(&[]),
+                    );
+                });
                 Ok(())
             }
             _ => {
@@ -217,6 +234,7 @@ impl Interface for AuthorizationManager {}
 
 impl IKeystoreAuthorization for AuthorizationManager {
     fn addAuthToken(&self, auth_token: &HardwareAuthToken) -> BinderResult<()> {
+        let _wp = wd::watch_millis("IKeystoreAuthorization::addAuthToken", 500);
         map_or_log_err(self.add_auth_token(auth_token), Ok)
     }
 
@@ -225,9 +243,19 @@ impl IKeystoreAuthorization for AuthorizationManager {
         lock_screen_event: LockScreenEvent,
         user_id: i32,
         password: Option<&[u8]>,
+        unlocking_sids: Option<&[i64]>,
     ) -> BinderResult<()> {
+        let _wp =
+            wd::watch_millis_with("IKeystoreAuthorization::onLockScreenEvent", 500, move || {
+                format!("lock event: {}", lock_screen_event.0)
+            });
         map_or_log_err(
-            self.on_lock_screen_event(lock_screen_event, user_id, password.map(|pw| pw.into())),
+            self.on_lock_screen_event(
+                lock_screen_event,
+                user_id,
+                password.map(|pw| pw.into()),
+                unlocking_sids,
+            ),
             Ok,
         )
     }
@@ -238,6 +266,7 @@ impl IKeystoreAuthorization for AuthorizationManager {
         secure_user_id: i64,
         auth_token_max_age_millis: i64,
     ) -> binder::public_api::Result<AuthorizationTokens> {
+        let _wp = wd::watch_millis("IKeystoreAuthorization::getAuthTokensForCredStore", 500);
         map_or_log_err(
             self.get_auth_tokens_for_credstore(
                 challenge,

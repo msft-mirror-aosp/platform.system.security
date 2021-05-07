@@ -20,6 +20,7 @@ use crate::gc::Gc;
 use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_migrator::LegacyMigrator;
 use crate::super_key::SuperKeyManager;
+use crate::utils::watchdog as wd;
 use crate::utils::Asp;
 use crate::{async_task::AsyncTask, database::MonotonicRawTime};
 use crate::{
@@ -58,6 +59,7 @@ pub fn create_thread_local_db() -> KeystoreDB {
             Box::new(|uuid, blob| {
                 let km_dev: Strong<dyn IKeyMintDevice> =
                     get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?.get_interface()?;
+                let _wp = wd::watch_millis("In create_thread_local_db: calling deleteKey", 500);
                 map_km_error(km_dev.deleteKey(&*blob))
                     .context("In invalidate key closure: Trying to invalidate key blob.")
             }),
@@ -172,7 +174,9 @@ lazy_static! {
         &DB_PATH.lock().expect("Could not get the database path for legacy blob loader.")));
     /// Legacy migrator. Atomically migrates legacy blobs to the database.
     pub static ref LEGACY_MIGRATOR: Arc<LegacyMigrator> =
-        Arc::new(LegacyMigrator::new(ASYNC_TASK.clone()));
+        Arc::new(LegacyMigrator::new(Arc::new(Default::default())));
+    /// Background thread which handles logging via statsd and logd
+    pub static ref LOGS_HANDLER: Arc<AsyncTask> = Default::default();
 }
 
 static KEYMINT_SERVICE_NAME: &str = "android.hardware.security.keymint.IKeyMintDevice";
@@ -225,8 +229,10 @@ fn connect_keymint(security_level: &SecurityLevel) -> Result<(Asp, KeyMintHardwa
             .context("In connect_keymint: Trying to get Legacy wrapper.")
     }?;
 
+    let wp = wd::watch_millis("In connect_keymint: calling getHardwareInfo()", 500);
     let hw_info = map_km_error(keymint.getHardwareInfo())
         .context("In connect_keymint: Failed to get hardware info.")?;
+    drop(wp);
 
     Ok((Asp::new(keymint.as_binder()), hw_info))
 }
