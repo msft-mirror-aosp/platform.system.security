@@ -19,8 +19,6 @@
 //! certificate chains signed by some root authority and stored in a keystore SQLite
 //! DB.
 
-#![allow(clippy::from_over_into, clippy::needless_question_mark, clippy::vec_init_then_push)]
-
 use std::collections::HashMap;
 
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
@@ -34,7 +32,7 @@ use android_security_remoteprovisioning::aidl::android::security::remoteprovisio
     AttestationPoolStatus::AttestationPoolStatus, IRemoteProvisioning::BnRemoteProvisioning,
     IRemoteProvisioning::IRemoteProvisioning,
 };
-use android_security_remoteprovisioning::binder::Strong;
+use android_security_remoteprovisioning::binder::{BinderFeatures, Strong};
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, KeyDescriptor::KeyDescriptor,
 };
@@ -45,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::database::{CertificateChain, KeystoreDB, Uuid};
 use crate::error::{self, map_or_log_err, map_rem_prov_error, Error};
 use crate::globals::{get_keymint_device, get_remotely_provisioned_component, DB};
-use crate::utils::Asp;
+use crate::utils::{watchdog as wd, Asp};
 
 /// Contains helper functions to check if remote provisioning is enabled on the system and, if so,
 /// to assign and retrieve attestation keys and certificate chains.
@@ -233,7 +231,7 @@ impl RemoteProvisioningService {
         if let Ok(dev) = get_remotely_provisioned_component(&SecurityLevel::STRONGBOX) {
             result.device_by_sec_level.insert(SecurityLevel::STRONGBOX, dev);
         }
-        Ok(BnRemoteProvisioning::new_binder(result))
+        Ok(BnRemoteProvisioning::new_binder(result, BinderFeatures::default()))
     }
 
     /// Populates the AttestationPoolStatus parcelable with information about how many
@@ -252,7 +250,7 @@ impl RemoteProvisioningService {
             // attestation keys unless the pool status is checked first, so this call should be
             // enough to routinely clean out expired keys.
             db.delete_expired_attestation_keys()?;
-            Ok(db.get_attestation_pool_status(expired_by, &uuid)?)
+            db.get_attestation_pool_status(expired_by, &uuid)
         })
     }
 
@@ -294,14 +292,15 @@ impl RemoteProvisioningService {
             protected_data,
         ))
         .context("In generate_csr: Failed to generate csr")?;
-        let mut cose_mac_0 = Vec::<u8>::new();
         // TODO(b/180392379): Replace this manual CBOR generation with the cbor-serde crate as well.
         //                    This generates an array consisting of the mac and the public key Maps.
         //                    Just generate the actual MacedPublicKeys structure when the crate is
         //                    available.
-        cose_mac_0.push((0b100_00000 | (keys_to_sign.len() + 1)) as u8);
-        cose_mac_0.push(0b010_11000); //push mac
-        cose_mac_0.push(mac.len() as u8);
+        let mut cose_mac_0: Vec<u8> = vec![
+            (0b100_00000 | (keys_to_sign.len() + 1)) as u8,
+            0b010_11000, // mac
+            (mac.len() as u8),
+        ];
         cose_mac_0.append(&mut mac);
         for maced_public_key in keys_to_sign {
             if maced_public_key.macedKey.len() > 83 + 8 {
@@ -327,13 +326,13 @@ impl RemoteProvisioningService {
         DB.with::<_, Result<()>>(|db| {
             let mut db = db.borrow_mut();
             let (_, _, uuid) = get_keymint_device(&sec_level)?;
-            Ok(db.store_signed_attestation_certificate_chain(
+            db.store_signed_attestation_certificate_chain(
                 public_key,
                 batch_cert,
                 certs, /* DER encoded certificate chain */
                 expiration_date,
                 &uuid,
-            )?)
+            )
         })
     }
 
@@ -362,7 +361,7 @@ impl RemoteProvisioningService {
         raw_key[32..64].clone_from_slice(&data[53..53 + 32]);
         DB.with::<_, Result<()>>(|db| {
             let mut db = db.borrow_mut();
-            Ok(db.create_attestation_key_entry(&maced_key.macedKey, &raw_key, &priv_key, &uuid)?)
+            db.create_attestation_key_entry(&maced_key.macedKey, &raw_key, &priv_key, &uuid)
         })
     }
 
@@ -377,7 +376,7 @@ impl RemoteProvisioningService {
     pub fn delete_all_keys(&self) -> Result<i64> {
         DB.with::<_, Result<i64>>(|db| {
             let mut db = db.borrow_mut();
-            Ok(db.delete_all_attestation_keys()?)
+            db.delete_all_attestation_keys()
         })
     }
 }
@@ -392,6 +391,7 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         expired_by: i64,
         sec_level: SecurityLevel,
     ) -> binder::public_api::Result<AttestationPoolStatus> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::getPoolStatus", 500);
         map_or_log_err(self.get_pool_status(expired_by, sec_level), Ok)
     }
 
@@ -405,6 +405,7 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         protected_data: &mut ProtectedData,
         device_info: &mut DeviceInfo,
     ) -> binder::public_api::Result<Vec<u8>> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::generateCsr", 500);
         map_or_log_err(
             self.generate_csr(
                 test_mode,
@@ -427,6 +428,7 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         expiration_date: i64,
         sec_level: SecurityLevel,
     ) -> binder::public_api::Result<()> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::provisionCertChain", 500);
         map_or_log_err(
             self.provision_cert_chain(public_key, batch_cert, certs, expiration_date, sec_level),
             Ok,
@@ -438,14 +440,17 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         is_test_mode: bool,
         sec_level: SecurityLevel,
     ) -> binder::public_api::Result<()> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::generateKeyPair", 500);
         map_or_log_err(self.generate_key_pair(is_test_mode, sec_level), Ok)
     }
 
     fn getSecurityLevels(&self) -> binder::public_api::Result<Vec<SecurityLevel>> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::getSecurityLevels", 500);
         map_or_log_err(self.get_security_levels(), Ok)
     }
 
     fn deleteAllKeys(&self) -> binder::public_api::Result<i64> {
+        let _wp = wd::watch_millis("IRemoteProvisioning::deleteAllKeys", 500);
         map_or_log_err(self.delete_all_keys(), Ok)
     }
 }
