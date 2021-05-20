@@ -14,11 +14,14 @@
 
 //! This is the Keystore 2.0 Enforcements module.
 // TODO: more description to follow.
-use crate::database::{AuthTokenEntry, MonotonicRawTime};
 use crate::error::{map_binder_status, Error, ErrorCode};
 use crate::globals::{get_timestamp_service, ASYNC_TASK, DB, ENFORCEMENTS};
 use crate::key_parameter::{KeyParameter, KeyParameterValue};
 use crate::{authorization::Error as AuthzError, super_key::SuperEncryptionType};
+use crate::{
+    database::{AuthTokenEntry, MonotonicRawTime},
+    globals::SUPER_KEY,
+};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, ErrorCode::ErrorCode as Ec, HardwareAuthToken::HardwareAuthToken,
     HardwareAuthenticatorType::HardwareAuthenticatorType,
@@ -34,11 +37,9 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use android_system_keystore2::binder::Strong;
 use anyhow::{Context, Result};
-use keystore2_system_property::PropertyWatcher;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicI32, Ordering},
         mpsc::{channel, Receiver, Sender, TryRecvError},
         Arc, Mutex, Weak,
     },
@@ -60,47 +61,54 @@ struct AuthRequest {
     state: AuthRequestState,
     /// This need to be set to Some to fulfill a AuthRequestState::OpAuth or
     /// AuthRequestState::TimeStampedOpAuth.
-    hat: Option<HardwareAuthToken>,
+    hat: Mutex<Option<HardwareAuthToken>>,
 }
 
+unsafe impl Sync for AuthRequest {}
+
 impl AuthRequest {
-    fn op_auth() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self { state: AuthRequestState::OpAuth, hat: None }))
+    fn op_auth() -> Arc<Self> {
+        Arc::new(Self { state: AuthRequestState::OpAuth, hat: Mutex::new(None) })
     }
 
-    fn timestamped_op_auth(receiver: Receiver<Result<TimeStampToken, Error>>) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
+    fn timestamped_op_auth(receiver: Receiver<Result<TimeStampToken, Error>>) -> Arc<Self> {
+        Arc::new(Self {
             state: AuthRequestState::TimeStampedOpAuth(receiver),
-            hat: None,
-        }))
+            hat: Mutex::new(None),
+        })
     }
 
     fn timestamp(
         hat: HardwareAuthToken,
         receiver: Receiver<Result<TimeStampToken, Error>>,
-    ) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self { state: AuthRequestState::TimeStamp(receiver), hat: Some(hat) }))
+    ) -> Arc<Self> {
+        Arc::new(Self { state: AuthRequestState::TimeStamp(receiver), hat: Mutex::new(Some(hat)) })
     }
 
-    fn add_auth_token(&mut self, hat: HardwareAuthToken) {
-        self.hat = Some(hat)
+    fn add_auth_token(&self, hat: HardwareAuthToken) {
+        *self.hat.lock().unwrap() = Some(hat)
     }
 
-    fn get_auth_tokens(&mut self) -> Result<(HardwareAuthToken, Option<TimeStampToken>)> {
-        match (&self.state, self.hat.is_some()) {
-            (AuthRequestState::OpAuth, true) => Ok((self.hat.take().unwrap(), None)),
-            (AuthRequestState::TimeStampedOpAuth(recv), true)
-            | (AuthRequestState::TimeStamp(recv), true) => {
+    fn get_auth_tokens(&self) -> Result<(HardwareAuthToken, Option<TimeStampToken>)> {
+        let hat = self
+            .hat
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(Error::Km(ErrorCode::KEY_USER_NOT_AUTHENTICATED))
+            .context("In get_auth_tokens: No operation auth token received.")?;
+
+        let tst = match &self.state {
+            AuthRequestState::TimeStampedOpAuth(recv) | AuthRequestState::TimeStamp(recv) => {
                 let result = recv.recv().context("In get_auth_tokens: Sender disconnected.")?;
-                let tst = result.context(concat!(
+                Some(result.context(concat!(
                     "In get_auth_tokens: Worker responded with error ",
                     "from generating timestamp token."
-                ))?;
-                Ok((self.hat.take().unwrap(), Some(tst)))
+                ))?)
             }
-            (_, false) => Err(Error::Km(ErrorCode::KEY_USER_NOT_AUTHENTICATED))
-                .context("In get_auth_tokens: No operation auth token received."),
-        }
+            AuthRequestState::OpAuth => None,
+        };
+        Ok((hat, tst))
     }
 }
 
@@ -126,7 +134,7 @@ enum DeferredAuthState {
     /// We block on timestamp tokens, because we can always make progress on these requests.
     /// The per-op auth tokens might never come, which means we fail if the client calls
     /// update or finish before we got a per-op auth token.
-    Waiting(Arc<Mutex<AuthRequest>>),
+    Waiting(Arc<AuthRequest>),
     /// In this state we have gotten all of the required tokens, we just cache them to
     /// be used when the operation progresses.
     Token(HardwareAuthToken, Option<TimeStampToken>),
@@ -168,9 +176,15 @@ impl TokenReceiverMap {
     const CLEANUP_PERIOD: u8 = 25;
 
     pub fn add_auth_token(&self, hat: HardwareAuthToken) {
-        let mut map = self.map_and_cleanup_counter.lock().unwrap();
-        let (ref mut map, _) = *map;
-        if let Some((_, recv)) = map.remove_entry(&hat.challenge) {
+        let recv = {
+            // Limit the scope of the mutex guard, so that it is not held while the auth token is
+            // added.
+            let mut map = self.map_and_cleanup_counter.lock().unwrap();
+            let (ref mut map, _) = *map;
+            map.remove_entry(&hat.challenge)
+        };
+
+        if let Some((_, recv)) = recv {
             recv.add_auth_token(hat);
         }
     }
@@ -190,7 +204,7 @@ impl TokenReceiverMap {
 }
 
 #[derive(Debug)]
-struct TokenReceiver(Weak<Mutex<AuthRequest>>);
+struct TokenReceiver(Weak<AuthRequest>);
 
 impl TokenReceiver {
     fn is_obsolete(&self) -> bool {
@@ -199,8 +213,7 @@ impl TokenReceiver {
 
     fn add_auth_token(&self, hat: HardwareAuthToken) {
         if let Some(state_arc) = self.0.upgrade() {
-            let mut state = state_arc.lock().unwrap();
-            state.add_auth_token(hat);
+            state_arc.add_auth_token(hat);
         }
     }
 }
@@ -325,8 +338,7 @@ impl AuthInfo {
     /// tokens into the DeferredAuthState::Token state for future use.
     fn get_auth_tokens(&mut self) -> Result<(Option<HardwareAuthToken>, Option<TimeStampToken>)> {
         let deferred_tokens = if let DeferredAuthState::Waiting(ref auth_request) = self.state {
-            let mut state = auth_request.lock().unwrap();
-            Some(state.get_auth_tokens().context("In AuthInfo::get_auth_tokens.")?)
+            Some(auth_request.get_auth_tokens().context("In AuthInfo::get_auth_tokens.")?)
         } else {
             None
         };
@@ -369,8 +381,6 @@ pub struct Enforcements {
     /// The enforcement module will try to get a confirmation token from this channel whenever
     /// an operation that requires confirmation finishes.
     confirmation_token_receiver: Arc<Mutex<Option<Receiver<Vec<u8>>>>>,
-    /// Highest boot level seen in keystore.boot_level; used to enforce MAX_BOOT_LEVEL tag.
-    boot_level: AtomicI32,
 }
 
 impl Enforcements {
@@ -596,7 +606,7 @@ impl Enforcements {
         }
 
         if let Some(level) = max_boot_level {
-            if level < self.boot_level.load(Ordering::SeqCst) {
+            if !SUPER_KEY.level_accessible(level) {
                 return Err(Error::Km(Ec::BOOT_LEVEL_EXCEEDED))
                     .context("In authorize_create: boot level is too late.");
             }
@@ -628,8 +638,7 @@ impl Enforcements {
                 } else {
                     unlocked_device_required
                 }
-            })
-            .context("In authorize_create: Trying to get required auth token.")?;
+            });
             Some(
                 hat_and_last_off_body
                     .ok_or(Error::Km(Ec::KEY_USER_NOT_AUTHENTICATED))
@@ -672,9 +681,10 @@ impl Enforcements {
             // So the HAT cannot be presented on create. So on update/finish we present both
             // an per-op-bound auth token and a timestamp token.
             (Some(_), true, true) => (None, DeferredAuthState::TimeStampedOpAuthRequired),
-            (Some(hat), true, false) => {
-                (None, DeferredAuthState::TimeStampRequired(hat.take_auth_token()))
-            }
+            (Some(hat), true, false) => (
+                Some(hat.auth_token().clone()),
+                DeferredAuthState::TimeStampRequired(hat.take_auth_token()),
+            ),
             (Some(hat), false, true) => {
                 (Some(hat.take_auth_token()), DeferredAuthState::OpAuthRequired)
             }
@@ -689,15 +699,11 @@ impl Enforcements {
         })
     }
 
-    fn find_auth_token<F>(p: F) -> Result<Option<(AuthTokenEntry, MonotonicRawTime)>>
+    fn find_auth_token<F>(p: F) -> Option<(AuthTokenEntry, MonotonicRawTime)>
     where
         F: Fn(&AuthTokenEntry) -> bool,
     {
-        DB.with(|db| {
-            let mut db = db.borrow_mut();
-            db.find_auth_token_entry(p).context("Trying to find auth token.")
-        })
-        .context("In find_auth_token.")
+        DB.with(|db| db.borrow().find_auth_token_entry(p))
     }
 
     /// Checks if the time now since epoch is greater than (or equal, if is_given_time_inclusive is
@@ -741,11 +747,9 @@ impl Enforcements {
     /// Add this auth token to the database.
     /// Then present the auth token to the op auth map. If an operation is waiting for this
     /// auth token this fulfills the request and removes the receiver from the map.
-    pub fn add_auth_token(&self, hat: HardwareAuthToken) -> Result<()> {
-        DB.with(|db| db.borrow_mut().insert_auth_token(&hat)).context("In add_auth_token.")?;
-
+    pub fn add_auth_token(&self, hat: HardwareAuthToken) {
+        DB.with(|db| db.borrow_mut().insert_auth_token(&hat));
         self.op_auth_map.add_auth_token(hat);
-        Ok(())
     }
 
     /// This allows adding an entry to the op_auth_map, indexed by the operation challenge.
@@ -762,27 +766,35 @@ impl Enforcements {
         key_parameters: &[KeyParameter],
         flags: Option<i32>,
     ) -> SuperEncryptionType {
-        if *domain != Domain::APP {
-            return SuperEncryptionType::None;
-        }
         if let Some(flags) = flags {
             if (flags & KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING) != 0 {
                 return SuperEncryptionType::None;
             }
         }
-        if key_parameters
-            .iter()
-            .any(|kp| matches!(kp.key_parameter_value(), KeyParameterValue::UnlockedDeviceRequired))
-        {
-            return SuperEncryptionType::ScreenLockBound;
+        // Each answer has a priority, numerically largest priority wins.
+        struct Candidate {
+            priority: u32,
+            enc_type: SuperEncryptionType,
         }
-        if key_parameters
-            .iter()
-            .any(|kp| matches!(kp.key_parameter_value(), KeyParameterValue::UserSecureID(_)))
-        {
-            return SuperEncryptionType::LskfBound;
+        let mut result = Candidate { priority: 0, enc_type: SuperEncryptionType::None };
+        for kp in key_parameters {
+            let t = match kp.key_parameter_value() {
+                KeyParameterValue::MaxBootLevel(level) => {
+                    Candidate { priority: 3, enc_type: SuperEncryptionType::BootLevel(*level) }
+                }
+                KeyParameterValue::UnlockedDeviceRequired if *domain == Domain::APP => {
+                    Candidate { priority: 2, enc_type: SuperEncryptionType::ScreenLockBound }
+                }
+                KeyParameterValue::UserSecureID(_) if *domain == Domain::APP => {
+                    Candidate { priority: 1, enc_type: SuperEncryptionType::LskfBound }
+                }
+                _ => Candidate { priority: 0, enc_type: SuperEncryptionType::None },
+            };
+            if t.priority > result.priority {
+                result = t;
+            }
         }
-        SuperEncryptionType::None
+        result.enc_type
     }
 
     /// Finds a matching auth token along with a timestamp token.
@@ -805,28 +817,22 @@ impl Enforcements {
         // Filter the matching auth tokens by challenge
         let result = Self::find_auth_token(|hat: &AuthTokenEntry| {
             (challenge == hat.challenge()) && hat.satisfies(&sids, auth_type)
-        })
-        .context(
-            "In get_auth_tokens: Failed to get a matching auth token filtered by challenge.",
-        )?;
+        });
 
         let auth_token = if let Some((auth_token_entry, _)) = result {
             auth_token_entry.take_auth_token()
         } else {
             // Filter the matching auth tokens by age.
             if auth_token_max_age_millis != 0 {
-                let now_in_millis = MonotonicRawTime::now().milli_seconds();
+                let now_in_millis = MonotonicRawTime::now();
                 let result = Self::find_auth_token(|auth_token_entry: &AuthTokenEntry| {
                     let token_valid = now_in_millis
-                        .checked_sub(auth_token_entry.time_received().milli_seconds())
+                        .checked_sub(&auth_token_entry.time_received())
                         .map_or(false, |token_age_in_millis| {
-                            auth_token_max_age_millis > token_age_in_millis
+                            auth_token_max_age_millis > token_age_in_millis.milliseconds()
                         });
                     token_valid && auth_token_entry.satisfies(&sids, auth_type)
-                })
-                .context(
-                    "In get_auth_tokens: Failed to get a matching auth token filtered by age.",
-                )?;
+                });
 
                 if let Some((auth_token_entry, _)) = result {
                     auth_token_entry.take_auth_token()
@@ -843,35 +849,6 @@ impl Enforcements {
         let tst = get_timestamp_token(challenge)
             .context("In get_auth_tokens. Error in getting timestamp token.")?;
         Ok((auth_token, tst))
-    }
-
-    /// Watch the `keystore.boot_level` system property, and keep self.boot_level up to date.
-    /// Blocks waiting for system property changes, so must be run in its own thread.
-    pub fn watch_boot_level(&self) -> Result<()> {
-        let mut w = PropertyWatcher::new("keystore.boot_level")?;
-        loop {
-            fn parse_value(_name: &str, value: &str) -> Result<Option<i32>> {
-                Ok(if value == "end" { None } else { Some(value.parse::<i32>()?) })
-            }
-            match w.read(parse_value)? {
-                Some(level) => {
-                    let old = self.boot_level.fetch_max(level, Ordering::SeqCst);
-                    log::info!(
-                        "Read keystore.boot_level: {}; boot level {} -> {}",
-                        level,
-                        old,
-                        std::cmp::max(old, level)
-                    );
-                }
-                None => {
-                    log::info!("keystore.boot_level is `end`, finishing.");
-                    self.boot_level.fetch_max(i32::MAX, Ordering::SeqCst);
-                    break;
-                }
-            }
-            w.wait()?;
-        }
-        Ok(())
     }
 }
 

@@ -17,11 +17,12 @@
 
 use std::collections::HashMap;
 
+use crate::audit_log::log_key_deleted;
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
     check_grant_permission, check_key_permission, check_keystore_permission,
-    key_parameters_to_authorizations, Asp,
+    key_parameters_to_authorizations, watchdog as wd, Asp,
 };
 use crate::{
     database::Uuid,
@@ -37,13 +38,13 @@ use crate::{
     id_rotation::IdRotationState,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::SecurityLevel::SecurityLevel;
+use android_hardware_security_keymint::binder::{BinderFeatures, Strong, ThreadState};
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, IKeystoreSecurityLevel::IKeystoreSecurityLevel,
     IKeystoreService::BnKeystoreService, IKeystoreService::IKeystoreService,
     KeyDescriptor::KeyDescriptor, KeyEntryResponse::KeyEntryResponse, KeyMetadata::KeyMetadata,
 };
 use anyhow::{Context, Result};
-use binder::{IBinderInternal, Strong, ThreadState};
 use error::Error;
 use keystore2_selinux as selinux;
 
@@ -90,9 +91,10 @@ impl KeystoreService {
                 "In KeystoreService::new_native_binder: Trying to initialize the legacy migrator.",
             )?;
 
-        let result = BnKeystoreService::new_binder(result);
-        result.as_binder().set_requesting_sid(true);
-        Ok(result)
+        Ok(BnKeystoreService::new_binder(
+            result,
+            BinderFeatures { set_requesting_sid: true, ..BinderFeatures::default() },
+        ))
     }
 
     fn uuid_to_sec_level(&self, uuid: &Uuid) -> SecurityLevel {
@@ -289,7 +291,7 @@ impl KeystoreService {
             &mut DB
                 .with(|db| {
                     let mut db = db.borrow_mut();
-                    db.list(k.domain, k.nspace)
+                    db.list(k.domain, k.nspace, KeyType::Client)
                 })
                 .context("In list_entries: Trying to list keystore database.")?,
         );
@@ -352,9 +354,13 @@ impl IKeystoreService for KeystoreService {
         &self,
         security_level: SecurityLevel,
     ) -> binder::public_api::Result<Strong<dyn IKeystoreSecurityLevel>> {
+        let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, move || {
+            format!("security_level: {}", security_level.0)
+        });
         map_or_log_err(self.get_security_level(security_level), Ok)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::public_api::Result<KeyEntryResponse> {
+        let _wp = wd::watch_millis("IKeystoreService::get_key_entry", 500);
         map_or_log_err(self.get_key_entry(key), Ok)
     }
     fn updateSubcomponent(
@@ -363,6 +369,7 @@ impl IKeystoreService for KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> binder::public_api::Result<()> {
+        let _wp = wd::watch_millis("IKeystoreService::updateSubcomponent", 500);
         map_or_log_err(self.update_subcomponent(key, public_cert, certificate_chain), Ok)
     }
     fn listEntries(
@@ -370,10 +377,14 @@ impl IKeystoreService for KeystoreService {
         domain: Domain,
         namespace: i64,
     ) -> binder::public_api::Result<Vec<KeyDescriptor>> {
+        let _wp = wd::watch_millis("IKeystoreService::listEntries", 500);
         map_or_log_err(self.list_entries(domain, namespace), Ok)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::public_api::Result<()> {
-        map_or_log_err(self.delete_key(key), Ok)
+        let _wp = wd::watch_millis("IKeystoreService::deleteKey", 500);
+        let result = self.delete_key(key);
+        log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());
+        map_or_log_err(result, Ok)
     }
     fn grant(
         &self,
@@ -381,9 +392,11 @@ impl IKeystoreService for KeystoreService {
         grantee_uid: i32,
         access_vector: i32,
     ) -> binder::public_api::Result<KeyDescriptor> {
+        let _wp = wd::watch_millis("IKeystoreService::grant", 500);
         map_or_log_err(self.grant(key, grantee_uid, access_vector.into()), Ok)
     }
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> binder::public_api::Result<()> {
+        let _wp = wd::watch_millis("IKeystoreService::ungrant", 500);
         map_or_log_err(self.ungrant(key, grantee_uid), Ok)
     }
 }

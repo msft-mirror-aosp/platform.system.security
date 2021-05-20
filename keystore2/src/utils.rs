@@ -36,7 +36,6 @@ use keystore2_apc_compat::{
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
-use std::convert::TryFrom;
 use std::sync::Mutex;
 
 /// This function uses its namesake in the permission module and in
@@ -107,11 +106,17 @@ pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
     let permission_controller: binder::Strong<dyn IPermissionController::IPermissionController> =
         binder::get_interface("permission")?;
 
-    let binder_result = permission_controller.checkPermission(
-        "android.permission.READ_PRIVILEGED_PHONE_STATE",
-        ThreadState::get_calling_pid(),
-        ThreadState::get_calling_uid() as i32,
-    );
+    let binder_result = {
+        let _wp = watchdog::watch_millis(
+            "In check_device_attestation_permissions: calling checkPermission.",
+            500,
+        );
+        permission_controller.checkPermission(
+            "android.permission.READ_PRIVILEGED_PHONE_STATE",
+            ThreadState::get_calling_pid(),
+            ThreadState::get_calling_uid() as i32,
+        )
+    };
     let has_permissions = map_binder_status(binder_result)
         .context("In check_device_attestation_permissions: checkPermission failed")?;
     match has_permissions {
@@ -180,19 +185,15 @@ pub fn key_parameters_to_authorizations(
     parameters.into_iter().map(|p| p.into_authorization()).collect()
 }
 
-/// This returns the current time (in seconds) as an instance of a monotonic clock, by invoking the
-/// system call since Rust does not support getting monotonic time instance as an integer.
-pub fn get_current_time_in_seconds() -> i64 {
+/// This returns the current time (in milliseconds) as an instance of a monotonic clock,
+/// by invoking the system call since Rust does not support getting monotonic time instance
+/// as an integer.
+pub fn get_current_time_in_milliseconds() -> i64 {
     let mut current_time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // Following unsafe block includes one system call to get monotonic time.
     // Therefore, it is not considered harmful.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut current_time) };
-    // It is safe to unwrap here because try_from() returns std::convert::Infallible, which is
-    // defined to be an error that can never happen (i.e. the result is always ok).
-    // This suppresses the compiler's complaint about converting tv_sec to i64 in method
-    // get_current_time_in_seconds.
-    #[allow(clippy::useless_conversion)]
-    i64::try_from(current_time.tv_sec).unwrap()
+    current_time.tv_sec as i64 * 1000 + (current_time.tv_nsec as i64 / 1_000_000)
 }
 
 /// Converts a response code as returned by the Android Protected Confirmation HIDL compatibility
@@ -223,10 +224,63 @@ pub fn ui_opts_2_compat(opt: i32) -> ApcCompatUiOptions {
 /// AID offset for uid space partitioning.
 pub const AID_USER_OFFSET: u32 = cutils_bindgen::AID_USER_OFFSET;
 
+/// AID of the keystore process itself, used for keys that
+/// keystore generates for its own use.
+pub const AID_KEYSTORE: u32 = cutils_bindgen::AID_KEYSTORE;
+
 /// Extracts the android user from the given uid.
 pub fn uid_to_android_user(uid: u32) -> u32 {
     // Safety: No memory access
     unsafe { cutils_bindgen::multiuser_get_user_id(uid) }
+}
+
+/// This module provides helpers for simplified use of the watchdog module.
+#[cfg(feature = "watchdog")]
+pub mod watchdog {
+    pub use crate::watchdog::WatchPoint;
+    use crate::watchdog::Watchdog;
+    use lazy_static::lazy_static;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    lazy_static! {
+        /// A Watchdog thread, that can be used to create watch points.
+        static ref WD: Arc<Watchdog> = Watchdog::new(Duration::from_secs(10));
+    }
+
+    /// Sets a watch point with `id` and a timeout of `millis` milliseconds.
+    pub fn watch_millis(id: &'static str, millis: u64) -> Option<WatchPoint> {
+        Watchdog::watch(&WD, id, Duration::from_millis(millis))
+    }
+
+    /// Like `watch_millis` but with a callback that is called every time a report
+    /// is printed about this watch point.
+    pub fn watch_millis_with(
+        id: &'static str,
+        millis: u64,
+        callback: impl Fn() -> String + Send + 'static,
+    ) -> Option<WatchPoint> {
+        Watchdog::watch_with(&WD, id, Duration::from_millis(millis), callback)
+    }
+}
+
+/// This module provides empty/noop implementations of the watch dog utility functions.
+#[cfg(not(feature = "watchdog"))]
+pub mod watchdog {
+    /// Noop watch point.
+    pub struct WatchPoint();
+    /// Sets a Noop watch point.
+    fn watch_millis(_: &'static str, _: u64) -> Option<WatchPoint> {
+        None
+    }
+
+    pub fn watch_millis_with(
+        _: &'static str,
+        _: u64,
+        _: impl Fn() -> String + Send + 'static,
+    ) -> Option<WatchPoint> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ rust_library {
 
     rustlibs: [
         "libanyhow",
+        "liblazy_static",
         "liblog_rust",
         "libselinux_bindgen",
         "libthiserror",
@@ -56,8 +57,30 @@ rust_test {
     rustlibs: [
         "libandroid_logger",
         "libanyhow",
+        "liblazy_static",
         "liblog_rust",
         "libselinux_bindgen",
+        "libthiserror",
+    ],
+}
+
+rust_test {
+    name: "keystore2_selinux_concurrency_test",
+    srcs: [
+        "src/concurrency_test.rs",
+    ],
+    crate_name: "keystore2_selinux_concurrency_test",
+    test_suites: ["deneral-tests"],
+    auto_gen_config: true,
+
+    rustlibs: [
+        "libandroid_logger",
+        "libanyhow",
+        "libkeystore2_selinux",
+        "liblazy_static",
+        "liblog_rust",
+        "libnix",
+        "libnum_cpus",
         "libthiserror",
     ],
 }

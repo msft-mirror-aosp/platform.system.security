@@ -18,17 +18,22 @@ use android_security_vpnprofilestore::aidl::android::security::vpnprofilestore::
     IVpnProfileStore::BnVpnProfileStore, IVpnProfileStore::IVpnProfileStore,
     IVpnProfileStore::ERROR_PROFILE_NOT_FOUND, IVpnProfileStore::ERROR_SYSTEM_ERROR,
 };
-use android_security_vpnprofilestore::binder::{Result as BinderResult, Status as BinderStatus};
-use anyhow::{Context, Result};
-use binder::{ExceptionCode, Strong, ThreadState};
-use keystore2::{async_task::AsyncTask, legacy_blob::LegacyBlobLoader};
+use android_security_vpnprofilestore::binder::{
+    BinderFeatures, ExceptionCode, Result as BinderResult, Status as BinderStatus, Strong,
+    ThreadState,
+};
+use anyhow::{anyhow, Context, Result};
+use keystore2::{async_task::AsyncTask, legacy_blob::LegacyBlobLoader, utils::watchdog as wd};
 use rusqlite::{
     params, Connection, OptionalExtension, Transaction, TransactionBehavior, NO_PARAMS,
 };
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Once,
 };
+
+static DB_SET_WAL_MODE: Once = Once::new();
 
 struct DB {
     conn: Connection,
@@ -36,15 +41,29 @@ struct DB {
 
 impl DB {
     fn new(db_file: &Path) -> Result<Self> {
+        DB_SET_WAL_MODE.call_once(|| {
+            log::info!("Setting VpnProfileStore database to WAL mode first time since boot.");
+            Self::set_wal_mode(&db_file).expect("In vpnprofilestore: Could not set WAL mode.");
+        });
+
         let mut db = Self {
             conn: Connection::open(db_file).context("Failed to initialize SQLite connection.")?,
         };
 
-        // On busy fail Immediately. It is unlikely to succeed given a bug in sqlite.
-        db.conn.busy_handler(None).context("Failed to set busy handler.")?;
-
         db.init_tables().context("Trying to initialize vpnstore db.")?;
         Ok(db)
+    }
+
+    fn set_wal_mode(db_file: &Path) -> Result<()> {
+        let conn = Connection::open(db_file)
+            .context("In VpnProfileStore set_wal_mode: Failed to open DB.")?;
+        let mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", &"WAL", |row| row.get(0))
+            .context("In VpnProfileStore set_wal_mode: Failed to set journal_mode")?;
+        match mode.as_str() {
+            "wal" => Ok(()),
+            _ => Err(anyhow!("Unable to set WAL mode, db is still in {} mode.", mode)),
+        }
     }
 
     fn with_transaction<T, F>(&mut self, behavior: TransactionBehavior, f: F) -> Result<T>
@@ -75,15 +94,11 @@ impl DB {
     }
 
     fn is_locked_error(e: &anyhow::Error) -> bool {
-        matches!(e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
-        Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseBusy,
-            ..
-        })
-        | Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseLocked,
-            ..
-        }))
+        matches!(
+            e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
+            Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseBusy, .. })
+                | Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseLocked, .. })
+        )
     }
 
     fn init_tables(&mut self) -> Result<()> {
@@ -177,7 +192,7 @@ impl Error {
 /// This function should be used by vpnprofilestore service calls to translate error conditions
 /// into service specific exceptions.
 ///
-/// All error conditions get logged by this function.
+/// All error conditions get logged by this function, except for ERROR_PROFILE_NOT_FOUND error.
 ///
 /// `Error::Error(x)` variants get mapped onto a service specific error code of `x`.
 ///
@@ -192,12 +207,16 @@ where
 {
     result.map_or_else(
         |e| {
-            log::error!("{:#?}", e);
             let root_cause = e.root_cause();
-            let rc = match root_cause.downcast_ref::<Error>() {
-                Some(Error::Error(e)) => *e,
-                Some(Error::Binder(_, _)) | None => ERROR_SYSTEM_ERROR,
+            let (rc, log_error) = match root_cause.downcast_ref::<Error>() {
+                // Make the profile not found errors silent.
+                Some(Error::Error(ERROR_PROFILE_NOT_FOUND)) => (ERROR_PROFILE_NOT_FOUND, false),
+                Some(Error::Error(e)) => (*e, true),
+                Some(Error::Binder(_, _)) | None => (ERROR_SYSTEM_ERROR, true),
             };
+            if log_error {
+                log::error!("{:?}", e);
+            }
             Err(BinderStatus::new_service_specific_error(rc, None))
         },
         handle_ok,
@@ -224,7 +243,7 @@ impl VpnProfileStore {
 
         let result = Self { db_path, async_task: Default::default() };
         result.init_shelf(path);
-        BnVpnProfileStore::new_binder(result)
+        BnVpnProfileStore::new_binder(result, BinderFeatures::default())
     }
 
     fn open_db(&self) -> Result<DB> {
@@ -364,15 +383,19 @@ impl binder::Interface for VpnProfileStore {}
 
 impl IVpnProfileStore for VpnProfileStore {
     fn get(&self, alias: &str) -> BinderResult<Vec<u8>> {
+        let _wp = wd::watch_millis("IVpnProfileStore::get", 500);
         map_or_log_err(self.get(alias), Ok)
     }
     fn put(&self, alias: &str, profile: &[u8]) -> BinderResult<()> {
+        let _wp = wd::watch_millis("IVpnProfileStore::put", 500);
         map_or_log_err(self.put(alias, profile), Ok)
     }
     fn remove(&self, alias: &str) -> BinderResult<()> {
+        let _wp = wd::watch_millis("IVpnProfileStore::remove", 500);
         map_or_log_err(self.remove(alias), Ok)
     }
     fn list(&self, prefix: &str) -> BinderResult<Vec<String>> {
+        let _wp = wd::watch_millis("IVpnProfileStore::list", 500);
         map_or_log_err(self.list(prefix), Ok)
     }
 }
@@ -463,6 +486,9 @@ mod db_test {
         let mut db = DB::new(&db_path).expect("Failed to open database.");
         const PROFILE_COUNT: u32 = 5000u32;
         const PROFILE_DB_COUNT: u32 = 5000u32;
+
+        let mode: String = db.conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        assert_eq!(mode, "wal");
 
         let mut actual_profile_count = PROFILE_COUNT;
         // First insert PROFILE_COUNT profiles.
