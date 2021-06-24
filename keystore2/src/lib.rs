@@ -18,12 +18,14 @@
 pub mod apc;
 pub mod async_task;
 pub mod authorization;
+pub mod boot_level_keys;
 pub mod database;
 pub mod ec_crypto;
 pub mod enforcements;
 pub mod entropy;
 pub mod error;
 pub mod globals;
+pub mod id_rotation;
 /// Internal Representation of Key Parameter and convenience functions.
 pub mod key_parameter;
 pub mod legacy_blob;
@@ -32,6 +34,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod operation;
 pub mod permission;
+pub mod raw_device;
 pub mod remote_provisioning;
 pub mod security_level;
 pub mod service;
@@ -40,6 +43,9 @@ pub mod try_insert;
 pub mod utils;
 
 mod attestation_key_utils;
-mod db_utils;
+mod audit_log;
 mod gc;
 mod super_key;
+
+#[cfg(feature = "watchdog")]
+mod watchdog;

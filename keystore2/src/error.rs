@@ -30,16 +30,13 @@
 //! Keystore functions should use `anyhow::Result` to return error conditions, and
 //! context should be added every time an error is forwarded.
 
-use std::cmp::PartialEq;
-
 pub use android_hardware_security_keymint::aidl::android::hardware::security::keymint::ErrorCode::ErrorCode;
 pub use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
-
-use keystore2_selinux as selinux;
-
 use android_system_keystore2::binder::{
     ExceptionCode, Result as BinderResult, Status as BinderStatus, StatusCode,
 };
+use keystore2_selinux as selinux;
+use std::cmp::PartialEq;
 
 /// This is the main Keystore error type. It wraps the Keystore `ResponseCode` generated
 /// from AIDL in the `Rc` variant and Keymint `ErrorCode` in the Km variant.
@@ -140,7 +137,7 @@ pub fn map_binder_status_code<T>(r: Result<T, StatusCode>) -> Result<T, Error> {
 /// This function should be used by Keystore service calls to translate error conditions
 /// into service specific exceptions.
 ///
-/// All error conditions get logged by this function.
+/// All error conditions get logged by this function, except for KEY_NOT_FOUND error.
 ///
 /// All `Error::Rc(x)` and `Error::Km(x)` variants get mapped onto a service specific error
 /// code of x. This is possible because KeyMint `ErrorCode` errors are always negative and
@@ -174,7 +171,13 @@ where
     map_err_with(
         result,
         |e| {
-            log::error!("{:?}", e);
+            // Make the key not found errors silent.
+            if !matches!(
+                e.root_cause().downcast_ref::<Error>(),
+                Some(Error::Rc(ResponseCode::KEY_NOT_FOUND))
+            ) {
+                log::error!("{:?}", e);
+            }
             e
         },
         handle_ok,

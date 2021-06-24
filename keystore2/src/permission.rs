@@ -149,9 +149,9 @@ macro_rules! implement_permission_aidl {
             }
         }
 
-        impl Into<$aidl_name> for $name {
-            fn into(self) -> $aidl_name {
-                self.0
+        impl From<$name> for $aidl_name {
+            fn from(p: $name) -> $aidl_name {
+                p.0
             }
         }
 
@@ -257,9 +257,9 @@ macro_rules! implement_permission {
             }
         }
 
-        impl Into<i32> for $name {
-            fn into(self) -> i32 {
-                self as i32
+        impl From<$name> for i32 {
+            fn from(p: $name) -> i32 {
+                p as i32
             }
         }
 

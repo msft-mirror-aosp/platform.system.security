@@ -18,10 +18,12 @@ use android_security_vpnprofilestore::aidl::android::security::vpnprofilestore::
     IVpnProfileStore::BnVpnProfileStore, IVpnProfileStore::IVpnProfileStore,
     IVpnProfileStore::ERROR_PROFILE_NOT_FOUND, IVpnProfileStore::ERROR_SYSTEM_ERROR,
 };
-use android_security_vpnprofilestore::binder::{Result as BinderResult, Status as BinderStatus};
+use android_security_vpnprofilestore::binder::{
+    BinderFeatures, ExceptionCode, Result as BinderResult, Status as BinderStatus, Strong,
+    ThreadState,
+};
 use anyhow::{Context, Result};
-use binder::{ExceptionCode, Strong, ThreadState};
-use keystore2::{async_task::AsyncTask, legacy_blob::LegacyBlobLoader};
+use keystore2::{async_task::AsyncTask, legacy_blob::LegacyBlobLoader, utils::watchdog as wd};
 use rusqlite::{
     params, Connection, OptionalExtension, Transaction, TransactionBehavior, NO_PARAMS,
 };
@@ -39,6 +41,7 @@ impl DB {
         let mut db = Self {
             conn: Connection::open(db_file).context("Failed to initialize SQLite connection.")?,
         };
+
         db.init_tables().context("Trying to initialize vpnstore db.")?;
         Ok(db)
     }
@@ -71,15 +74,11 @@ impl DB {
     }
 
     fn is_locked_error(e: &anyhow::Error) -> bool {
-        matches!(e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
-        Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseBusy,
-            ..
-        })
-        | Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseLocked,
-            ..
-        }))
+        matches!(
+            e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
+            Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseBusy, .. })
+                | Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseLocked, .. })
+        )
     }
 
     fn init_tables(&mut self) -> Result<()> {
@@ -173,7 +172,7 @@ impl Error {
 /// This function should be used by vpnprofilestore service calls to translate error conditions
 /// into service specific exceptions.
 ///
-/// All error conditions get logged by this function.
+/// All error conditions get logged by this function, except for ERROR_PROFILE_NOT_FOUND error.
 ///
 /// `Error::Error(x)` variants get mapped onto a service specific error code of `x`.
 ///
@@ -188,12 +187,16 @@ where
 {
     result.map_or_else(
         |e| {
-            log::error!("{:#?}", e);
             let root_cause = e.root_cause();
-            let rc = match root_cause.downcast_ref::<Error>() {
-                Some(Error::Error(e)) => *e,
-                Some(Error::Binder(_, _)) | None => ERROR_SYSTEM_ERROR,
+            let (rc, log_error) = match root_cause.downcast_ref::<Error>() {
+                // Make the profile not found errors silent.
+                Some(Error::Error(ERROR_PROFILE_NOT_FOUND)) => (ERROR_PROFILE_NOT_FOUND, false),
+                Some(Error::Error(e)) => (*e, true),
+                Some(Error::Binder(_, _)) | None => (ERROR_SYSTEM_ERROR, true),
             };
+            if log_error {
+                log::error!("{:?}", e);
+            }
             Err(BinderStatus::new_service_specific_error(rc, None))
         },
         handle_ok,
@@ -220,7 +223,7 @@ impl VpnProfileStore {
 
         let result = Self { db_path, async_task: Default::default() };
         result.init_shelf(path);
-        BnVpnProfileStore::new_binder(result)
+        BnVpnProfileStore::new_binder(result, BinderFeatures::default())
     }
 
     fn open_db(&self) -> Result<DB> {
@@ -360,15 +363,19 @@ impl binder::Interface for VpnProfileStore {}
 
 impl IVpnProfileStore for VpnProfileStore {
     fn get(&self, alias: &str) -> BinderResult<Vec<u8>> {
+        let _wp = wd::watch_millis("IVpnProfileStore::get", 500);
         map_or_log_err(self.get(alias), Ok)
     }
     fn put(&self, alias: &str, profile: &[u8]) -> BinderResult<()> {
+        let _wp = wd::watch_millis("IVpnProfileStore::put", 500);
         map_or_log_err(self.put(alias, profile), Ok)
     }
     fn remove(&self, alias: &str) -> BinderResult<()> {
+        let _wp = wd::watch_millis("IVpnProfileStore::remove", 500);
         map_or_log_err(self.remove(alias), Ok)
     }
     fn list(&self, prefix: &str) -> BinderResult<Vec<String>> {
+        let _wp = wd::watch_millis("IVpnProfileStore::list", 500);
         map_or_log_err(self.list(prefix), Ok)
     }
 }
@@ -377,7 +384,12 @@ impl IVpnProfileStore for VpnProfileStore {
 mod db_test {
     use super::*;
     use keystore2_test_utils::TempDir;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+    use std::time::Instant;
 
+    static TEST_ALIAS: &str = &"test_alias";
     static TEST_BLOB1: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
     static TEST_BLOB2: &[u8] = &[2, 2, 3, 4, 5, 6, 7, 8, 9, 0];
     static TEST_BLOB3: &[u8] = &[3, 2, 3, 4, 5, 6, 7, 8, 9, 0];
@@ -439,5 +451,105 @@ mod db_test {
             Some(TEST_BLOB4),
             db.get(2, "test1").expect("Failed to get profile.").as_deref()
         );
+    }
+
+    #[test]
+    fn concurrent_vpn_profile_test() -> Result<()> {
+        let temp_dir = Arc::new(
+            TempDir::new("concurrent_vpn_profile_test_").expect("Failed to create temp dir."),
+        );
+
+        let db_path = temp_dir.build().push("vpnprofile.sqlite").to_owned();
+
+        let test_begin = Instant::now();
+
+        let mut db = DB::new(&db_path).expect("Failed to open database.");
+        const PROFILE_COUNT: u32 = 5000u32;
+        const PROFILE_DB_COUNT: u32 = 5000u32;
+
+        let mut actual_profile_count = PROFILE_COUNT;
+        // First insert PROFILE_COUNT profiles.
+        for count in 0..PROFILE_COUNT {
+            if Instant::now().duration_since(test_begin) >= Duration::from_secs(15) {
+                actual_profile_count = count;
+                break;
+            }
+            let alias = format!("test_alias_{}", count);
+            db.put(1, &alias, TEST_BLOB1).expect("Failed to add profile (1).");
+        }
+
+        // Insert more keys from a different thread and into a different namespace.
+        let db_path1 = db_path.clone();
+        let handle1 = thread::spawn(move || {
+            let mut db = DB::new(&db_path1).expect("Failed to open database.");
+
+            for count in 0..actual_profile_count {
+                if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
+                    return;
+                }
+                let alias = format!("test_alias_{}", count);
+                db.put(2, &alias, TEST_BLOB2).expect("Failed to add profile (2).");
+            }
+
+            // Then delete them again.
+            for count in 0..actual_profile_count {
+                if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
+                    return;
+                }
+                let alias = format!("test_alias_{}", count);
+                db.remove(2, &alias).expect("Remove Failed (2).");
+            }
+        });
+
+        // And start deleting the first set of profiles.
+        let db_path2 = db_path.clone();
+        let handle2 = thread::spawn(move || {
+            let mut db = DB::new(&db_path2).expect("Failed to open database.");
+
+            for count in 0..actual_profile_count {
+                if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
+                    return;
+                }
+                let alias = format!("test_alias_{}", count);
+                db.remove(1, &alias).expect("Remove Failed (1)).");
+            }
+        });
+
+        // While a lot of inserting and deleting is going on we have to open database connections
+        // successfully and then insert and delete a specific profile.
+        let db_path3 = db_path.clone();
+        let handle3 = thread::spawn(move || {
+            for _count in 0..PROFILE_DB_COUNT {
+                if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
+                    return;
+                }
+                let mut db = DB::new(&db_path3).expect("Failed to open database.");
+
+                db.put(3, &TEST_ALIAS, TEST_BLOB3).expect("Failed to add profile (3).");
+
+                db.remove(3, &TEST_ALIAS).expect("Remove failed (3).");
+            }
+        });
+
+        // While thread 3 is inserting and deleting TEST_ALIAS, we try to get the alias.
+        // This may yield an entry or none, but it must not fail.
+        let handle4 = thread::spawn(move || {
+            for _count in 0..PROFILE_DB_COUNT {
+                if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
+                    return;
+                }
+                let mut db = DB::new(&db_path).expect("Failed to open database.");
+
+                // This may return Some or None but it must not fail.
+                db.get(3, &TEST_ALIAS).expect("Failed to get profile (4).");
+            }
+        });
+
+        handle1.join().expect("Thread 1 panicked.");
+        handle2.join().expect("Thread 2 panicked.");
+        handle3.join().expect("Thread 3 panicked.");
+        handle4.join().expect("Thread 4 panicked.");
+
+        Ok(())
     }
 }

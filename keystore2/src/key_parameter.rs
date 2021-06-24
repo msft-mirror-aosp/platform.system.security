@@ -92,7 +92,7 @@
 
 use std::convert::TryInto;
 
-use crate::db_utils::SqlField;
+use crate::database::utils::SqlField;
 use crate::error::Error as KeystoreError;
 use crate::error::ResponseCode;
 
@@ -599,9 +599,9 @@ macro_rules! implement_try_from_to_km_parameter {
         ], [$($in)*]
     }};
     (@into $enum_name:ident, [$($out:tt)*], []) => {
-        impl Into<KmKeyParameter> for $enum_name {
-            fn into(self) -> KmKeyParameter {
-                match self {
+        impl From<$enum_name> for KmKeyParameter {
+            fn from(x: $enum_name) -> Self {
+                match x {
                     $($out)*
                 }
             }
@@ -825,6 +825,9 @@ pub enum KeyParameterValue {
     /// When deleted, the key is guaranteed to be permanently deleted and unusable
     #[key_param(tag = ROLLBACK_RESISTANCE, field = BoolValue)]
     RollbackResistance,
+    /// The Key shall only be used during the early boot stage
+    #[key_param(tag = EARLY_BOOT_ONLY, field = BoolValue)]
+    EarlyBootOnly,
     /// The date and time at which the key becomes active
     #[key_param(tag = ACTIVE_DATETIME, field = DateTime)]
     ActiveDateTime(i64),
@@ -1387,11 +1390,11 @@ mod storage_tests {
             db.prepare("SELECT tag, data, security_level FROM persistent.keyparameter")?;
         let mut rows = stmt.query(NO_PARAMS)?;
         let row = rows.next()?.unwrap();
-        Ok(KeyParameter::new_from_sql(
+        KeyParameter::new_from_sql(
             Tag(row.get(0)?),
             &SqlField::new(1, row),
             SecurityLevel(row.get(2)?),
-        )?)
+        )
     }
 }
 
