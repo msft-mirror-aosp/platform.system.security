@@ -43,11 +43,18 @@ aidl_interface {
     },
 }
 
-java_binary {
-    name: "provisioner_cli",
-    wrapper: "provisioner_cli",
-    srcs: ["src/com/android/commands/provisioner/**/*.java"],
-    static_libs: [
-        "android.security.provisioner-java",
+cc_binary {
+    name: "rkp_factory_extraction_tool",
+    srcs: ["rkp_factory_extraction_tool.cpp"],
+    shared_libs: [
+        "android.hardware.security.keymint-V1-ndk_platform",
+        "libbinder",
+        "libbinder_ndk",
+        "libcppbor_external",
+        "libcppcose_rkp",
+        "libcrypto",
+        "liblog",
+        "libvintf",
     ],
+    //export_include_dirs: ["include"],
 }

@@ -13,33 +13,53 @@
 // limitations under the License.
 
 use crate::{
+    boot_level_keys::{get_level_zero_key, BootLevelKeyCache},
     database::BlobMetaData,
     database::BlobMetaEntry,
     database::EncryptedBy,
     database::KeyEntry,
     database::KeyType,
-    database::{KeyMetaData, KeyMetaEntry, KeystoreDB},
+    database::{KeyEntryLoadBits, KeyIdGuard, KeyMetaData, KeyMetaEntry, KeystoreDB},
     ec_crypto::ECDHPrivateKey,
     enforcements::Enforcements,
     error::Error,
     error::ResponseCode,
-    key_parameter::KeyParameter,
+    key_parameter::{KeyParameter, KeyParameterValue},
     legacy_blob::LegacyBlobLoader,
     legacy_migrator::LegacyMigrator,
+    raw_device::KeyMintDevice,
     try_insert::TryInsert,
+    utils::watchdog as wd,
+    utils::AID_KEYSTORE,
 };
-use android_system_keystore2::aidl::android::system::keystore2::Domain::Domain;
+use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
+    Algorithm::Algorithm, BlockMode::BlockMode, HardwareAuthToken::HardwareAuthToken,
+    HardwareAuthenticatorType::HardwareAuthenticatorType, KeyFormat::KeyFormat,
+    KeyParameter::KeyParameter as KmKeyParameter, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
+    SecurityLevel::SecurityLevel,
+};
+use android_system_keystore2::aidl::android::system::keystore2::{
+    Domain::Domain, KeyDescriptor::KeyDescriptor,
+};
 use anyhow::{Context, Result};
 use keystore2_crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, generate_aes256_key, generate_salt, Password, ZVec,
     AES_256_KEY_LENGTH,
 };
-use std::ops::Deref;
+use keystore2_system_property::PropertyWatcher;
 use std::{
     collections::HashMap,
     sync::Arc,
     sync::{Mutex, Weak},
 };
+use std::{convert::TryFrom, ops::Deref};
+
+const MAX_MAX_BOOT_LEVEL: usize = 1_000_000_000;
+/// Allow up to 15 seconds between the user unlocking using a biometric, and the auth
+/// token being used to unlock in [`SuperKeyManager::try_unlock_user_with_biometric`].
+/// This seems short enough for security purposes, while long enough that even the
+/// very slowest device will present the auth token in time.
+const BIOMETRIC_AUTH_TIMEOUT_S: i32 = 15; // seconds
 
 type UserId = u32;
 
@@ -90,13 +110,47 @@ pub enum SuperEncryptionType {
     LskfBound,
     /// Superencrypt with a key cleared from memory when the device is locked.
     ScreenLockBound,
+    /// Superencrypt with a key based on the desired boot level
+    BootLevel(i32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SuperKeyIdentifier {
+    /// id of the super key in the database.
+    DatabaseId(i64),
+    /// Boot level of the encrypting boot level key
+    BootLevel(i32),
+}
+
+impl SuperKeyIdentifier {
+    fn from_metadata(metadata: &BlobMetaData) -> Option<Self> {
+        if let Some(EncryptedBy::KeyId(key_id)) = metadata.encrypted_by() {
+            Some(SuperKeyIdentifier::DatabaseId(*key_id))
+        } else if let Some(boot_level) = metadata.max_boot_level() {
+            Some(SuperKeyIdentifier::BootLevel(*boot_level))
+        } else {
+            None
+        }
+    }
+
+    fn add_to_metadata(&self, metadata: &mut BlobMetaData) {
+        match self {
+            SuperKeyIdentifier::DatabaseId(id) => {
+                metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::KeyId(*id)));
+            }
+            SuperKeyIdentifier::BootLevel(level) => {
+                metadata.add(BlobMetaEntry::MaxBootLevel(*level));
+            }
+        }
+    }
 }
 
 pub struct SuperKey {
     algorithm: SuperEncryptionAlgorithm,
     key: ZVec,
-    // id of the super key in the database.
-    id: i64,
+    /// Identifier of the encrypting key, used to write an encrypted blob
+    /// back to the database after re-encryption eg on a key update.
+    id: SuperKeyIdentifier,
     /// ECDH is more expensive than AES. So on ECDH private keys we set the
     /// reencrypt_with field to point at the corresponding AES key, and the
     /// keys will be re-encrypted with AES on first use.
@@ -116,6 +170,72 @@ impl SuperKey {
     }
 }
 
+/// A SuperKey that has been encrypted with an AES-GCM key. For
+/// encryption the key is in memory, and for decryption it is in KM.
+struct LockedKey {
+    algorithm: SuperEncryptionAlgorithm,
+    id: SuperKeyIdentifier,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>, // with tag appended
+}
+
+impl LockedKey {
+    fn new(key: &[u8], to_encrypt: &Arc<SuperKey>) -> Result<Self> {
+        let (mut ciphertext, nonce, mut tag) = aes_gcm_encrypt(&to_encrypt.key, key)?;
+        ciphertext.append(&mut tag);
+        Ok(LockedKey { algorithm: to_encrypt.algorithm, id: to_encrypt.id, nonce, ciphertext })
+    }
+
+    fn decrypt(
+        &self,
+        db: &mut KeystoreDB,
+        km_dev: &KeyMintDevice,
+        key_id_guard: &KeyIdGuard,
+        key_entry: &KeyEntry,
+        auth_token: &HardwareAuthToken,
+        reencrypt_with: Option<Arc<SuperKey>>,
+    ) -> Result<Arc<SuperKey>> {
+        let key_blob = key_entry
+            .key_blob_info()
+            .as_ref()
+            .map(|(key_blob, _)| KeyBlob::Ref(key_blob))
+            .ok_or(Error::Rc(ResponseCode::KEY_NOT_FOUND))
+            .context("In LockedKey::decrypt: Missing key blob info.")?;
+        let key_params = vec![
+            KeyParameterValue::Algorithm(Algorithm::AES),
+            KeyParameterValue::KeySize(256),
+            KeyParameterValue::BlockMode(BlockMode::GCM),
+            KeyParameterValue::PaddingMode(PaddingMode::NONE),
+            KeyParameterValue::Nonce(self.nonce.clone()),
+            KeyParameterValue::MacLength(128),
+        ];
+        let key_params: Vec<KmKeyParameter> = key_params.into_iter().map(|x| x.into()).collect();
+        let key = ZVec::try_from(km_dev.use_key_in_one_step(
+            db,
+            key_id_guard,
+            &key_blob,
+            KeyPurpose::DECRYPT,
+            &key_params,
+            Some(auth_token),
+            &self.ciphertext,
+        )?)?;
+        Ok(Arc::new(SuperKey { algorithm: self.algorithm, key, id: self.id, reencrypt_with }))
+    }
+}
+
+/// Keys for unlocking UNLOCKED_DEVICE_REQUIRED keys, as LockedKeys, complete with
+/// a database descriptor for the encrypting key and the sids for the auth tokens
+/// that can be used to decrypt it.
+struct BiometricUnlock {
+    /// List of auth token SIDs that can be used to unlock these keys.
+    sids: Vec<i64>,
+    /// Database descriptor of key to use to unlock.
+    key_desc: KeyDescriptor,
+    /// Locked versions of the matching UserSuperKeys fields
+    screen_lock_bound: LockedKey,
+    screen_lock_bound_private: LockedKey,
+}
+
 #[derive(Default)]
 struct UserSuperKeys {
     /// The per boot key is used for LSKF binding of authentication bound keys. There is one
@@ -130,17 +250,28 @@ struct UserSuperKeys {
     /// When the device is locked, screen-lock-bound keys can still be encrypted, using
     /// ECDH public-key encryption. This field holds the decryption private key.
     screen_lock_bound_private: Option<Arc<SuperKey>>,
+    /// Versions of the above two keys, locked behind a biometric.
+    biometric_unlock: Option<BiometricUnlock>,
 }
 
 #[derive(Default)]
 struct SkmState {
     user_keys: HashMap<UserId, UserSuperKeys>,
     key_index: HashMap<i64, Weak<SuperKey>>,
+    boot_level_key_cache: Option<BootLevelKeyCache>,
 }
 
 impl SkmState {
-    fn add_key_to_key_index(&mut self, super_key: &Arc<SuperKey>) {
-        self.key_index.insert(super_key.id, Arc::downgrade(super_key));
+    fn add_key_to_key_index(&mut self, super_key: &Arc<SuperKey>) -> Result<()> {
+        if let SuperKeyIdentifier::DatabaseId(id) = super_key.id {
+            self.key_index.insert(id, Arc::downgrade(super_key));
+            Ok(())
+        } else {
+            Err(Error::sys()).context(format!(
+                "In add_key_to_key_index: cannot add key with ID {:?}",
+                super_key.id
+            ))
+        }
     }
 }
 
@@ -150,19 +281,101 @@ pub struct SuperKeyManager {
 }
 
 impl SuperKeyManager {
+    pub fn set_up_boot_level_cache(self: &Arc<Self>, db: &mut KeystoreDB) -> Result<()> {
+        let mut data = self.data.lock().unwrap();
+        if data.boot_level_key_cache.is_some() {
+            log::info!("In set_up_boot_level_cache: called for a second time");
+            return Ok(());
+        }
+        let level_zero_key = get_level_zero_key(db)
+            .context("In set_up_boot_level_cache: get_level_zero_key failed")?;
+        data.boot_level_key_cache = Some(BootLevelKeyCache::new(level_zero_key));
+        log::info!("Starting boot level watcher.");
+        let clone = self.clone();
+        std::thread::spawn(move || {
+            clone
+                .watch_boot_level()
+                .unwrap_or_else(|e| log::error!("watch_boot_level failed:\n{:?}", e));
+        });
+        Ok(())
+    }
+
+    /// Watch the `keystore.boot_level` system property, and keep boot level up to date.
+    /// Blocks waiting for system property changes, so must be run in its own thread.
+    fn watch_boot_level(&self) -> Result<()> {
+        let mut w = PropertyWatcher::new("keystore.boot_level")
+            .context("In watch_boot_level: PropertyWatcher::new failed")?;
+        loop {
+            let level = w
+                .read(|_n, v| v.parse::<usize>().map_err(std::convert::Into::into))
+                .context("In watch_boot_level: read of property failed")?;
+            // watch_boot_level should only be called once data.boot_level_key_cache is Some,
+            // so it's safe to unwrap in the branches below.
+            if level < MAX_MAX_BOOT_LEVEL {
+                log::info!("Read keystore.boot_level value {}", level);
+                let mut data = self.data.lock().unwrap();
+                data.boot_level_key_cache
+                    .as_mut()
+                    .unwrap()
+                    .advance_boot_level(level)
+                    .context("In watch_boot_level: advance_boot_level failed")?;
+            } else {
+                log::info!(
+                    "keystore.boot_level {} hits maximum {}, finishing.",
+                    level,
+                    MAX_MAX_BOOT_LEVEL
+                );
+                let mut data = self.data.lock().unwrap();
+                data.boot_level_key_cache.as_mut().unwrap().finish();
+                break;
+            }
+            w.wait().context("In watch_boot_level: property wait failed")?;
+        }
+        Ok(())
+    }
+
+    pub fn level_accessible(&self, boot_level: i32) -> bool {
+        self.data
+            .lock()
+            .unwrap()
+            .boot_level_key_cache
+            .as_ref()
+            .map_or(false, |c| c.level_accessible(boot_level as usize))
+    }
+
     pub fn forget_all_keys_for_user(&self, user: UserId) {
         let mut data = self.data.lock().unwrap();
         data.user_keys.remove(&user);
     }
 
-    fn install_per_boot_key_for_user(&self, user: UserId, super_key: Arc<SuperKey>) {
+    fn install_per_boot_key_for_user(&self, user: UserId, super_key: Arc<SuperKey>) -> Result<()> {
         let mut data = self.data.lock().unwrap();
-        data.add_key_to_key_index(&super_key);
+        data.add_key_to_key_index(&super_key)
+            .context("In install_per_boot_key_for_user: add_key_to_key_index failed")?;
         data.user_keys.entry(user).or_default().per_boot = Some(super_key);
+        Ok(())
     }
 
-    fn lookup_key(&self, key_id: &i64) -> Option<Arc<SuperKey>> {
-        self.data.lock().unwrap().key_index.get(key_id).and_then(|k| k.upgrade())
+    fn lookup_key(&self, key_id: &SuperKeyIdentifier) -> Result<Option<Arc<SuperKey>>> {
+        let mut data = self.data.lock().unwrap();
+        Ok(match key_id {
+            SuperKeyIdentifier::DatabaseId(id) => data.key_index.get(id).and_then(|k| k.upgrade()),
+            SuperKeyIdentifier::BootLevel(level) => data
+                .boot_level_key_cache
+                .as_mut()
+                .map(|b| b.aes_key(*level as usize))
+                .transpose()
+                .context("In lookup_key: aes_key failed")?
+                .flatten()
+                .map(|key| {
+                    Arc::new(SuperKey {
+                        algorithm: SuperEncryptionAlgorithm::Aes256Gcm,
+                        key,
+                        id: *key_id,
+                        reencrypt_with: None,
+                    })
+                }),
+        })
     }
 
     pub fn get_per_boot_key_by_user_id(&self, user_id: UserId) -> Option<Arc<SuperKey>> {
@@ -215,26 +428,27 @@ impl SuperKeyManager {
         Ok(())
     }
 
-    /// Unwraps an encrypted key blob given metadata identifying the encryption key.
-    /// The function queries `metadata.encrypted_by()` to determine the encryption key.
-    /// It then checks if the required key is memory resident, and if so decrypts the
-    /// blob.
-    pub fn unwrap_key<'a>(&self, blob: &'a [u8], metadata: &BlobMetaData) -> Result<KeyBlob<'a>> {
-        let key_id = if let Some(EncryptedBy::KeyId(key_id)) = metadata.encrypted_by() {
-            key_id
+    /// Check if a given key is super-encrypted, from its metadata. If so, unwrap the key using
+    /// the relevant super key.
+    pub fn unwrap_key_if_required<'a>(
+        &self,
+        metadata: &BlobMetaData,
+        blob: &'a [u8],
+    ) -> Result<KeyBlob<'a>> {
+        Ok(if let Some(key_id) = SuperKeyIdentifier::from_metadata(metadata) {
+            let super_key = self
+                .lookup_key(&key_id)
+                .context("In unwrap_key: lookup_key failed")?
+                .ok_or(Error::Rc(ResponseCode::LOCKED))
+                .context("In unwrap_key: Required super decryption key is not in memory.")?;
+            KeyBlob::Sensitive {
+                key: Self::unwrap_key_with_key(blob, metadata, &super_key)
+                    .context("In unwrap_key: unwrap_key_with_key failed")?,
+                reencrypt_with: super_key.reencrypt_with.as_ref().unwrap_or(&super_key).clone(),
+                force_reencrypt: super_key.reencrypt_with.is_some(),
+            }
         } else {
-            return Err(Error::Rc(ResponseCode::VALUE_CORRUPTED))
-                .context("In unwrap_key: Cannot determine wrapping key.");
-        };
-        let super_key = self
-            .lookup_key(&key_id)
-            .ok_or(Error::Rc(ResponseCode::LOCKED))
-            .context("In unwrap_key: Required super decryption key is not in memory.")?;
-        Ok(KeyBlob::Sensitive {
-            key: Self::unwrap_key_with_key(blob, metadata, &super_key)
-                .context("In unwrap_key: unwrap_key_with_key failed")?,
-            reencrypt_with: super_key.reencrypt_with.as_ref().unwrap_or(&super_key).clone(),
-            force_reencrypt: super_key.reencrypt_with.is_some(),
+            KeyBlob::Ref(blob)
         })
     }
 
@@ -389,7 +603,7 @@ impl SuperKeyManager {
             .context(
                 "In populate_cache_from_super_key_blob. Failed to extract super key from key entry",
             )?;
-        self.install_per_boot_key_for_user(user_id, super_key.clone());
+        self.install_per_boot_key_for_user(user_id, super_key.clone())?;
         Ok(super_key)
     }
 
@@ -430,7 +644,12 @@ impl SuperKeyManager {
                     ));
                 }
             };
-            Ok(Arc::new(SuperKey { algorithm, key, id: entry.id(), reencrypt_with }))
+            Ok(Arc::new(SuperKey {
+                algorithm,
+                key,
+                id: SuperKeyIdentifier::DatabaseId(entry.id()),
+                reencrypt_with,
+            }))
         } else {
             Err(Error::Rc(ResponseCode::VALUE_CORRUPTED))
                 .context("In extract_super_key_from_key_entry: No key blob info.")
@@ -498,13 +717,13 @@ impl SuperKeyManager {
             .context("In encrypt_with_aes_super_key: Failed to encrypt new super key.")?;
         metadata.add(BlobMetaEntry::Iv(iv));
         metadata.add(BlobMetaEntry::AeadTag(tag));
-        metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::KeyId(super_key.id)));
+        super_key.id.add_to_metadata(&mut metadata);
         Ok((encrypted_key, metadata))
     }
 
     /// Check if super encryption is required and if so, super-encrypt the key to be stored in
     /// the database.
-    #[allow(clippy::clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_super_encryption_on_key_init(
         &self,
         db: &mut KeystoreDB,
@@ -554,27 +773,23 @@ impl SuperKeyManager {
                     metadata.add(BlobMetaEntry::Salt(salt));
                     metadata.add(BlobMetaEntry::Iv(iv));
                     metadata.add(BlobMetaEntry::AeadTag(aead_tag));
-                    metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::KeyId(key_id_guard.id())));
+                    SuperKeyIdentifier::DatabaseId(key_id_guard.id())
+                        .add_to_metadata(&mut metadata);
                     Ok((encrypted_key, metadata))
                 }
             }
-        }
-    }
-
-    /// Check if a given key is super-encrypted, from its metadata. If so, unwrap the key using
-    /// the relevant super key.
-    pub fn unwrap_key_if_required<'a>(
-        &self,
-        metadata: &BlobMetaData,
-        key_blob: &'a [u8],
-    ) -> Result<KeyBlob<'a>> {
-        if Self::key_super_encrypted(&metadata) {
-            let unwrapped_key = self
-                .unwrap_key(key_blob, metadata)
-                .context("In unwrap_key_if_required. Error in unwrapping the key.")?;
-            Ok(unwrapped_key)
-        } else {
-            Ok(KeyBlob::Ref(key_blob))
+            SuperEncryptionType::BootLevel(level) => {
+                let key_id = SuperKeyIdentifier::BootLevel(level);
+                let super_key = self
+                    .lookup_key(&key_id)
+                    .context("In handle_super_encryption_on_key_init: lookup_key failed")?
+                    .ok_or(Error::Rc(ResponseCode::LOCKED))
+                    .context("In handle_super_encryption_on_key_init: Boot stage key absent")?;
+                Self::encrypt_with_aes_super_key(key_blob, &super_key).context(concat!(
+                    "In handle_super_encryption_on_key_init: ",
+                    "Failed to encrypt with BootLevel key."
+                ))
+            }
         }
     }
 
@@ -594,14 +809,6 @@ impl SuperKeyManager {
             }
             _ => Ok((KeyBlob::Ref(key_after_upgrade), None)),
         }
-    }
-
-    // Helper function to decide if a key is super encrypted, given metadata.
-    fn key_super_encrypted(metadata: &BlobMetaData) -> bool {
-        if let Some(&EncryptedBy::KeyId(_)) = metadata.encrypted_by() {
-            return true;
-        }
-        false
     }
 
     /// Fetch a superencryption key from the database, or create it if it doesn't already exist.
@@ -663,7 +870,7 @@ impl SuperKeyManager {
             Ok(Arc::new(SuperKey {
                 algorithm: key_type.algorithm,
                 key: super_key,
-                id: key_entry.id(),
+                id: SuperKeyIdentifier::DatabaseId(key_entry.id()),
                 reencrypt_with,
             }))
         }
@@ -702,17 +909,153 @@ impl SuperKeyManager {
                 )
             })?
             .clone();
-        data.add_key_to_key_index(&aes);
-        data.add_key_to_key_index(&ecdh);
+        data.add_key_to_key_index(&aes)?;
+        data.add_key_to_key_index(&ecdh)?;
         Ok(())
     }
 
     /// Wipe the screen-lock bound keys for this user from memory.
-    pub fn lock_screen_lock_bound_key(&self, user_id: UserId) {
+    pub fn lock_screen_lock_bound_key(
+        &self,
+        db: &mut KeystoreDB,
+        user_id: UserId,
+        unlocking_sids: &[i64],
+    ) {
+        log::info!("Locking screen bound for user {} sids {:?}", user_id, unlocking_sids);
         let mut data = self.data.lock().unwrap();
         let mut entry = data.user_keys.entry(user_id).or_default();
+        if !unlocking_sids.is_empty() {
+            if let (Some(aes), Some(ecdh)) = (
+                entry.screen_lock_bound.as_ref().cloned(),
+                entry.screen_lock_bound_private.as_ref().cloned(),
+            ) {
+                let res = (|| -> Result<()> {
+                    let key_desc = KeyMintDevice::internal_descriptor(format!(
+                        "biometric_unlock_key_{}",
+                        user_id
+                    ));
+                    let encrypting_key = generate_aes256_key()?;
+                    let km_dev: KeyMintDevice =
+                        KeyMintDevice::get(SecurityLevel::TRUSTED_ENVIRONMENT)
+                            .context("In lock_screen_lock_bound_key: KeyMintDevice::get failed")?;
+                    let mut key_params = vec![
+                        KeyParameterValue::Algorithm(Algorithm::AES),
+                        KeyParameterValue::KeySize(256),
+                        KeyParameterValue::BlockMode(BlockMode::GCM),
+                        KeyParameterValue::PaddingMode(PaddingMode::NONE),
+                        KeyParameterValue::CallerNonce,
+                        KeyParameterValue::KeyPurpose(KeyPurpose::DECRYPT),
+                        KeyParameterValue::MinMacLength(128),
+                        KeyParameterValue::AuthTimeout(BIOMETRIC_AUTH_TIMEOUT_S),
+                        KeyParameterValue::HardwareAuthenticatorType(
+                            HardwareAuthenticatorType::FINGERPRINT,
+                        ),
+                    ];
+                    for sid in unlocking_sids {
+                        key_params.push(KeyParameterValue::UserSecureID(*sid));
+                    }
+                    let key_params: Vec<KmKeyParameter> =
+                        key_params.into_iter().map(|x| x.into()).collect();
+                    km_dev.create_and_store_key(
+                        db,
+                        &key_desc,
+                        KeyType::Client, /* TODO Should be Super b/189470584 */
+                        |dev| {
+                            let _wp = wd::watch_millis(
+                                "In lock_screen_lock_bound_key: calling importKey.",
+                                500,
+                            );
+                            dev.importKey(
+                                key_params.as_slice(),
+                                KeyFormat::RAW,
+                                &encrypting_key,
+                                None,
+                            )
+                        },
+                    )?;
+                    entry.biometric_unlock = Some(BiometricUnlock {
+                        sids: unlocking_sids.into(),
+                        key_desc,
+                        screen_lock_bound: LockedKey::new(&encrypting_key, &aes)?,
+                        screen_lock_bound_private: LockedKey::new(&encrypting_key, &ecdh)?,
+                    });
+                    Ok(())
+                })();
+                // There is no reason to propagate an error here upwards. We must discard
+                // entry.screen_lock_bound* in any case.
+                if let Err(e) = res {
+                    log::error!("Error setting up biometric unlock: {:#?}", e);
+                }
+            }
+        }
         entry.screen_lock_bound = None;
         entry.screen_lock_bound_private = None;
+    }
+
+    /// User has unlocked, not using a password. See if any of our stored auth tokens can be used
+    /// to unlock the keys protecting UNLOCKED_DEVICE_REQUIRED keys.
+    pub fn try_unlock_user_with_biometric(
+        &self,
+        db: &mut KeystoreDB,
+        user_id: UserId,
+    ) -> Result<()> {
+        let mut data = self.data.lock().unwrap();
+        let mut entry = data.user_keys.entry(user_id).or_default();
+        if let Some(biometric) = entry.biometric_unlock.as_ref() {
+            let (key_id_guard, key_entry) = db
+                .load_key_entry(
+                    &biometric.key_desc,
+                    KeyType::Client, // This should not be a Client key.
+                    KeyEntryLoadBits::KM,
+                    AID_KEYSTORE,
+                    |_, _| Ok(()),
+                )
+                .context("In try_unlock_user_with_biometric: load_key_entry failed")?;
+            let km_dev: KeyMintDevice = KeyMintDevice::get(SecurityLevel::TRUSTED_ENVIRONMENT)
+                .context("In try_unlock_user_with_biometric: KeyMintDevice::get failed")?;
+            for sid in &biometric.sids {
+                if let Some((auth_token_entry, _)) = db.find_auth_token_entry(|entry| {
+                    entry.auth_token().userId == *sid || entry.auth_token().authenticatorId == *sid
+                }) {
+                    let res: Result<(Arc<SuperKey>, Arc<SuperKey>)> = (|| {
+                        let slb = biometric.screen_lock_bound.decrypt(
+                            db,
+                            &km_dev,
+                            &key_id_guard,
+                            &key_entry,
+                            auth_token_entry.auth_token(),
+                            None,
+                        )?;
+                        let slbp = biometric.screen_lock_bound_private.decrypt(
+                            db,
+                            &km_dev,
+                            &key_id_guard,
+                            &key_entry,
+                            auth_token_entry.auth_token(),
+                            Some(slb.clone()),
+                        )?;
+                        Ok((slb, slbp))
+                    })();
+                    match res {
+                        Ok((slb, slbp)) => {
+                            entry.screen_lock_bound = Some(slb.clone());
+                            entry.screen_lock_bound_private = Some(slbp.clone());
+                            data.add_key_to_key_index(&slb)?;
+                            data.add_key_to_key_index(&slbp)?;
+                            log::info!(concat!(
+                                "In try_unlock_user_with_biometric: ",
+                                "Successfully unlocked with biometric"
+                            ));
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            log::warn!("In try_unlock_user_with_biometric: attempt failed: {:?}", e)
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

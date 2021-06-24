@@ -14,13 +14,14 @@
 
 //! This crate implements the Keystore 2.0 service entry point.
 
-use keystore2::authorization::AuthorizationManager;
 use keystore2::entropy;
 use keystore2::globals::ENFORCEMENTS;
 use keystore2::maintenance::Maintenance;
+use keystore2::metrics;
 use keystore2::remote_provisioning::RemoteProvisioningService;
 use keystore2::service::KeystoreService;
 use keystore2::{apc::ApcManager, shared_secret_negotiation};
+use keystore2::{authorization::AuthorizationManager, id_rotation::IdRotationState};
 use log::{error, info};
 use std::{panic, path::Path, sync::mpsc::channel};
 use vpnprofilestore::VpnProfileStore;
@@ -46,10 +47,6 @@ fn main() {
     // Saying hi.
     info!("Keystore2 is starting.");
 
-    // Initialize the per boot database.
-    let _keep_me_alive = keystore2::database::KeystoreDB::keep_perboot_db_alive()
-        .expect("Failed to initialize the perboot database.");
-
     let mut args = std::env::args();
     args.next().expect("That's odd. How is there not even a first argument?");
 
@@ -57,23 +54,18 @@ fn main() {
     // startup as Keystore 1.0 did because Keystore 2.0 is intended to run much earlier than
     // Keystore 1.0. Instead we set a global variable to the database path.
     // For the ground truth check the service startup rule for init (typically in keystore2.rc).
-    if let Some(dir) = args.next() {
-        *keystore2::globals::DB_PATH.lock().expect("Could not lock DB_PATH.") =
-            Path::new(&dir).to_path_buf();
+    let id_rotation_state = if let Some(dir) = args.next() {
+        let db_path = Path::new(&dir);
+        *keystore2::globals::DB_PATH.write().expect("Could not lock DB_PATH.") =
+            db_path.to_path_buf();
+        IdRotationState::new(&db_path)
     } else {
-        panic!("Must specify a working directory.");
-    }
+        panic!("Must specify a database directory.");
+    };
 
     let (confirmation_token_sender, confirmation_token_receiver) = channel();
 
     ENFORCEMENTS.install_confirmation_token_receiver(confirmation_token_receiver);
-
-    info!("Starting boot level watcher.");
-    std::thread::spawn(|| {
-        keystore2::globals::ENFORCEMENTS
-            .watch_boot_level()
-            .unwrap_or_else(|e| error!("watch_boot_level failed: {}", e));
-    });
 
     entropy::register_feeder();
     shared_secret_negotiation::perform_shared_secret_negotiation();
@@ -81,7 +73,7 @@ fn main() {
     info!("Starting thread pool now.");
     binder::ProcessState::start_thread_pool();
 
-    let ks_service = KeystoreService::new_native_binder().unwrap_or_else(|e| {
+    let ks_service = KeystoreService::new_native_binder(id_rotation_state).unwrap_or_else(|e| {
         panic!("Failed to create service {} because of {:?}.", KS2_SERVICE_NAME, e);
     });
     binder::add_service(KS2_SERVICE_NAME, ks_service.as_binder()).unwrap_or_else(|e| {
@@ -129,7 +121,7 @@ fn main() {
     }
 
     let vpnprofilestore = VpnProfileStore::new_native_binder(
-        &keystore2::globals::DB_PATH.lock().expect("Could not get DB_PATH."),
+        &keystore2::globals::DB_PATH.read().expect("Could not get DB_PATH."),
     );
     binder::add_service(VPNPROFILESTORE_SERVICE_NAME, vpnprofilestore.as_binder()).unwrap_or_else(
         |e| {
@@ -139,6 +131,13 @@ fn main() {
             );
         },
     );
+
+    std::thread::spawn(|| {
+        match metrics::register_pull_metrics_callbacks() {
+            Err(e) => error!("register_pull_metrics_callbacks failed: {:?}.", e),
+            _ => info!("Pull metrics callbacks successfully registered."),
+        };
+    });
 
     info!("Successfully registered Keystore 2.0 service.");
 
