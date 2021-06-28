@@ -16,12 +16,27 @@
 
 #pragma once
 
+#include <functional>
+#include <string>
+#include <vector>
+
 #include <android-base/result.h>
+
+struct CertInfo {
+    std::string subjectCn;
+    std::vector<uint8_t> subjectKey;
+};
 
 android::base::Result<void> createSelfSignedCertificate(
     const std::vector<uint8_t>& publicKey,
     const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
     const std::string& path);
+
+android::base::Result<void> createLeafCertificate(
+    const char* commonName, const std::vector<uint8_t>& publicKey,
+    const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
+    const std::string& issuerCertPath, const std::string& outPath);
+
 android::base::Result<std::vector<uint8_t>> createPkcs7(const std::vector<uint8_t>& signedData);
 
 android::base::Result<std::vector<uint8_t>>
@@ -29,6 +44,9 @@ extractPublicKeyFromX509(const std::vector<uint8_t>& x509);
 android::base::Result<std::vector<uint8_t>>
 extractPublicKeyFromSubjectPublicKeyInfo(const std::vector<uint8_t>& subjectKeyInfo);
 android::base::Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::string& path);
+
+android::base::Result<CertInfo>
+verifyAndExtractCertInfoFromX509(const std::string& path, const std::vector<uint8_t>& publicKey);
 
 android::base::Result<void> verifySignature(const std::string& message,
                                             const std::string& signature,
