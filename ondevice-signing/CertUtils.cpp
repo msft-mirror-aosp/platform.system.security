@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "CertUtils.h"
+
 #include <android-base/logging.h>
 #include <android-base/result.h>
 
@@ -24,36 +26,53 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
-#include <fcntl.h>
+#include <optional>
 #include <vector>
 
 #include "KeyConstants.h"
 
-const char kBasicConstraints[] = "CA:TRUE";
-const char kKeyUsage[] = "critical,keyCertSign,cRLSign,digitalSignature";
-const char kSubjectKeyIdentifier[] = "hash";
+const char kRootCommonName[] = "ODS";
 constexpr int kCertLifetimeSeconds = 10 * 365 * 24 * 60 * 60;
 
-using android::base::Result;
-// using android::base::ErrnoError;
+using android::base::ErrnoError;
 using android::base::Error;
+using android::base::Result;
 
-static bool add_ext(X509* cert, int nid, const char* value) {
-    size_t len = strlen(value) + 1;
-    std::vector<char> mutableValue(value, value + len);
-    X509V3_CTX context;
+static Result<bssl::UniquePtr<X509>> loadX509(const std::string& path) {
+    X509* rawCert;
+    auto f = fopen(path.c_str(), "re");
+    if (f == nullptr) {
+        return Error() << "Failed to open " << path;
+    }
+    if (!d2i_X509_fp(f, &rawCert)) {
+        fclose(f);
+        return Error() << "Unable to decode x509 cert at " << path;
+    }
+    bssl::UniquePtr<X509> cert(rawCert);
 
-    X509V3_set_ctx_nodb(&context);
+    fclose(f);
+    return cert;
+}
 
-    X509V3_set_ctx(&context, cert, cert, nullptr, nullptr, 0);
-    X509_EXTENSION* ex = X509V3_EXT_nconf_nid(nullptr, &context, nid, mutableValue.data());
+static X509V3_CTX makeContext(X509* issuer, X509* subject) {
+    X509V3_CTX context = {};
+    X509V3_set_ctx(&context, issuer, subject, nullptr, nullptr, 0);
+    return context;
+}
+
+static bool add_ext(X509V3_CTX* context, X509* cert, int nid, const char* value) {
+    bssl::UniquePtr<X509_EXTENSION> ex(X509V3_EXT_nconf_nid(nullptr, context, nid, value));
     if (!ex) {
         return false;
     }
 
-    X509_add_ext(cert, ex, -1);
-    X509_EXTENSION_free(ex);
+    X509_add_ext(cert, ex.get(), -1);
     return true;
+}
+
+static void addNameEntry(X509_NAME* name, const char* field, const char* value) {
+    X509_NAME_add_entry_by_txt(name, field, MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(value), -1, -1, 0);
 }
 
 Result<bssl::UniquePtr<RSA>> getRsa(const std::vector<uint8_t>& publicKey) {
@@ -91,20 +110,7 @@ Result<void> verifySignature(const std::string& message, const std::string& sign
     return {};
 }
 
-Result<void> createSelfSignedCertificate(
-    const std::vector<uint8_t>& publicKey,
-    const std::function<Result<std::string>(const std::string&)>& signFunction,
-    const std::string& path) {
-    bssl::UniquePtr<X509> x509(X509_new());
-    if (!x509) {
-        return Error() << "Unable to allocate x509 container";
-    }
-    X509_set_version(x509.get(), 2);
-
-    ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1);
-    X509_gmtime_adj(X509_get_notBefore(x509.get()), 0);
-    X509_gmtime_adj(X509_get_notAfter(x509.get()), kCertLifetimeSeconds);
-
+static Result<bssl::UniquePtr<EVP_PKEY>> toRsaPkey(const std::vector<uint8_t>& publicKey) {
     // "publicKey" corresponds to the raw public key bytes - need to create
     // a new RSA key with the correct exponent.
     auto rsaPubkey = getRsa(publicKey);
@@ -113,30 +119,29 @@ Result<void> createSelfSignedCertificate(
     }
 
     bssl::UniquePtr<EVP_PKEY> public_key(EVP_PKEY_new());
-    EVP_PKEY_assign_RSA(public_key.get(), rsaPubkey->release());
-
-    if (!X509_set_pubkey(x509.get(), public_key.get())) {
-        return Error() << "Unable to set x509 public key";
+    if (!EVP_PKEY_assign_RSA(public_key.get(), rsaPubkey->release())) {
+        return Error() << "Failed to assign key";
     }
+    return public_key;
+}
 
-    X509_NAME* name = X509_get_subject_name(x509.get());
-    if (!name) {
-        return Error() << "Unable to get x509 subject name";
-    }
-    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("Android"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("ODS"), -1, -1, 0);
-    if (!X509_set_issuer_name(x509.get(), name)) {
-        return Error() << "Unable to set x509 issuer name";
-    }
+static Result<void> createCertificate(
+    const char* commonName, const std::vector<uint8_t>& publicKey,
+    const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
+    const std::optional<std::string>& issuerCertPath, const std::string& path) {
 
-    add_ext(x509.get(), NID_basic_constraints, kBasicConstraints);
-    add_ext(x509.get(), NID_key_usage, kKeyUsage);
-    add_ext(x509.get(), NID_subject_key_identifier, kSubjectKeyIdentifier);
-    add_ext(x509.get(), NID_authority_key_identifier, "keyid:always");
+    // If an issuer cert is specified, we are signing someone else's key.
+    // Otherwise we are signing our key - a self-signed certificate.
+    bool selfSigned = !issuerCertPath;
+
+    bssl::UniquePtr<X509> x509(X509_new());
+    if (!x509) {
+        return Error() << "Unable to allocate x509 container";
+    }
+    X509_set_version(x509.get(), 2);
+    X509_gmtime_adj(X509_get_notBefore(x509.get()), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509.get()), kCertLifetimeSeconds);
+    ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), selfSigned ? 1 : 2);
 
     bssl::UniquePtr<X509_ALGOR> algor(X509_ALGOR_new());
     if (!algor ||
@@ -145,6 +150,62 @@ Result<void> createSelfSignedCertificate(
         !X509_set1_signature_algo(x509.get(), algor.get())) {
         return Error() << "Unable to set x509 signature algorithm";
     }
+
+    auto public_key = toRsaPkey(publicKey);
+    if (!public_key.ok()) {
+        return public_key.error();
+    }
+
+    if (!X509_set_pubkey(x509.get(), public_key.value().get())) {
+        return Error() << "Unable to set x509 public key";
+    }
+
+    X509_NAME* subjectName = X509_get_subject_name(x509.get());
+    if (!subjectName) {
+        return Error() << "Unable to get x509 subject name";
+    }
+    addNameEntry(subjectName, "C", "US");
+    addNameEntry(subjectName, "O", "Android");
+    addNameEntry(subjectName, "CN", commonName);
+
+    if (selfSigned) {
+        if (!X509_set_issuer_name(x509.get(), subjectName)) {
+            return Error() << "Unable to set x509 issuer name";
+        }
+    } else {
+        X509_NAME* issuerName = X509_get_issuer_name(x509.get());
+        if (!issuerName) {
+            return Error() << "Unable to get x509 issuer name";
+        }
+        addNameEntry(issuerName, "C", "US");
+        addNameEntry(issuerName, "O", "Android");
+        addNameEntry(issuerName, "CN", kRootCommonName);
+    }
+
+    // Beware: context contains a pointer to issuerCert, so we need to keep it alive.
+    bssl::UniquePtr<X509> issuerCert;
+    X509V3_CTX context;
+
+    if (selfSigned) {
+        context = makeContext(x509.get(), x509.get());
+    } else {
+        auto certStatus = loadX509(*issuerCertPath);
+        if (!certStatus.ok()) {
+            return Error() << "Unable to load issuer cert: " << certStatus.error();
+        }
+        issuerCert = std::move(certStatus.value());
+        context = makeContext(issuerCert.get(), x509.get());
+    }
+
+    // If it's a self-signed cert we use it for signing certs, otherwise only for signing data.
+    const char* basicConstraints = selfSigned ? "CA:TRUE" : "CA:FALSE";
+    const char* keyUsage =
+        selfSigned ? "critical,keyCertSign,cRLSign,digitalSignature" : "critical,digitalSignature";
+
+    add_ext(&context, x509.get(), NID_basic_constraints, basicConstraints);
+    add_ext(&context, x509.get(), NID_key_usage, keyUsage);
+    add_ext(&context, x509.get(), NID_subject_key_identifier, "hash");
+    add_ext(&context, x509.get(), NID_authority_key_identifier, "keyid:always");
 
     // Get the data to be signed
     unsigned char* to_be_signed_buf(nullptr);
@@ -164,12 +225,28 @@ Result<void> createSelfSignedCertificate(
 
     auto f = fopen(path.c_str(), "wbe");
     if (f == nullptr) {
-        return Error() << "Failed to open " << path;
+        return ErrnoError() << "Failed to open " << path;
     }
     i2d_X509_fp(f, x509.get());
-    fclose(f);
+    if (fclose(f) != 0) {
+        return ErrnoError() << "Failed to close " << path;
+    }
 
     return {};
+}
+
+Result<void> createSelfSignedCertificate(
+    const std::vector<uint8_t>& publicKey,
+    const std::function<Result<std::string>(const std::string&)>& signFunction,
+    const std::string& path) {
+    return createCertificate(kRootCommonName, publicKey, signFunction, {}, path);
+}
+
+android::base::Result<void> createLeafCertificate(
+    const char* commonName, const std::vector<uint8_t>& publicKey,
+    const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
+    const std::string& issuerCertPath, const std::string& path) {
+    return createCertificate(commonName, publicKey, signFunction, issuerCertPath, path);
 }
 
 Result<std::vector<uint8_t>> extractPublicKey(EVP_PKEY* pkey) {
@@ -196,14 +273,14 @@ Result<std::vector<uint8_t>> extractPublicKey(EVP_PKEY* pkey) {
 Result<std::vector<uint8_t>>
 extractPublicKeyFromSubjectPublicKeyInfo(const std::vector<uint8_t>& keyData) {
     auto keyDataBytes = keyData.data();
-    EVP_PKEY* public_key = d2i_PUBKEY(nullptr, &keyDataBytes, keyData.size());
+    bssl::UniquePtr<EVP_PKEY> public_key(d2i_PUBKEY(nullptr, &keyDataBytes, keyData.size()));
 
-    return extractPublicKey(public_key);
+    return extractPublicKey(public_key.get());
 }
 
-Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::vector<uint8_t>& keyData) {
-    auto keyDataBytes = keyData.data();
-    bssl::UniquePtr<X509> decoded_cert(d2i_X509(nullptr, &keyDataBytes, keyData.size()));
+Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::vector<uint8_t>& derCert) {
+    auto derCertBytes = derCert.data();
+    bssl::UniquePtr<X509> decoded_cert(d2i_X509(nullptr, &derCertBytes, derCert.size()));
     if (decoded_cert.get() == nullptr) {
         return Error() << "Failed to decode X509 certificate.";
     }
@@ -213,18 +290,54 @@ Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::vector<uint8_t>
 }
 
 Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::string& path) {
-    X509* cert;
-    auto f = fopen(path.c_str(), "re");
-    if (f == nullptr) {
-        return Error() << "Failed to open " << path;
+    auto cert = loadX509(path);
+    if (!cert.ok()) {
+        return cert.error();
     }
-    if (!d2i_X509_fp(f, &cert)) {
-        fclose(f);
-        return Error() << "Unable to decode x509 cert at " << path;
+    return extractPublicKey(X509_get_pubkey(cert.value().get()));
+}
+
+Result<CertInfo> verifyAndExtractCertInfoFromX509(const std::string& path,
+                                                  const std::vector<uint8_t>& publicKey) {
+    auto public_key = toRsaPkey(publicKey);
+    if (!public_key.ok()) {
+        return public_key.error();
     }
 
-    fclose(f);
-    return extractPublicKey(X509_get_pubkey(cert));
+    auto cert = loadX509(path);
+    if (!cert.ok()) {
+        return cert.error();
+    }
+    X509* x509 = cert.value().get();
+
+    // Make sure we signed it.
+    if (X509_verify(x509, public_key.value().get()) != 1) {
+        return Error() << "Failed to verify certificate.";
+    }
+
+    bssl::UniquePtr<EVP_PKEY> pkey(X509_get_pubkey(x509));
+    auto subject_key = extractPublicKey(pkey.get());
+    if (!subject_key.ok()) {
+        return subject_key.error();
+    }
+
+    // The pointers here are all owned by x509, and each function handles an
+    // error return from the previous call correctly.
+    X509_NAME* name = X509_get_subject_name(x509);
+    int index = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
+    X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, index);
+    ASN1_STRING* asn1cn = X509_NAME_ENTRY_get_data(entry);
+    unsigned char* utf8cn;
+    int length = ASN1_STRING_to_UTF8(&utf8cn, asn1cn);
+    if (length < 0) {
+        return Error() << "Failed to read subject CN";
+    }
+
+    bssl::UniquePtr<unsigned char> utf8owner(utf8cn);
+    std::string cn(reinterpret_cast<char*>(utf8cn), static_cast<size_t>(length));
+
+    CertInfo cert_info{std::move(cn), std::move(subject_key.value())};
+    return cert_info;
 }
 
 Result<std::vector<uint8_t>> createPkcs7(const std::vector<uint8_t>& signed_digest) {

@@ -50,13 +50,6 @@ static const char* kFsVerityInitPath = "/system/bin/fsverity_init";
 #define le16_to_cpu(v) (__builtin_bswap16((__force uint16_t)(v)))
 #endif
 
-struct fsverity_signed_digest {
-    char magic[8]; /* must be "FSVerity" */
-    __le16 digest_algorithm;
-    __le16 digest_size;
-    __u8 digest[];
-};
-
 static std::string toHex(std::span<uint8_t> data) {
     std::stringstream ss;
     for (auto it = data.begin(); it != data.end(); ++it) {
@@ -121,7 +114,7 @@ static trailing_unique_ptr<T> makeUniqueWithTrailingData(size_t trailing_data_si
 
 static Result<std::vector<uint8_t>> signDigest(const SigningKey& key,
                                                const std::vector<uint8_t>& digest) {
-    auto d = makeUniqueWithTrailingData<fsverity_signed_digest>(digest.size());
+    auto d = makeUniqueWithTrailingData<fsverity_formatted_digest>(digest.size());
 
     memcpy(d->magic, "FSVerity", 8);
     d->digest_algorithm = cpu_to_le16(FS_VERITY_HASH_ALG_SHA256);
@@ -243,10 +236,13 @@ Result<std::map<std::string, std::string>> verifyAllFilesInVerity(const std::str
     return digests;
 }
 
-Result<void> addCertToFsVerityKeyring(const std::string& path) {
-    const char* const argv[] = {kFsVerityInitPath, "--load-extra-key", "fsv_ods"};
+Result<void> addCertToFsVerityKeyring(const std::string& path, const char* keyName) {
+    const char* const argv[] = {kFsVerityInitPath, "--load-extra-key", keyName};
 
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return ErrnoError() << "Failed to open " << path;
+    }
     pid_t pid = fork();
     if (pid == 0) {
         dup2(fd, STDIN_FILENO);
@@ -255,7 +251,7 @@ Result<void> addCertToFsVerityKeyring(const std::string& path) {
         char* argv_child[argc + 1];
         memcpy(argv_child, argv, argc * sizeof(char*));
         argv_child[argc] = nullptr;
-        execvp(argv_child[0], const_cast<char**>(argv_child));
+        execvp(argv_child[0], argv_child);
         PLOG(ERROR) << "exec in ForkExecvp";
         _exit(EXIT_FAILURE);
     } else {
@@ -271,10 +267,8 @@ Result<void> addCertToFsVerityKeyring(const std::string& path) {
     if (!WIFEXITED(status)) {
         return Error() << kFsVerityInitPath << ": abnormal process exit";
     }
-    if (WEXITSTATUS(status)) {
-        if (status != 0) {
-            return Error() << kFsVerityInitPath << " exited with " << status;
-        }
+    if (WEXITSTATUS(status) != 0) {
+        return Error() << kFsVerityInitPath << " exited with " << WEXITSTATUS(status);
     }
 
     return {};
