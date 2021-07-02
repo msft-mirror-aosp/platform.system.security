@@ -20,8 +20,11 @@
 #include <aidl/android/hardware/security/keymint/IRemotelyProvisionedComponent.h>
 #include <android/binder_manager.h>
 #include <cppbor.h>
+#include <gflags/gflags.h>
 #include <keymaster/cppcose/cppcose.h>
 #include <log/log.h>
+#include <remote_prov/remote_prov_utils.h>
+#include <sys/random.h>
 #include <vintf/VintfObject.h>
 
 using std::set;
@@ -32,6 +35,9 @@ using aidl::android::hardware::security::keymint::DeviceInfo;
 using aidl::android::hardware::security::keymint::IRemotelyProvisionedComponent;
 using aidl::android::hardware::security::keymint::MacedPublicKey;
 using aidl::android::hardware::security::keymint::ProtectedData;
+using aidl::android::hardware::security::keymint::remote_prov::generateEekChain;
+using aidl::android::hardware::security::keymint::remote_prov::getProdEekChain;
+using aidl::android::hardware::security::keymint::remote_prov::jsonEncodeCsrWithBuild;
 
 using android::vintf::HalManifest;
 using android::vintf::VintfObject;
@@ -39,66 +45,42 @@ using android::vintf::VintfObject;
 using namespace cppbor;
 using namespace cppcose;
 
+DEFINE_bool(test_mode, false, "If enabled, a fake EEK key/cert are used.");
+
+DEFINE_string(output_format, "csr", "How to format the output. Defaults to 'csr'.");
+
 namespace {
 
 const string kPackage = "android.hardware.security.keymint";
 const string kInterface = "IRemotelyProvisionedComponent";
 const string kFormattedName = kPackage + "." + kInterface + "/";
 
-ErrMsgOr<vector<uint8_t>> generateEekChain(size_t length, const vector<uint8_t>& eekId) {
-    auto eekChain = cppbor::Array();
+// Various supported --output_format values.
+constexpr std::string_view kBinaryCsrOutput = "csr";     // Just the raw csr as binary
+constexpr std::string_view kBuildPlusCsr = "build+csr";  // Text-encoded (JSON) build
+                                                         // fingerprint plus CSR.
 
-    vector<uint8_t> prevPrivKey;
-    for (size_t i = 0; i < length - 1; ++i) {
-        vector<uint8_t> pubKey(ED25519_PUBLIC_KEY_LEN);
-        vector<uint8_t> privKey(ED25519_PRIVATE_KEY_LEN);
+constexpr size_t kChallengeSize = 16;
 
-        ED25519_keypair(pubKey.data(), privKey.data());
+std::vector<uint8_t> generateChallenge() {
+    std::vector<uint8_t> challenge(kChallengeSize);
 
-        // The first signing key is self-signed.
-        if (prevPrivKey.empty()) prevPrivKey = privKey;
-
-        auto coseSign1 = constructCoseSign1(prevPrivKey,
-                                            cppbor::Map() /* payload CoseKey */
-                                                .add(CoseKey::KEY_TYPE, OCTET_KEY_PAIR)
-                                                .add(CoseKey::ALGORITHM, EDDSA)
-                                                .add(CoseKey::CURVE, ED25519)
-                                                .add(CoseKey::PUBKEY_X, pubKey)
-                                                .canonicalize()
-                                                .encode(),
-                                            {} /* AAD */);
-        if (!coseSign1) return coseSign1.moveMessage();
-        eekChain.add(coseSign1.moveValue());
-
-        prevPrivKey = privKey;
+    ssize_t bytesRemaining = static_cast<ssize_t>(challenge.size());
+    uint8_t* writePtr = challenge.data();
+    while (bytesRemaining > 0) {
+        int bytesRead = getrandom(writePtr, bytesRemaining, /*flags=*/0);
+        if (bytesRead < 0) {
+            LOG_FATAL_IF(errno != EINTR, "%d - %s", errno, strerror(errno));
+        }
+        bytesRemaining -= bytesRead;
+        writePtr += bytesRead;
     }
 
-    vector<uint8_t> pubKey(X25519_PUBLIC_VALUE_LEN);
-    vector<uint8_t> privKey(X25519_PRIVATE_KEY_LEN);
-    X25519_keypair(pubKey.data(), privKey.data());
-
-    auto coseSign1 = constructCoseSign1(prevPrivKey,
-                                        cppbor::Map() /* payload CoseKey */
-                                            .add(CoseKey::KEY_TYPE, OCTET_KEY_PAIR)
-                                            .add(CoseKey::KEY_ID, eekId)
-                                            .add(CoseKey::ALGORITHM, ECDH_ES_HKDF_256)
-                                            .add(CoseKey::CURVE, cppcose::X25519)
-                                            .add(CoseKey::PUBKEY_X, pubKey)
-                                            .canonicalize()
-                                            .encode(),
-                                        {} /* AAD */);
-    if (!coseSign1) return coseSign1.moveMessage();
-    eekChain.add(coseSign1.moveValue());
-
-    return eekChain.encode();
+    return challenge;
 }
 
-std::vector<uint8_t> getChallenge() {
-    return std::vector<uint8_t>(0);
-}
-
-std::vector<uint8_t> composeCertificateRequest(ProtectedData&& protectedData,
-                                               DeviceInfo&& deviceInfo) {
+Array composeCertificateRequest(ProtectedData&& protectedData, DeviceInfo&& deviceInfo,
+                                const std::vector<uint8_t>& challenge) {
     Array emptyMacedKeysToSign;
     emptyMacedKeysToSign
         .add(std::vector<uint8_t>(0))   // empty protected headers as bstr
@@ -107,10 +89,10 @@ std::vector<uint8_t> composeCertificateRequest(ProtectedData&& protectedData,
         .add(std::vector<uint8_t>(0));  // empty tag as bstr
     Array certificateRequest;
     certificateRequest.add(EncodedItem(std::move(deviceInfo.deviceInfo)))
-        .add(getChallenge())  // fake challenge
+        .add(challenge)
         .add(EncodedItem(std::move(protectedData.protectedData)))
         .add(std::move(emptyMacedKeysToSign));
-    return certificateRequest.encode();
+    return certificateRequest;
 }
 
 int32_t errorMsg(string name) {
@@ -118,9 +100,47 @@ int32_t errorMsg(string name) {
     return -1;
 }
 
+std::vector<uint8_t> getEekChain() {
+    if (FLAGS_test_mode) {
+        const std::vector<uint8_t> kFakeEekId = {'f', 'a', 'k', 'e', 0};
+        auto eekOrErr = generateEekChain(3 /* chainlength */, kFakeEekId);
+        LOG_FATAL_IF(!eekOrErr, "Failed to generate test EEK somehow: %s",
+                     eekOrErr.message().c_str());
+        auto [eek, ignored_pubkey, ignored_privkey] = eekOrErr.moveValue();
+        return eek;
+    }
+
+    return getProdEekChain();
+}
+
+void writeOutput(const Array& csr) {
+    if (FLAGS_output_format == kBinaryCsrOutput) {
+        auto bytes = csr.encode();
+        std::copy(bytes.begin(), bytes.end(), std::ostream_iterator<char>(std::cout));
+    } else if (FLAGS_output_format == kBuildPlusCsr) {
+        auto [json, error] = jsonEncodeCsrWithBuild(csr);
+        if (!error.empty()) {
+            std::cerr << "Error JSON encoding the output: " << error;
+            exit(1);
+        }
+        std::cout << json << std::endl;
+    } else {
+        std::cerr << "Unexpected output_format '" << FLAGS_output_format << "'" << std::endl;
+        std::cerr << "Valid formats:" << std::endl;
+        std::cerr << "  " << kBinaryCsrOutput << std::endl;
+        std::cerr << "  " << kBuildPlusCsr << std::endl;
+        exit(1);
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    gflags::ParseCommandLineFlags(&argc, &argv, /*remove_flags=*/true);
+
+    const std::vector<uint8_t> eek_chain = getEekChain();
+    const std::vector<uint8_t> challenge = generateChallenge();
+
     std::shared_ptr<const HalManifest> manifest = VintfObject::GetDeviceHalManifest();
     set<string> rkpNames = manifest->getAidlInstances(kPackage, kInterface);
     for (auto name : rkpNames) {
@@ -136,31 +156,19 @@ int main() {
         std::vector<uint8_t> keysToSignMac;
         std::vector<MacedPublicKey> emptyKeys;
 
-        // Replace this eek chain generation with the actual production GEEK
-        std::vector<uint8_t> eekId(10);  // replace with real KID later (EEK fingerprint)
-        auto eekOrErr = generateEekChain(3 /* chainlength */, eekId);
-        if (!eekOrErr) {
-            ALOGE("Failed to generate test EEK somehow: %s", eekOrErr.message().c_str());
-            return errorMsg(name);
-        }
-
-        std::vector<uint8_t> eek = eekOrErr.moveValue();
         DeviceInfo deviceInfo;
         ProtectedData protectedData;
         if (rkp_service) {
             ALOGE("extracting bundle");
             ::ndk::ScopedAStatus status = rkp_service->generateCertificateRequest(
-                true /* testMode */, emptyKeys, eek, getChallenge(), &deviceInfo, &protectedData,
+                FLAGS_test_mode, emptyKeys, eek_chain, challenge, &deviceInfo, &protectedData,
                 &keysToSignMac);
             if (!status.isOk()) {
                 ALOGE("Bundle extraction failed. Error code: %d", status.getServiceSpecificError());
                 return errorMsg(name);
             }
-            std::cout << "\n";
-            std::vector<uint8_t> certificateRequest =
-                composeCertificateRequest(std::move(protectedData), std::move(deviceInfo));
-            std::copy(certificateRequest.begin(), certificateRequest.end(),
-                      std::ostream_iterator<char>(std::cout));
+            writeOutput(composeCertificateRequest(std::move(protectedData), std::move(deviceInfo),
+                                                  challenge));
         }
     }
 }
