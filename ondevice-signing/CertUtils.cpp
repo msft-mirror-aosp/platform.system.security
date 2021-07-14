@@ -31,8 +31,10 @@
 
 #include "KeyConstants.h"
 
-const char kRootCommonName[] = "ODS";
+// Common properties for all of our certificates.
 constexpr int kCertLifetimeSeconds = 10 * 365 * 24 * 60 * 60;
+const char* const kIssuerCountry = "US";
+const char* const kIssuerOrg = "Android";
 
 using android::base::ErrnoError;
 using android::base::Error;
@@ -75,7 +77,7 @@ static void addNameEntry(X509_NAME* name, const char* field, const char* value) 
                                reinterpret_cast<const unsigned char*>(value), -1, -1, 0);
 }
 
-Result<bssl::UniquePtr<RSA>> getRsa(const std::vector<uint8_t>& publicKey) {
+static Result<bssl::UniquePtr<RSA>> getRsaFromModulus(const std::vector<uint8_t>& publicKey) {
     bssl::UniquePtr<BIGNUM> n(BN_new());
     bssl::UniquePtr<BIGNUM> e(BN_new());
     bssl::UniquePtr<RSA> rsaPubkey(RSA_new());
@@ -91,29 +93,24 @@ Result<bssl::UniquePtr<RSA>> getRsa(const std::vector<uint8_t>& publicKey) {
     return rsaPubkey;
 }
 
-Result<void> verifySignature(const std::string& message, const std::string& signature,
-                             const std::vector<uint8_t>& publicKey) {
-    auto rsaKey = getRsa(publicKey);
-    if (!rsaKey.ok()) {
-        return rsaKey.error();
+static Result<bssl::UniquePtr<RSA>>
+getRsaFromRsaPublicKey(const std::vector<uint8_t>& rsaPublicKey) {
+    auto derBytes = rsaPublicKey.data();
+    bssl::UniquePtr<RSA> rsaKey(d2i_RSAPublicKey(nullptr, &derBytes, rsaPublicKey.size()));
+    if (rsaKey.get() == nullptr) {
+        return Error() << "Failed to parse RsaPublicKey";
     }
-    uint8_t hashBuf[SHA256_DIGEST_LENGTH];
-    SHA256(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(message.c_str())),
-           message.length(), hashBuf);
-
-    bool success = RSA_verify(NID_sha256, hashBuf, sizeof(hashBuf),
-                              (const uint8_t*)signature.c_str(), signature.length(), rsaKey->get());
-
-    if (!success) {
-        return Error() << "Failed to verify signature.";
+    if (derBytes != rsaPublicKey.data() + rsaPublicKey.size()) {
+        return Error() << "Key has unexpected trailing data";
     }
-    return {};
+
+    return rsaKey;
 }
 
-static Result<bssl::UniquePtr<EVP_PKEY>> toRsaPkey(const std::vector<uint8_t>& publicKey) {
+static Result<bssl::UniquePtr<EVP_PKEY>> modulusToRsaPkey(const std::vector<uint8_t>& publicKey) {
     // "publicKey" corresponds to the raw public key bytes - need to create
     // a new RSA key with the correct exponent.
-    auto rsaPubkey = getRsa(publicKey);
+    auto rsaPubkey = getRsaFromModulus(publicKey);
     if (!rsaPubkey.ok()) {
         return rsaPubkey.error();
     }
@@ -125,8 +122,61 @@ static Result<bssl::UniquePtr<EVP_PKEY>> toRsaPkey(const std::vector<uint8_t>& p
     return public_key;
 }
 
+static Result<bssl::UniquePtr<EVP_PKEY>>
+rsaPublicKeyToRsaPkey(const std::vector<uint8_t>& rsaPublicKey) {
+    // rsaPublicKey contains both modulus and exponent, DER-encoded.
+    auto rsaKey = getRsaFromRsaPublicKey(rsaPublicKey);
+    if (!rsaKey.ok()) {
+        return rsaKey.error();
+    }
+
+    bssl::UniquePtr<EVP_PKEY> public_key(EVP_PKEY_new());
+    if (!EVP_PKEY_assign_RSA(public_key.get(), rsaKey->release())) {
+        return Error() << "Failed to assign key";
+    }
+    return public_key;
+}
+
+Result<void> verifySignature(const std::string& message, const std::string& signature,
+                             const std::vector<uint8_t>& publicKey) {
+    auto rsaKey = getRsaFromModulus(publicKey);
+    if (!rsaKey.ok()) {
+        return rsaKey.error();
+    }
+    uint8_t hashBuf[SHA256_DIGEST_LENGTH];
+    SHA256(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(message.c_str())),
+           message.length(), hashBuf);
+
+    bool success = RSA_verify(NID_sha256, hashBuf, sizeof(hashBuf),
+                              (const uint8_t*)signature.c_str(), signature.length(), rsaKey->get());
+
+    if (!success) {
+        return Error() << "Failed to verify signature";
+    }
+    return {};
+}
+
+Result<void> verifyRsaPublicKeySignature(const std::string& message, const std::string& signature,
+                                         const std::vector<uint8_t>& rsaPublicKey) {
+    auto rsaKey = getRsaFromRsaPublicKey(rsaPublicKey);
+    if (!rsaKey.ok()) {
+        return rsaKey.error();
+    }
+
+    uint8_t hashBuf[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const uint8_t*>(message.data()), message.size(), hashBuf);
+
+    bool success = RSA_verify(NID_sha256, hashBuf, sizeof(hashBuf),
+                              reinterpret_cast<const uint8_t*>(signature.data()), signature.size(),
+                              rsaKey->get());
+    if (!success) {
+        return Error() << "Failed to verify signature";
+    }
+    return {};
+}
+
 static Result<void> createCertificate(
-    const char* commonName, const std::vector<uint8_t>& publicKey,
+    const CertSubject& subject, EVP_PKEY* publicKey,
     const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
     const std::optional<std::string>& issuerCertPath, const std::string& path) {
 
@@ -141,7 +191,7 @@ static Result<void> createCertificate(
     X509_set_version(x509.get(), 2);
     X509_gmtime_adj(X509_get_notBefore(x509.get()), 0);
     X509_gmtime_adj(X509_get_notAfter(x509.get()), kCertLifetimeSeconds);
-    ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), selfSigned ? 1 : 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), subject.serialNumber);
 
     bssl::UniquePtr<X509_ALGOR> algor(X509_ALGOR_new());
     if (!algor ||
@@ -151,12 +201,7 @@ static Result<void> createCertificate(
         return Error() << "Unable to set x509 signature algorithm";
     }
 
-    auto public_key = toRsaPkey(publicKey);
-    if (!public_key.ok()) {
-        return public_key.error();
-    }
-
-    if (!X509_set_pubkey(x509.get(), public_key.value().get())) {
+    if (!X509_set_pubkey(x509.get(), publicKey)) {
         return Error() << "Unable to set x509 public key";
     }
 
@@ -164,9 +209,9 @@ static Result<void> createCertificate(
     if (!subjectName) {
         return Error() << "Unable to get x509 subject name";
     }
-    addNameEntry(subjectName, "C", "US");
-    addNameEntry(subjectName, "O", "Android");
-    addNameEntry(subjectName, "CN", commonName);
+    addNameEntry(subjectName, "C", kIssuerCountry);
+    addNameEntry(subjectName, "O", kIssuerOrg);
+    addNameEntry(subjectName, "CN", subject.commonName);
 
     if (selfSigned) {
         if (!X509_set_issuer_name(x509.get(), subjectName)) {
@@ -177,9 +222,9 @@ static Result<void> createCertificate(
         if (!issuerName) {
             return Error() << "Unable to get x509 issuer name";
         }
-        addNameEntry(issuerName, "C", "US");
-        addNameEntry(issuerName, "O", "Android");
-        addNameEntry(issuerName, "CN", kRootCommonName);
+        addNameEntry(issuerName, "C", kIssuerCountry);
+        addNameEntry(issuerName, "O", kIssuerOrg);
+        addNameEntry(issuerName, "CN", kRootSubject.commonName);
     }
 
     // Beware: context contains a pointer to issuerCert, so we need to keep it alive.
@@ -239,14 +284,24 @@ Result<void> createSelfSignedCertificate(
     const std::vector<uint8_t>& publicKey,
     const std::function<Result<std::string>(const std::string&)>& signFunction,
     const std::string& path) {
-    return createCertificate(kRootCommonName, publicKey, signFunction, {}, path);
+    auto rsa_pkey = modulusToRsaPkey(publicKey);
+    if (!rsa_pkey.ok()) {
+        return rsa_pkey.error();
+    }
+
+    return createCertificate(kRootSubject, rsa_pkey.value().get(), signFunction, {}, path);
 }
 
 android::base::Result<void> createLeafCertificate(
-    const char* commonName, const std::vector<uint8_t>& publicKey,
+    const CertSubject& subject, const std::vector<uint8_t>& rsaPublicKey,
     const std::function<android::base::Result<std::string>(const std::string&)>& signFunction,
     const std::string& issuerCertPath, const std::string& path) {
-    return createCertificate(commonName, publicKey, signFunction, issuerCertPath, path);
+    auto rsa_pkey = rsaPublicKeyToRsaPkey(rsaPublicKey);
+    if (!rsa_pkey.ok()) {
+        return rsa_pkey.error();
+    }
+
+    return createCertificate(subject, rsa_pkey.value().get(), signFunction, issuerCertPath, path);
 }
 
 Result<std::vector<uint8_t>> extractPublicKey(EVP_PKEY* pkey) {
@@ -297,9 +352,40 @@ Result<std::vector<uint8_t>> extractPublicKeyFromX509(const std::string& path) {
     return extractPublicKey(X509_get_pubkey(cert.value().get()));
 }
 
+Result<std::vector<uint8_t>> extractRsaPublicKey(EVP_PKEY* pkey) {
+    RSA* rsa = EVP_PKEY_get0_RSA(pkey);
+    if (rsa == nullptr) {
+        return Error() << "The public key is not an RSA key";
+    }
+
+    uint8_t* out = nullptr;
+    int size = i2d_RSAPublicKey(rsa, &out);
+    if (size < 0 || !out) {
+        return Error() << "Failed to convert to RSAPublicKey";
+    }
+
+    bssl::UniquePtr<uint8_t> buffer(out);
+    std::vector<uint8_t> result(out, out + size);
+    return result;
+}
+
+Result<std::vector<uint8_t>> extractRsaPublicKeyFromX509(const std::vector<uint8_t>& derCert) {
+    auto derCertBytes = derCert.data();
+    bssl::UniquePtr<X509> decoded_cert(d2i_X509(nullptr, &derCertBytes, derCert.size()));
+    if (decoded_cert.get() == nullptr) {
+        return Error() << "Failed to decode X509 certificate.";
+    }
+    bssl::UniquePtr<EVP_PKEY> decoded_pkey(X509_get_pubkey(decoded_cert.get()));
+    if (decoded_pkey == nullptr) {
+        return Error() << "Failed to extract public key from x509 cert";
+    }
+
+    return extractRsaPublicKey(decoded_pkey.get());
+}
+
 Result<CertInfo> verifyAndExtractCertInfoFromX509(const std::string& path,
                                                   const std::vector<uint8_t>& publicKey) {
-    auto public_key = toRsaPkey(publicKey);
+    auto public_key = modulusToRsaPkey(publicKey);
     if (!public_key.ok()) {
         return public_key.error();
     }
@@ -316,7 +402,7 @@ Result<CertInfo> verifyAndExtractCertInfoFromX509(const std::string& path,
     }
 
     bssl::UniquePtr<EVP_PKEY> pkey(X509_get_pubkey(x509));
-    auto subject_key = extractPublicKey(pkey.get());
+    auto subject_key = extractRsaPublicKey(pkey.get());
     if (!subject_key.ok()) {
         return subject_key.error();
     }
@@ -340,7 +426,8 @@ Result<CertInfo> verifyAndExtractCertInfoFromX509(const std::string& path,
     return cert_info;
 }
 
-Result<std::vector<uint8_t>> createPkcs7(const std::vector<uint8_t>& signed_digest) {
+Result<std::vector<uint8_t>> createPkcs7(const std::vector<uint8_t>& signed_digest,
+                                         const CertSubject& signer) {
     CBB out, outer_seq, wrapped_seq, seq, digest_algos_set, digest_algo, null;
     CBB content_info, issuer_and_serial, signer_infos, signer_info, sign_algo, signature;
     uint8_t *pkcs7_data, *name_der;
@@ -348,19 +435,20 @@ Result<std::vector<uint8_t>> createPkcs7(const std::vector<uint8_t>& signed_dige
     BIGNUM* serial = BN_new();
     int sig_nid = NID_rsaEncryption;
 
-    X509_NAME* name = X509_NAME_new();
-    if (!name) {
-        return Error() << "Unable to get x509 subject name";
+    X509_NAME* issuer_name = X509_NAME_new();
+    if (!issuer_name) {
+        return Error() << "Unable to create x509 subject name";
     }
-    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("Android"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("ODS"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(issuer_name, "C", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(kIssuerCountry), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(issuer_name, "O", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(kIssuerOrg), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(issuer_name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(kRootSubject.commonName), -1,
+                               -1, 0);
 
-    BN_set_word(serial, 1);
-    name_der_len = i2d_X509_NAME(name, &name_der);
+    BN_set_word(serial, signer.serialNumber);
+    name_der_len = i2d_X509_NAME(issuer_name, &name_der);
     CBB_init(&out, 1024);
 
     if (!CBB_add_asn1(&out, &outer_seq, CBS_ASN1_SEQUENCE) ||

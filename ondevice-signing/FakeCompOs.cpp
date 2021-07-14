@@ -26,7 +26,10 @@
 
 #include <binder/IServiceManager.h>
 
+#include <openssl/nid.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
 
 using android::String16;
 
@@ -225,8 +228,8 @@ Result<void> FakeCompOs::loadAndVerifyKey(const ByteVector& keyBlob,
         return signature.error();
     }
 
-    std::string dataStr(data.begin(), data.end());
-    std::string signatureStr(signature.value().begin(), signature.value().end());
-
-    return verifySignature(dataStr, signatureStr, publicKey);
+    std::string signatureString(reinterpret_cast<char*>(signature.value().data()),
+                                signature.value().size());
+    std::string dataString(reinterpret_cast<char*>(data.data()), data.size());
+    return verifyRsaPublicKeySignature(dataString, signatureString, publicKey);
 }
