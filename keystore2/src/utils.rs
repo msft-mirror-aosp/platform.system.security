@@ -43,7 +43,7 @@ use keystore2_apc_compat::{
 pub fn check_keystore_permission(perm: KeystorePerm) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_keystore_permission(
-            &calling_sid.ok_or_else(Error::sys).context(
+            calling_sid.ok_or_else(Error::sys).context(
                 "In check_keystore_permission: Cannot check permission without calling_sid.",
             )?,
             perm,
@@ -57,7 +57,7 @@ pub fn check_keystore_permission(perm: KeystorePerm) -> anyhow::Result<()> {
 pub fn check_grant_permission(access_vec: KeyPermSet, key: &KeyDescriptor) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_grant_permission(
-            &calling_sid.ok_or_else(Error::sys).context(
+            calling_sid.ok_or_else(Error::sys).context(
                 "In check_grant_permission: Cannot check permission without calling_sid.",
             )?,
             access_vec,
@@ -77,7 +77,7 @@ pub fn check_key_permission(
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_key_permission(
             ThreadState::get_calling_uid(),
-            &calling_sid
+            calling_sid
                 .ok_or_else(Error::sys)
                 .context("In check_key_permission: Cannot check permission without calling_sid.")?,
             perm,
@@ -188,16 +188,15 @@ pub fn ui_opts_2_compat(opt: i32) -> ApcCompatUiOptions {
 }
 
 /// AID offset for uid space partitioning.
-pub const AID_USER_OFFSET: u32 = cutils_bindgen::AID_USER_OFFSET;
+pub const AID_USER_OFFSET: u32 = rustutils::users::AID_USER_OFFSET;
 
 /// AID of the keystore process itself, used for keys that
 /// keystore generates for its own use.
-pub const AID_KEYSTORE: u32 = cutils_bindgen::AID_KEYSTORE;
+pub const AID_KEYSTORE: u32 = rustutils::users::AID_KEYSTORE;
 
 /// Extracts the android user from the given uid.
 pub fn uid_to_android_user(uid: u32) -> u32 {
-    // Safety: No memory access
-    unsafe { cutils_bindgen::multiuser_get_user_id(uid) }
+    rustutils::users::multiuser_get_user_id(uid)
 }
 
 /// This module provides helpers for simplified use of the watchdog module.
