@@ -46,13 +46,13 @@ use keystore2_crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, generate_aes256_key, generate_salt, Password, ZVec,
     AES_256_KEY_LENGTH,
 };
+use rustutils::system_properties::PropertyWatcher;
 use std::{
     collections::HashMap,
     sync::Arc,
     sync::{Mutex, Weak},
 };
 use std::{convert::TryFrom, ops::Deref};
-use system_properties::PropertyWatcher;
 
 const MAX_MAX_BOOT_LEVEL: usize = 1_000_000_000;
 /// Allow up to 15 seconds between the user unlocking using a biometric, and the auth
@@ -396,7 +396,7 @@ impl SuperKeyManager {
             .get_or_create_key_with(
                 Domain::APP,
                 user as u64 as i64,
-                &USER_SUPER_KEY.alias,
+                USER_SUPER_KEY.alias,
                 crate::database::KEYSTORE_UUID,
                 || {
                     // For backward compatibility we need to check if there is a super key present.
@@ -499,7 +499,7 @@ impl SuperKeyManager {
         user_id: UserId,
     ) -> Result<bool> {
         let key_in_db = db
-            .key_exists(Domain::APP, user_id as u64 as i64, &USER_SUPER_KEY.alias, KeyType::Super)
+            .key_exists(Domain::APP, user_id as u64 as i64, USER_SUPER_KEY.alias, KeyType::Super)
             .context("In super_key_exists_in_db_for_user.")?;
 
         if key_in_db {
@@ -735,7 +735,7 @@ impl SuperKeyManager {
         match Enforcements::super_encryption_required(domain, key_parameters, flags) {
             SuperEncryptionType::None => Ok((key_blob.to_vec(), BlobMetaData::new())),
             SuperEncryptionType::LskfBound => self
-                .super_encrypt_on_key_init(db, legacy_migrator, user_id, &key_blob)
+                .super_encrypt_on_key_init(db, legacy_migrator, user_id, key_blob)
                 .context(concat!(
                     "In handle_super_encryption_on_key_init. ",
                     "Failed to super encrypt with LskfBound key."
@@ -744,7 +744,7 @@ impl SuperKeyManager {
                 let mut data = self.data.lock().unwrap();
                 let entry = data.user_keys.entry(user_id).or_default();
                 if let Some(super_key) = entry.screen_lock_bound.as_ref() {
-                    Self::encrypt_with_aes_super_key(key_blob, &super_key).context(concat!(
+                    Self::encrypt_with_aes_super_key(key_blob, super_key).context(concat!(
                         "In handle_super_encryption_on_key_init. ",
                         "Failed to encrypt with ScreenLockBound key."
                     ))
@@ -1213,8 +1213,8 @@ impl<'a> Deref for KeyBlob<'a> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Sensitive { key, .. } => &key,
-            Self::NonSensitive(key) => &key,
+            Self::Sensitive { key, .. } => key,
+            Self::NonSensitive(key) => key,
             Self::Ref(key) => key,
         }
     }
