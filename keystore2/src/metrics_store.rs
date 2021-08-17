@@ -45,8 +45,8 @@ use android_security_metrics::aidl::android::security::metrics::{
     Storage::Storage as MetricsStorage,
 };
 use anyhow::{Context, Result};
-use keystore2_system_property::{write, PropertyWatcher, PropertyWatcherError};
 use lazy_static::lazy_static;
+use rustutils::system_properties::PropertyWatcherError;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -626,7 +626,9 @@ pub fn update_keystore_crash_sysprop() {
         }
     };
 
-    if let Err(e) = write(KEYSTORE_CRASH_COUNT_PROPERTY, &new_count.to_string()) {
+    if let Err(e) =
+        rustutils::system_properties::write(KEYSTORE_CRASH_COUNT_PROPERTY, &new_count.to_string())
+    {
         log::error!(
             concat!(
                 "In update_keystore_crash_sysprop:: ",
@@ -639,12 +641,10 @@ pub fn update_keystore_crash_sysprop() {
 
 /// Read the system property: keystore.crash_count.
 pub fn read_keystore_crash_count() -> Result<i32> {
-    let mut prop_reader = PropertyWatcher::new("keystore.crash_count").context(concat!(
-        "In read_keystore_crash_count: Failed to create reader a PropertyWatcher."
-    ))?;
-    prop_reader
-        .read(|_n, v| v.parse::<i32>().map_err(std::convert::Into::into))
-        .context("In read_keystore_crash_count: Failed to read the existing system property.")
+    rustutils::system_properties::read("keystore.crash_count")
+        .context("In read_keystore_crash_count: Failed read property.")?
+        .parse::<i32>()
+        .map_err(std::convert::Into::into)
 }
 
 /// Enum defining the bit position for each padding mode. Since padding mode can be repeatable, it
