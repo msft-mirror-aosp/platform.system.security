@@ -15,18 +15,20 @@
 //! This crate implements the IKeystoreSecurityLevel interface.
 
 use crate::attestation_key_utils::{get_attest_key_info, AttestationKeyInfo};
-use crate::audit_log::{log_key_deleted, log_key_generated, log_key_imported};
+use crate::audit_log::{
+    log_key_deleted, log_key_generated, log_key_imported, log_key_integrity_violation,
+};
 use crate::database::{CertificateInfo, KeyIdGuard};
 use crate::error::{self, map_km_error, map_or_log_err, Error, ErrorCode};
 use crate::globals::{DB, ENFORCEMENTS, LEGACY_MIGRATOR, SUPER_KEY};
 use crate::key_parameter::KeyParameter as KsKeyParam;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
-use crate::metrics::log_key_creation_event_stats;
+use crate::metrics_store::log_key_creation_event_stats;
 use crate::remote_provisioning::RemProvState;
 use crate::super_key::{KeyBlob, SuperKeyManager};
 use crate::utils::{
     check_device_attestation_permissions, check_key_permission, is_device_id_attestation_tag,
-    key_characteristics_to_internal, uid_to_android_user, watchdog as wd, Asp,
+    key_characteristics_to_internal, uid_to_android_user, watchdog as wd,
 };
 use crate::{
     database::{
@@ -59,7 +61,7 @@ use anyhow::{anyhow, Context, Result};
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
     security_level: SecurityLevel,
-    keymint: Asp,
+    keymint: Strong<dyn IKeyMintDevice>,
     hw_info: KeyMintHardwareInfo,
     km_uuid: Uuid,
     operation_db: OperationDb,
@@ -174,6 +176,7 @@ impl KeystoreSecurityLevel {
                     let key_id = db
                         .store_new_key(
                             &key,
+                            KeyType::Client,
                             &key_parameters,
                             &(&key_blob, &blob_metadata),
                             &cert_info,
@@ -238,9 +241,9 @@ impl KeystoreSecurityLevel {
             _ => {
                 let (key_id_guard, mut key_entry) = DB
                     .with::<_, Result<(KeyIdGuard, KeyEntry)>>(|db| {
-                        LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                        LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
                             db.borrow_mut().load_key_entry(
-                                &key,
+                                key,
                                 KeyType::Client,
                                 KeyEntryLoadBits::KM,
                                 caller_uid,
@@ -301,29 +304,41 @@ impl KeystoreSecurityLevel {
             .unwrap_key_if_required(&blob_metadata, km_blob)
             .context("In create_operation. Failed to handle super encryption.")?;
 
-        let km_dev: Strong<dyn IKeyMintDevice> = self
-            .keymint
-            .get_interface()
-            .context("In create_operation: Failed to get KeyMint device")?;
-
         let (begin_result, upgraded_blob) = self
             .upgrade_keyblob_if_required_with(
-                &*km_dev,
+                &*self.keymint,
                 key_id_guard,
                 &km_blob,
                 &blob_metadata,
-                &operation_parameters,
+                operation_parameters,
                 |blob| loop {
                     match map_km_error({
                         let _wp = self.watch_millis(
                             "In KeystoreSecurityLevel::create_operation: calling begin",
                             500,
                         );
-                        km_dev.begin(purpose, blob, &operation_parameters, immediate_hat.as_ref())
+                        self.keymint.begin(
+                            purpose,
+                            blob,
+                            operation_parameters,
+                            immediate_hat.as_ref(),
+                        )
                     }) {
                         Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
                             self.operation_db.prune(caller_uid, forced)?;
                             continue;
+                        }
+                        v @ Err(Error::Km(ErrorCode::INVALID_KEY_BLOB)) => {
+                            if let Some((key_id, _)) = key_properties {
+                                if let Ok(Some(key)) =
+                                    DB.with(|db| db.borrow_mut().load_key_descriptor(key_id))
+                                {
+                                    log_key_integrity_violation(&key);
+                                } else {
+                                    log::error!("Failed to load key descriptor for audit log");
+                                }
+                            }
+                            return v;
                         }
                         v => return v,
                     }
@@ -493,8 +508,6 @@ impl KeystoreSecurityLevel {
             .add_certificate_parameters(caller_uid, params, &key)
             .context("In generate_key: Trying to get aaid.")?;
 
-        let km_dev: Strong<dyn IKeyMintDevice> = self.keymint.get_interface()?;
-
         let creation_result = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
                 key_id_guard,
@@ -503,7 +516,7 @@ impl KeystoreSecurityLevel {
                 issuer_subject,
             }) => self
                 .upgrade_keyblob_if_required_with(
-                    &*km_dev,
+                    &*self.keymint,
                     Some(key_id_guard),
                     &KeyBlob::Ref(&blob),
                     &blob_metadata,
@@ -522,7 +535,7 @@ impl KeystoreSecurityLevel {
                                 ),
                                 5000, // Generate can take a little longer.
                             );
-                            km_dev.generateKey(&params, attest_key.as_ref())
+                            self.keymint.generateKey(&params, attest_key.as_ref())
                         })
                     },
                 )
@@ -537,7 +550,7 @@ impl KeystoreSecurityLevel {
                         ),
                         5000, // Generate can take a little longer.
                     );
-                    km_dev.generateKey(&params, Some(&attestation_key))
+                    self.keymint.generateKey(&params, Some(&attestation_key))
                 })
                 .context("While generating Key with remote provisioned attestation key.")
                 .map(|mut creation_result| {
@@ -553,7 +566,7 @@ impl KeystoreSecurityLevel {
                     ),
                     5000, // Generate can take a little longer.
                 );
-                km_dev.generateKey(&params, None)
+                self.keymint.generateKey(&params, None)
             })
             .context("While generating Key without explicit attestation key."),
         }
@@ -610,8 +623,7 @@ impl KeystoreSecurityLevel {
             })
             .context("In import_key.")?;
 
-        let km_dev: Strong<dyn IKeyMintDevice> =
-            self.keymint.get_interface().context("In import_key: Trying to get the KM device")?;
+        let km_dev = &self.keymint;
         let creation_result = map_km_error({
             let _wp =
                 self.watch_millis("In KeystoreSecurityLevel::import_key: calling importKey.", 500);
@@ -679,7 +691,7 @@ impl KeystoreSecurityLevel {
             .with(|db| {
                 LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
                     db.borrow_mut().load_key_entry(
-                        &wrapping_key,
+                        wrapping_key,
                         KeyType::Client,
                         KeyEntryLoadBits::KM,
                         caller_uid,
@@ -721,10 +733,9 @@ impl KeystoreSecurityLevel {
 
         let masking_key = masking_key.unwrap_or(ZERO_BLOB_32);
 
-        let km_dev: Strong<dyn IKeyMintDevice> = self.keymint.get_interface()?;
         let (creation_result, _) = self
             .upgrade_keyblob_if_required_with(
-                &*km_dev,
+                &*self.keymint,
                 Some(wrapping_key_id_guard),
                 &wrapping_key_blob,
                 &wrapping_blob_metadata,
@@ -734,11 +745,11 @@ impl KeystoreSecurityLevel {
                         "In KeystoreSecurityLevel::import_wrapped_key: calling importWrappedKey.",
                         500,
                     );
-                    let creation_result = map_km_error(km_dev.importWrappedKey(
+                    let creation_result = map_km_error(self.keymint.importWrappedKey(
                         wrapped_data,
                         wrapping_blob,
                         masking_key,
-                        &params,
+                        params,
                         pw_sid,
                         fp_sid,
                     ))?;
@@ -758,7 +769,7 @@ impl KeystoreSecurityLevel {
         upgraded_blob: &[u8],
     ) -> Result<()> {
         let (upgraded_blob_to_be_stored, new_blob_metadata) =
-            SuperKeyManager::reencrypt_if_required(key_blob, &upgraded_blob)
+            SuperKeyManager::reencrypt_if_required(key_blob, upgraded_blob)
                 .context("In store_upgraded_keyblob: Failed to handle super encryption.")?;
 
         let mut new_blob_metadata = new_blob_metadata.unwrap_or_default();
@@ -868,10 +879,7 @@ impl KeystoreSecurityLevel {
         check_key_permission(KeyPerm::convert_storage_key_to_ephemeral(), storage_key, &None)
             .context("In convert_storage_key_to_ephemeral: Check permission")?;
 
-        let km_dev: Strong<dyn IKeyMintDevice> = self.keymint.get_interface().context(concat!(
-            "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: ",
-            "Getting keymint device interface"
-        ))?;
+        let km_dev = &self.keymint;
         match {
             let _wp = self.watch_millis(
                 concat!(
@@ -899,7 +907,7 @@ impl KeystoreSecurityLevel {
                         "In convert_storage_key_to_ephemeral: calling convertStorageKeyToEphemeral (2)",
                         500,
                     );
-                    map_km_error(km_dev.convertStorageKeyToEphemeral(key_blob))
+                    map_km_error(km_dev.convertStorageKeyToEphemeral(&upgraded_blob))
                 }
                     .context(concat!(
                         "In convert_storage_key_to_ephemeral: ",
@@ -930,14 +938,11 @@ impl KeystoreSecurityLevel {
         check_key_permission(KeyPerm::delete(), key, &None)
             .context("In IKeystoreSecurityLevel delete_key: Checking delete permissions")?;
 
-        let km_dev: Strong<dyn IKeyMintDevice> = self
-            .keymint
-            .get_interface()
-            .context("In IKeystoreSecurityLevel delete_key: Getting keymint device interface")?;
+        let km_dev = &self.keymint;
         {
             let _wp =
                 self.watch_millis("In KeystoreSecuritylevel::delete_key: calling deleteKey", 500);
-            map_km_error(km_dev.deleteKey(&key_blob)).context("In keymint device deleteKey")
+            map_km_error(km_dev.deleteKey(key_blob)).context("In keymint device deleteKey")
         }
     }
 }

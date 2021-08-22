@@ -22,7 +22,7 @@ use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
     check_grant_permission, check_key_permission, check_keystore_permission,
-    key_parameters_to_authorizations, watchdog as wd, Asp,
+    key_parameters_to_authorizations, watchdog as wd,
 };
 use crate::{
     database::Uuid,
@@ -51,7 +51,7 @@ use keystore2_selinux as selinux;
 /// Implementation of the IKeystoreService.
 #[derive(Default)]
 pub struct KeystoreService {
-    i_sec_level_by_uuid: HashMap<Uuid, Asp>,
+    i_sec_level_by_uuid: HashMap<Uuid, Strong<dyn IKeystoreSecurityLevel>>,
     uuid_by_sec_level: HashMap<SecurityLevel, Uuid>,
 }
 
@@ -68,15 +68,13 @@ impl KeystoreService {
         .context(concat!(
             "In KeystoreService::new_native_binder: ",
             "Trying to construct mandatory security level TEE."
-        ))
-        .map(|(dev, uuid)| (Asp::new(dev.as_binder()), uuid))?;
+        ))?;
         result.i_sec_level_by_uuid.insert(uuid, dev);
         result.uuid_by_sec_level.insert(SecurityLevel::TRUSTED_ENVIRONMENT, uuid);
 
         // Strongbox is optional, so we ignore errors and turn the result into an Option.
         if let Ok((dev, uuid)) =
             KeystoreSecurityLevel::new_native_binder(SecurityLevel::STRONGBOX, id_rotation_state)
-                .map(|(dev, uuid)| (Asp::new(dev.as_binder()), uuid))
         {
             result.i_sec_level_by_uuid.insert(uuid, dev);
             result.uuid_by_sec_level.insert(SecurityLevel::STRONGBOX, uuid);
@@ -107,7 +105,7 @@ impl KeystoreService {
 
     fn get_i_sec_level_by_uuid(&self, uuid: &Uuid) -> Result<Strong<dyn IKeystoreSecurityLevel>> {
         if let Some(dev) = self.i_sec_level_by_uuid.get(uuid) {
-            dev.get_interface().context("In get_i_sec_level_by_uuid.")
+            Ok(dev.clone())
         } else {
             Err(error::Error::sys())
                 .context("In get_i_sec_level_by_uuid: KeyMint instance for key not found.")
@@ -123,7 +121,7 @@ impl KeystoreService {
             .get(&sec_level)
             .and_then(|uuid| self.i_sec_level_by_uuid.get(uuid))
         {
-            dev.get_interface().context("In get_security_level.")
+            Ok(dev.clone())
         } else {
             Err(error::Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
                 .context("In get_security_level: No such security level.")
@@ -134,9 +132,9 @@ impl KeystoreService {
         let caller_uid = ThreadState::get_calling_uid();
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
-                LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
                     db.borrow_mut().load_key_entry(
-                        &key,
+                        key,
                         KeyType::Client,
                         KeyEntryLoadBits::PUBLIC,
                         caller_uid,
@@ -185,9 +183,9 @@ impl KeystoreService {
     ) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
         DB.with::<_, Result<()>>(|db| {
-            let entry = match LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+            let entry = match LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
                 db.borrow_mut().load_key_entry(
-                    &key,
+                    key,
                     KeyType::Client,
                     KeyEntryLoadBits::NONE,
                     caller_uid,
@@ -241,8 +239,13 @@ impl KeystoreService {
             check_key_permission(KeyPerm::rebind(), &key, &None)
                 .context("Caller does not have permission to insert this certificate.")?;
 
-            db.store_new_certificate(&key, certificate_chain.unwrap(), &KEYSTORE_UUID)
-                .context("Failed to insert new certificate.")?;
+            db.store_new_certificate(
+                &key,
+                KeyType::Client,
+                certificate_chain.unwrap(),
+                &KEYSTORE_UUID,
+            )
+            .context("Failed to insert new certificate.")?;
             Ok(())
         })
         .context("In update_subcomponent.")
@@ -291,7 +294,7 @@ impl KeystoreService {
             &mut DB
                 .with(|db| {
                     let mut db = db.borrow_mut();
-                    db.list(k.domain, k.nspace)
+                    db.list(k.domain, k.nspace, KeyType::Client)
                 })
                 .context("In list_entries: Trying to list keystore database.")?,
         );
@@ -304,8 +307,8 @@ impl KeystoreService {
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
         DB.with(|db| {
-            LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
-                db.borrow_mut().unbind_key(&key, KeyType::Client, caller_uid, |k, av| {
+            LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
+                db.borrow_mut().unbind_key(key, KeyType::Client, caller_uid, |k, av| {
                     check_key_permission(KeyPerm::delete(), k, &av).context("During delete_key.")
                 })
             })
@@ -322,9 +325,9 @@ impl KeystoreService {
     ) -> Result<KeyDescriptor> {
         let caller_uid = ThreadState::get_calling_uid();
         DB.with(|db| {
-            LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+            LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
                 db.borrow_mut().grant(
-                    &key,
+                    key,
                     caller_uid,
                     grantee_uid as u32,
                     access_vector,
@@ -337,7 +340,7 @@ impl KeystoreService {
 
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> Result<()> {
         DB.with(|db| {
-            db.borrow_mut().ungrant(&key, ThreadState::get_calling_uid(), grantee_uid as u32, |k| {
+            db.borrow_mut().ungrant(key, ThreadState::get_calling_uid(), grantee_uid as u32, |k| {
                 check_key_permission(KeyPerm::grant(), k, &None)
             })
         })

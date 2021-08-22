@@ -42,22 +42,23 @@
 //! callbacks.
 
 mod perboot;
+pub(crate) mod utils;
+mod versioning;
 
 use crate::impl_metadata; // This is in db_utils.rs
 use crate::key_parameter::{KeyParameter, Tag};
+use crate::metrics_store::log_rkp_error_stats;
 use crate::permission::KeyPermSet;
 use crate::utils::{get_current_time_in_milliseconds, watchdog as wd, AID_USER_OFFSET};
-use crate::{
-    db_utils::{self, SqlField},
-    gc::Gc,
-    super_key::USER_SUPER_KEY,
-};
 use crate::{
     error::{Error as KsError, ErrorCode, ResponseCode},
     super_key::SuperKeyType,
 };
+use crate::{gc::Gc, super_key::USER_SUPER_KEY};
 use anyhow::{anyhow, Context, Result};
 use std::{convert::TryFrom, convert::TryInto, ops::Deref, time::SystemTimeError};
+use utils as db_utils;
+use utils::SqlField;
 
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     HardwareAuthToken::HardwareAuthToken,
@@ -69,8 +70,10 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 use android_security_remoteprovisioning::aidl::android::security::remoteprovisioning::{
     AttestationPoolStatus::AttestationPoolStatus,
 };
-use statslog_rust::keystore2_storage_stats::{
-	Keystore2StorageStats, StorageType as StatsdStorageType,
+use android_security_metrics::aidl::android::security::metrics::{
+    StorageStats::StorageStats,
+    Storage::Storage as MetricsStorage,
+    RkpError::RkpError as MetricsRkpError,
 };
 
 use keystore2_crypto::ZVec;
@@ -79,7 +82,7 @@ use log::error;
 #[cfg(not(test))]
 use rand::prelude::random;
 use rusqlite::{
-    params,
+    params, params_from_iter,
     types::FromSql,
     types::FromSqlResult,
     types::ToSqlOutput,
@@ -139,7 +142,7 @@ impl KeyMetaData {
             let db_tag: i64 = row.get(0).context("Failed to read tag.")?;
             metadata.insert(
                 db_tag,
-                KeyMetaEntry::new_from_sql(db_tag, &SqlField::new(1, &row))
+                KeyMetaEntry::new_from_sql(db_tag, &SqlField::new(1, row))
                     .context("Failed to read KeyMetaEntry.")?,
             );
             Ok(())
@@ -214,7 +217,7 @@ impl BlobMetaData {
             let db_tag: i64 = row.get(0).context("Failed to read tag.")?;
             metadata.insert(
                 db_tag,
-                BlobMetaEntry::new_from_sql(db_tag, &SqlField::new(1, &row))
+                BlobMetaEntry::new_from_sql(db_tag, &SqlField::new(1, row))
                     .context("Failed to read BlobMetaEntry.")?,
             );
             Ok(())
@@ -385,12 +388,12 @@ impl DateTime {
     }
 
     /// Returns unix epoch time in milliseconds.
-    pub fn to_millis_epoch(&self) -> i64 {
+    pub fn to_millis_epoch(self) -> i64 {
         self.0
     }
 
     /// Returns unix epoch time in seconds.
-    pub fn to_secs_epoch(&self) -> i64 {
+    pub fn to_secs_epoch(self) -> i64 {
         self.0 / 1000
     }
 }
@@ -825,23 +828,11 @@ pub struct PerBootDbKeepAlive(Connection);
 
 impl KeystoreDB {
     const UNASSIGNED_KEY_ID: i64 = -1i64;
+    const CURRENT_DB_VERSION: u32 = 1;
+    const UPGRADERS: &'static [fn(&Transaction) -> Result<u32>] = &[Self::from_0_to_1];
 
     /// Name of the file that holds the cross-boot persistent database.
-    pub const PERSISTENT_DB_FILENAME: &'static str = &"persistent.sqlite";
-
-    /// Set write-ahead logging mode on the persistent database found in `db_root`.
-    pub fn set_wal_mode(db_root: &Path) -> Result<()> {
-        let path = Self::make_persistent_path(&db_root)?;
-        let conn =
-            Connection::open(path).context("In KeystoreDB::set_wal_mode: Failed to open DB")?;
-        let mode: String = conn
-            .pragma_update_and_check(None, "journal_mode", &"WAL", |row| row.get(0))
-            .context("In KeystoreDB::set_wal_mode: Failed to set journal_mode")?;
-        match mode.as_str() {
-            "wal" => Ok(()),
-            _ => Err(anyhow!("Unable to set WAL mode, db is still in {} mode.", mode)),
-        }
-    }
+    pub const PERSISTENT_DB_FILENAME: &'static str = "persistent.sqlite";
 
     /// This will create a new database connection connecting the two
     /// files persistent.sqlite and perboot.sqlite in the given directory.
@@ -851,14 +842,36 @@ impl KeystoreDB {
     pub fn new(db_root: &Path, gc: Option<Arc<Gc>>) -> Result<Self> {
         let _wp = wd::watch_millis("KeystoreDB::new", 500);
 
-        let persistent_path = Self::make_persistent_path(&db_root)?;
+        let persistent_path = Self::make_persistent_path(db_root)?;
         let conn = Self::make_connection(&persistent_path)?;
 
         let mut db = Self { conn, gc, perboot: perboot::PERBOOT_DB.clone() };
         db.with_transaction(TransactionBehavior::Immediate, |tx| {
+            versioning::upgrade_database(tx, Self::CURRENT_DB_VERSION, Self::UPGRADERS)
+                .context("In KeystoreDB::new: trying to upgrade database.")?;
             Self::init_tables(tx).context("Trying to initialize tables.").no_gc()
         })?;
         Ok(db)
+    }
+
+    // This upgrade function deletes all MAX_BOOT_LEVEL keys, that were generated before
+    // cryptographic binding to the boot level keys was implemented.
+    fn from_0_to_1(tx: &Transaction) -> Result<u32> {
+        tx.execute(
+            "UPDATE persistent.keyentry SET state = ?
+             WHERE
+                 id IN (SELECT keyentryid FROM persistent.keyparameter WHERE tag = ?)
+             AND
+                 id NOT IN (
+                     SELECT keyentryid FROM persistent.blobentry
+                     WHERE id IN (
+                         SELECT blobentryid FROM persistent.blobmetadata WHERE tag = ?
+                     )
+                 );",
+            params![KeyLifeCycle::Unreferenced, Tag::MAX_BOOT_LEVEL.0, BlobMetaData::MaxBootLevel],
+        )
+        .context("In from_0_to_1: Failed to delete logical boot level keys.")?;
+        Ok(1)
     }
 
     fn init_tables(tx: &Transaction) -> Result<()> {
@@ -1011,23 +1024,23 @@ impl KeystoreDB {
 
     fn do_table_size_query(
         &mut self,
-        storage_type: StatsdStorageType,
+        storage_type: MetricsStorage,
         query: &str,
         params: &[&str],
-    ) -> Result<Keystore2StorageStats> {
+    ) -> Result<StorageStats> {
         let (total, unused) = self.with_transaction(TransactionBehavior::Deferred, |tx| {
-            tx.query_row(query, params, |row| Ok((row.get(0)?, row.get(1)?)))
+            tx.query_row(query, params_from_iter(params), |row| Ok((row.get(0)?, row.get(1)?)))
                 .with_context(|| {
-                    format!("get_storage_stat: Error size of storage type {}", storage_type as i32)
+                    format!("get_storage_stat: Error size of storage type {}", storage_type.0)
                 })
                 .no_gc()
         })?;
-        Ok(Keystore2StorageStats { storage_type, size: total, unused_size: unused })
+        Ok(StorageStats { storage_type, size: total, unused_size: unused })
     }
 
-    fn get_total_size(&mut self) -> Result<Keystore2StorageStats> {
+    fn get_total_size(&mut self) -> Result<StorageStats> {
         self.do_table_size_query(
-            StatsdStorageType::Database,
+            MetricsStorage::DATABASE,
             "SELECT page_count * page_size, freelist_count * page_size
              FROM pragma_page_count('persistent'),
                   pragma_page_size('persistent'),
@@ -1038,10 +1051,10 @@ impl KeystoreDB {
 
     fn get_table_size(
         &mut self,
-        storage_type: StatsdStorageType,
+        storage_type: MetricsStorage,
         schema: &str,
         table: &str,
-    ) -> Result<Keystore2StorageStats> {
+    ) -> Result<StorageStats> {
         self.do_table_size_query(
             storage_type,
             "SELECT pgsize,unused FROM dbstat(?1)
@@ -1053,63 +1066,57 @@ impl KeystoreDB {
     /// Fetches a storage statisitics atom for a given storage type. For storage
     /// types that map to a table, information about the table's storage is
     /// returned. Requests for storage types that are not DB tables return None.
-    pub fn get_storage_stat(
-        &mut self,
-        storage_type: StatsdStorageType,
-    ) -> Result<Keystore2StorageStats> {
+    pub fn get_storage_stat(&mut self, storage_type: MetricsStorage) -> Result<StorageStats> {
         let _wp = wd::watch_millis("KeystoreDB::get_storage_stat", 500);
 
         match storage_type {
-            StatsdStorageType::Database => self.get_total_size(),
-            StatsdStorageType::KeyEntry => {
+            MetricsStorage::DATABASE => self.get_total_size(),
+            MetricsStorage::KEY_ENTRY => {
                 self.get_table_size(storage_type, "persistent", "keyentry")
             }
-            StatsdStorageType::KeyEntryIdIndex => {
+            MetricsStorage::KEY_ENTRY_ID_INDEX => {
                 self.get_table_size(storage_type, "persistent", "keyentry_id_index")
             }
-            StatsdStorageType::KeyEntryDomainNamespaceIndex => {
+            MetricsStorage::KEY_ENTRY_DOMAIN_NAMESPACE_INDEX => {
                 self.get_table_size(storage_type, "persistent", "keyentry_domain_namespace_index")
             }
-            StatsdStorageType::BlobEntry => {
+            MetricsStorage::BLOB_ENTRY => {
                 self.get_table_size(storage_type, "persistent", "blobentry")
             }
-            StatsdStorageType::BlobEntryKeyEntryIdIndex => {
+            MetricsStorage::BLOB_ENTRY_KEY_ENTRY_ID_INDEX => {
                 self.get_table_size(storage_type, "persistent", "blobentry_keyentryid_index")
             }
-            StatsdStorageType::KeyParameter => {
+            MetricsStorage::KEY_PARAMETER => {
                 self.get_table_size(storage_type, "persistent", "keyparameter")
             }
-            StatsdStorageType::KeyParameterKeyEntryIdIndex => {
+            MetricsStorage::KEY_PARAMETER_KEY_ENTRY_ID_INDEX => {
                 self.get_table_size(storage_type, "persistent", "keyparameter_keyentryid_index")
             }
-            StatsdStorageType::KeyMetadata => {
+            MetricsStorage::KEY_METADATA => {
                 self.get_table_size(storage_type, "persistent", "keymetadata")
             }
-            StatsdStorageType::KeyMetadataKeyEntryIdIndex => {
+            MetricsStorage::KEY_METADATA_KEY_ENTRY_ID_INDEX => {
                 self.get_table_size(storage_type, "persistent", "keymetadata_keyentryid_index")
             }
-            StatsdStorageType::Grant => self.get_table_size(storage_type, "persistent", "grant"),
-            StatsdStorageType::AuthToken => {
+            MetricsStorage::GRANT => self.get_table_size(storage_type, "persistent", "grant"),
+            MetricsStorage::AUTH_TOKEN => {
                 // Since the table is actually a BTreeMap now, unused_size is not meaningfully
                 // reportable
                 // Size provided is only an approximation
-                Ok(Keystore2StorageStats {
+                Ok(StorageStats {
                     storage_type,
                     size: (self.perboot.auth_tokens_len() * std::mem::size_of::<AuthTokenEntry>())
-                        as i64,
+                        as i32,
                     unused_size: 0,
                 })
             }
-            StatsdStorageType::BlobMetadata => {
+            MetricsStorage::BLOB_METADATA => {
                 self.get_table_size(storage_type, "persistent", "blobmetadata")
             }
-            StatsdStorageType::BlobMetadataBlobEntryIdIndex => {
+            MetricsStorage::BLOB_METADATA_BLOB_ENTRY_ID_INDEX => {
                 self.get_table_size(storage_type, "persistent", "blobmetadata_blobentryid_index")
             }
-            _ => Err(anyhow::Error::msg(format!(
-                "Unsupported storage type: {}",
-                storage_type as i32
-            ))),
+            _ => Err(anyhow::Error::msg(format!("Unsupported storage type: {}", storage_type.0))),
         }
     }
 
@@ -1237,7 +1244,7 @@ impl KeystoreDB {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             let key_descriptor =
                 KeyDescriptor { domain, nspace, alias: Some(alias.to_string()), blob: None };
-            let result = Self::load_key_entry_id(&tx, &key_descriptor, key_type);
+            let result = Self::load_key_entry_id(tx, &key_descriptor, key_type);
             match result {
                 Ok(_) => Ok(true),
                 Err(error) => match error.root_cause().downcast_ref::<KsError>() {
@@ -1283,7 +1290,7 @@ impl KeystoreDB {
             key_metadata.store_in_db(key_id, tx).context("KeyMetaData::store_in_db failed")?;
 
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id,
                 SubComponentType::KEY_BLOB,
                 Some(blob),
@@ -1313,10 +1320,10 @@ impl KeystoreDB {
                 alias: Some(key_type.alias.into()),
                 blob: None,
             };
-            let id = Self::load_key_entry_id(&tx, &key_descriptor, KeyType::Super);
+            let id = Self::load_key_entry_id(tx, &key_descriptor, KeyType::Super);
             match id {
                 Ok(id) => {
-                    let key_entry = Self::load_key_components(&tx, KeyEntryLoadBits::KM, id)
+                    let key_entry = Self::load_key_components(tx, KeyEntryLoadBits::KM, id)
                         .context("In load_super_key. Failed to load key entry.")?;
                     Ok(Some((KEY_ID_LOCK.get(id), key_entry)))
                 }
@@ -1376,7 +1383,7 @@ impl KeystoreDB {
             let (id, entry) = match id {
                 Some(id) => (
                     id,
-                    Self::load_key_components(&tx, KeyEntryLoadBits::KM, id)
+                    Self::load_key_components(tx, KeyEntryLoadBits::KM, id)
                         .context("In get_or_create_key_with.")?,
                 ),
 
@@ -1402,7 +1409,7 @@ impl KeystoreDB {
                     let (blob, metadata) =
                         create_new_key().context("In get_or_create_key_with.")?;
                     Self::set_blob_internal(
-                        &tx,
+                        tx,
                         id,
                         SubComponentType::KEY_BLOB,
                         Some(&blob),
@@ -1481,12 +1488,13 @@ impl KeystoreDB {
         &mut self,
         domain: &Domain,
         namespace: &i64,
+        key_type: KeyType,
         km_uuid: &Uuid,
     ) -> Result<KeyIdGuard> {
         let _wp = wd::watch_millis("KeystoreDB::create_key_entry", 500);
 
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            Self::create_key_entry_internal(tx, domain, namespace, km_uuid).no_gc()
+            Self::create_key_entry_internal(tx, domain, namespace, key_type, km_uuid).no_gc()
         })
         .context("In create_key_entry.")
     }
@@ -1495,6 +1503,7 @@ impl KeystoreDB {
         tx: &Transaction,
         domain: &Domain,
         namespace: &i64,
+        key_type: KeyType,
         km_uuid: &Uuid,
     ) -> Result<KeyIdGuard> {
         match *domain {
@@ -1512,7 +1521,7 @@ impl KeystoreDB {
                      VALUES(?, ?, ?, ?, NULL, ?, ?);",
                     params![
                         id,
-                        KeyType::Client,
+                        key_type,
                         domain.0 as u32,
                         *namespace,
                         KeyLifeCycle::Existing,
@@ -1551,7 +1560,7 @@ impl KeystoreDB {
                 .context("In create_key_entry")?,
             );
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id.0,
                 SubComponentType::KEY_BLOB,
                 Some(private_key),
@@ -1560,7 +1569,7 @@ impl KeystoreDB {
             let mut metadata = KeyMetaData::new();
             metadata.add(KeyMetaEntry::AttestationMacedPublicKey(maced_public_key.to_vec()));
             metadata.add(KeyMetaEntry::AttestationRawPubKey(raw_public_key.to_vec()));
-            metadata.store_in_db(key_id.0, &tx)?;
+            metadata.store_in_db(key_id.0, tx)?;
             Ok(()).no_gc()
         })
         .context("In create_attestation_key_entry")
@@ -1583,7 +1592,7 @@ impl KeystoreDB {
         let _wp = wd::watch_millis("KeystoreDB::set_blob", 500);
 
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            Self::set_blob_internal(&tx, key_id.0, sc_type, blob, blob_metadata).need_gc()
+            Self::set_blob_internal(tx, key_id.0, sc_type, blob, blob_metadata).need_gc()
         })
         .context("In set_blob.")
     }
@@ -1597,7 +1606,7 @@ impl KeystoreDB {
 
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             Self::set_blob_internal(
-                &tx,
+                tx,
                 Self::UNASSIGNED_KEY_ID,
                 SubComponentType::KEY_BLOB,
                 Some(blob),
@@ -1690,7 +1699,7 @@ impl KeystoreDB {
     #[cfg(test)]
     fn insert_key_metadata(&mut self, key_id: &KeyIdGuard, metadata: &KeyMetaData) -> Result<()> {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            metadata.store_in_db(key_id.0, &tx).no_gc()
+            metadata.store_in_db(key_id.0, tx).no_gc()
         })
         .context("In insert_key_metadata.")
     }
@@ -1752,16 +1761,16 @@ impl KeystoreDB {
             metadata.add(KeyMetaEntry::AttestationExpirationDate(DateTime::from_millis_epoch(
                 expiration_date,
             )));
-            metadata.store_in_db(key_id, &tx).context("Failed to insert key metadata.")?;
+            metadata.store_in_db(key_id, tx).context("Failed to insert key metadata.")?;
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id,
                 SubComponentType::CERT_CHAIN,
                 Some(cert_chain),
                 None,
             )
             .context("Failed to insert cert chain")?;
-            Self::set_blob_internal(&tx, key_id, SubComponentType::CERT, Some(batch_cert), None)
+            Self::set_blob_internal(tx, key_id, SubComponentType::CERT, Some(batch_cert), None)
                 .context("Failed to insert cert")?;
             Ok(()).no_gc()
         })
@@ -1822,6 +1831,7 @@ impl KeystoreDB {
                 )
                 .context("Failed to assign attestation key")?;
             if result == 0 {
+                log_rkp_error_stats(MetricsRkpError::OUT_OF_KEYS);
                 return Err(KsError::Rc(ResponseCode::OUT_OF_KEYS)).context("Out of keys.");
             } else if result > 1 {
                 return Err(KsError::sys())
@@ -1904,7 +1914,7 @@ impl KeystoreDB {
             );
             let mut num_deleted = 0;
             for id in key_ids_to_check.iter().filter(|kt| kt.1 < curr_time).map(|kt| kt.0) {
-                if Self::mark_unreferenced(&tx, id)? {
+                if Self::mark_unreferenced(tx, id)? {
                     num_deleted += 1;
                 }
             }
@@ -1931,7 +1941,7 @@ impl KeystoreDB {
                 .context("Failed to execute statement")?;
             let num_deleted = keys_to_delete
                 .iter()
-                .map(|id| Self::mark_unreferenced(&tx, *id))
+                .map(|id| Self::mark_unreferenced(tx, *id))
                 .collect::<Result<Vec<bool>>>()
                 .context("Failed to execute mark_unreferenced on a keyid")?
                 .into_iter()
@@ -2103,6 +2113,7 @@ impl KeystoreDB {
         alias: &str,
         domain: &Domain,
         namespace: &i64,
+        key_type: KeyType,
     ) -> Result<bool> {
         match *domain {
             Domain::APP | Domain::SELINUX => {}
@@ -2117,15 +2128,15 @@ impl KeystoreDB {
             .execute(
                 "UPDATE persistent.keyentry
                  SET alias = NULL, domain = NULL, namespace = NULL, state = ?
-                 WHERE alias = ? AND domain = ? AND namespace = ?;",
-                params![KeyLifeCycle::Unreferenced, alias, domain.0 as u32, namespace],
+                 WHERE alias = ? AND domain = ? AND namespace = ? AND key_type = ?;",
+                params![KeyLifeCycle::Unreferenced, alias, domain.0 as u32, namespace, key_type],
             )
             .context("In rebind_alias: Failed to rebind existing entry.")?;
         let result = tx
             .execute(
                 "UPDATE persistent.keyentry
                     SET alias = ?, state = ?
-                    WHERE id = ? AND domain = ? AND namespace = ? AND state = ?;",
+                    WHERE id = ? AND domain = ? AND namespace = ? AND state = ? AND key_type = ?;",
                 params![
                     alias,
                     KeyLifeCycle::Live,
@@ -2133,6 +2144,7 @@ impl KeystoreDB {
                     domain.0 as u32,
                     *namespace,
                     KeyLifeCycle::Existing,
+                    key_type,
                 ],
             )
             .context("In rebind_alias: Failed to set alias.")?;
@@ -2215,9 +2227,11 @@ impl KeystoreDB {
     /// fields, and rebinds the given alias to the new key.
     /// The boolean returned is a hint for the garbage collector. If true, a key was replaced,
     /// is now unreferenced and needs to be collected.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_new_key(
         &mut self,
         key: &KeyDescriptor,
+        key_type: KeyType,
         params: &[KeyParameter],
         blob_info: &(&[u8], &BlobMetaData),
         cert_info: &CertificateInfo,
@@ -2237,7 +2251,7 @@ impl KeystoreDB {
             }
         };
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            let key_id = Self::create_key_entry_internal(tx, &domain, namespace, km_uuid)
+            let key_id = Self::create_key_entry_internal(tx, &domain, namespace, key_type, km_uuid)
                 .context("Trying to create new key entry.")?;
             let (blob, blob_metadata) = *blob_info;
             Self::set_blob_internal(
@@ -2245,11 +2259,11 @@ impl KeystoreDB {
                 key_id.id(),
                 SubComponentType::KEY_BLOB,
                 Some(blob),
-                Some(&blob_metadata),
+                Some(blob_metadata),
             )
             .context("Trying to insert the key blob.")?;
             if let Some(cert) = &cert_info.cert {
-                Self::set_blob_internal(tx, key_id.id(), SubComponentType::CERT, Some(&cert), None)
+                Self::set_blob_internal(tx, key_id.id(), SubComponentType::CERT, Some(cert), None)
                     .context("Trying to insert the certificate.")?;
             }
             if let Some(cert_chain) = &cert_info.cert_chain {
@@ -2257,7 +2271,7 @@ impl KeystoreDB {
                     tx,
                     key_id.id(),
                     SubComponentType::CERT_CHAIN,
-                    Some(&cert_chain),
+                    Some(cert_chain),
                     None,
                 )
                 .context("Trying to insert the certificate chain.")?;
@@ -2265,7 +2279,7 @@ impl KeystoreDB {
             Self::insert_keyparameter_internal(tx, &key_id, params)
                 .context("Trying to insert key parameters.")?;
             metadata.store_in_db(key_id.id(), tx).context("Trying to insert key metadata.")?;
-            let need_gc = Self::rebind_alias(tx, &key_id, &alias, &domain, namespace)
+            let need_gc = Self::rebind_alias(tx, &key_id, alias, &domain, namespace, key_type)
                 .context("Trying to rebind alias.")?;
             Ok(key_id).do_gc(need_gc)
         })
@@ -2278,6 +2292,7 @@ impl KeystoreDB {
     pub fn store_new_certificate(
         &mut self,
         key: &KeyDescriptor,
+        key_type: KeyType,
         cert: &[u8],
         km_uuid: &Uuid,
     ) -> Result<KeyIdGuard> {
@@ -2295,7 +2310,7 @@ impl KeystoreDB {
             }
         };
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            let key_id = Self::create_key_entry_internal(tx, &domain, namespace, km_uuid)
+            let key_id = Self::create_key_entry_internal(tx, &domain, namespace, key_type, km_uuid)
                 .context("Trying to create new key entry.")?;
 
             Self::set_blob_internal(
@@ -2314,7 +2329,7 @@ impl KeystoreDB {
 
             metadata.store_in_db(key_id.id(), tx).context("Trying to insert key metadata.")?;
 
-            let need_gc = Self::rebind_alias(tx, &key_id, &alias, &domain, namespace)
+            let need_gc = Self::rebind_alias(tx, &key_id, alias, &domain, namespace, key_type)
                 .context("Trying to rebind alias.")?;
             Ok(key_id).do_gc(need_gc)
         })
@@ -2383,7 +2398,7 @@ impl KeystoreDB {
                 if access_key.domain == Domain::APP {
                     access_key.nspace = caller_uid as i64;
                 }
-                let key_id = Self::load_key_entry_id(&tx, &access_key, key_type)
+                let key_id = Self::load_key_entry_id(tx, &access_key, key_type)
                     .with_context(|| format!("With key.domain = {:?}.", access_key.domain))?;
 
                 Ok((key_id, access_key, None))
@@ -2548,7 +2563,7 @@ impl KeystoreDB {
             let tag = Tag(row.get(0).context("Failed to read tag.")?);
             let sec_level = SecurityLevel(row.get(2).context("Failed to read sec_level.")?);
             parameters.push(
-                KeyParameter::new_from_sql(tag, &SqlField::new(1, &row), sec_level)
+                KeyParameter::new_from_sql(tag, &SqlField::new(1, row), sec_level)
                     .context("Failed to read KeyParameter.")?,
             );
             Ok(())
@@ -2926,7 +2941,7 @@ impl KeystoreDB {
                         }
                     }
                 }
-                notify_gc = Self::mark_unreferenced(&tx, key_id)
+                notify_gc = Self::mark_unreferenced(tx, key_id)
                     .context("In unbind_keys_for_user.")?
                     || notify_gc;
             }
@@ -2940,16 +2955,15 @@ impl KeystoreDB {
         load_bits: KeyEntryLoadBits,
         key_id: i64,
     ) -> Result<KeyEntry> {
-        let metadata = KeyMetaData::load_from_db(key_id, &tx).context("In load_key_components.")?;
+        let metadata = KeyMetaData::load_from_db(key_id, tx).context("In load_key_components.")?;
 
         let (has_km_blob, key_blob_info, cert_blob, cert_chain_blob) =
-            Self::load_blob_components(key_id, load_bits, &tx)
-                .context("In load_key_components.")?;
+            Self::load_blob_components(key_id, load_bits, tx).context("In load_key_components.")?;
 
-        let parameters = Self::load_key_parameters(key_id, &tx)
+        let parameters = Self::load_key_parameters(key_id, tx)
             .context("In load_key_components: Trying to load key parameters.")?;
 
-        let km_uuid = Self::get_key_km_uuid(&tx, key_id)
+        let km_uuid = Self::get_key_km_uuid(tx, key_id)
             .context("In load_key_components: Trying to get KM uuid.")?;
 
         Ok(KeyEntry {
@@ -2967,19 +2981,28 @@ impl KeystoreDB {
     /// Returns a list of KeyDescriptors in the selected domain/namespace.
     /// The key descriptors will have the domain, nspace, and alias field set.
     /// Domain must be APP or SELINUX, the caller must make sure of that.
-    pub fn list(&mut self, domain: Domain, namespace: i64) -> Result<Vec<KeyDescriptor>> {
+    pub fn list(
+        &mut self,
+        domain: Domain,
+        namespace: i64,
+        key_type: KeyType,
+    ) -> Result<Vec<KeyDescriptor>> {
         let _wp = wd::watch_millis("KeystoreDB::list", 500);
 
         self.with_transaction(TransactionBehavior::Deferred, |tx| {
             let mut stmt = tx
                 .prepare(
                     "SELECT alias FROM persistent.keyentry
-             WHERE domain = ? AND namespace = ? AND alias IS NOT NULL AND state = ?;",
+                     WHERE domain = ?
+                     AND namespace = ?
+                     AND alias IS NOT NULL
+                     AND state = ?
+                     AND key_type = ?;",
                 )
                 .context("In list: Failed to prepare.")?;
 
             let mut rows = stmt
-                .query(params![domain.0 as u32, namespace, KeyLifeCycle::Live])
+                .query(params![domain.0 as u32, namespace, KeyLifeCycle::Live, key_type])
                 .context("In list: Failed to query.")?;
 
             let mut descriptors: Vec<KeyDescriptor> = Vec::new();
@@ -3024,7 +3047,7 @@ impl KeystoreDB {
             // But even if we load the access tuple by grant here, the permission
             // check denies the attempt to create a grant by grant descriptor.
             let (key_id, access_key_descriptor, _) =
-                Self::load_access_tuple(&tx, key, KeyType::Client, caller_uid)
+                Self::load_access_tuple(tx, key, KeyType::Client, caller_uid)
                     .context("In grant")?;
 
             // Perform access control. It is vital that we return here if the permission
@@ -3084,7 +3107,7 @@ impl KeystoreDB {
             // Load the key_id and complete the access control tuple.
             // We ignore the access vector here because grants cannot be granted.
             let (key_id, access_key_descriptor, _) =
-                Self::load_access_tuple(&tx, key, KeyType::Client, caller_uid)
+                Self::load_access_tuple(tx, key, KeyType::Client, caller_uid)
                     .context("In ungrant.")?;
 
             // Perform access control. We must return here if the permission
@@ -3159,6 +3182,30 @@ impl KeystoreDB {
     fn get_last_off_body(&self) -> MonotonicRawTime {
         self.perboot.get_last_off_body()
     }
+
+    /// Load descriptor of a key by key id
+    pub fn load_key_descriptor(&mut self, key_id: i64) -> Result<Option<KeyDescriptor>> {
+        let _wp = wd::watch_millis("KeystoreDB::load_key_descriptor", 500);
+
+        self.with_transaction(TransactionBehavior::Deferred, |tx| {
+            tx.query_row(
+                "SELECT domain, namespace, alias FROM persistent.keyentry WHERE id = ?;",
+                params![key_id],
+                |row| {
+                    Ok(KeyDescriptor {
+                        domain: Domain(row.get(0)?),
+                        nspace: row.get(1)?,
+                        alias: row.get(2)?,
+                        blob: None,
+                    })
+                },
+            )
+            .optional()
+            .context("Trying to load key descriptor")
+            .no_gc()
+        })
+        .context("In load_key_descriptor.")
+    }
 }
 
 #[cfg(test)]
@@ -3180,7 +3227,6 @@ mod tests {
     use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
         Timestamp::Timestamp,
     };
-    use rusqlite::DatabaseName::Attached;
     use rusqlite::NO_PARAMS;
     use rusqlite::TransactionBehavior;
     use std::cell::RefCell;
@@ -3223,7 +3269,7 @@ mod tests {
         namespace: i64,
     ) -> Result<bool> {
         db.with_transaction(TransactionBehavior::Immediate, |tx| {
-            KeystoreDB::rebind_alias(tx, newid, alias, &domain, &namespace).no_gc()
+            KeystoreDB::rebind_alias(tx, newid, alias, &domain, &namespace, KeyType::Client).no_gc()
         })
         .context("In rebind_alias.")
     }
@@ -3347,7 +3393,7 @@ mod tests {
         let temp_dir = TempDir::new("persistent_db_test")?;
         let mut db = KeystoreDB::new(temp_dir.path(), None)?;
 
-        db.create_key_entry(&Domain::APP, &100, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::APP, &100, KeyType::Client, &KEYSTORE_UUID)?;
         let entries = get_keyentry(&db)?;
         assert_eq!(entries.len(), 1);
 
@@ -3366,8 +3412,8 @@ mod tests {
 
         let mut db = new_test_db()?;
 
-        db.create_key_entry(&Domain::APP, &100, &KEYSTORE_UUID)?;
-        db.create_key_entry(&Domain::SELINUX, &101, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::APP, &100, KeyType::Client, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::SELINUX, &101, KeyType::Client, &KEYSTORE_UUID)?;
 
         let entries = get_keyentry(&db)?;
         assert_eq!(entries.len(), 2);
@@ -3376,15 +3422,15 @@ mod tests {
 
         // Test that we must pass in a valid Domain.
         check_result_is_error_containing_string(
-            db.create_key_entry(&Domain::GRANT, &102, &KEYSTORE_UUID),
+            db.create_key_entry(&Domain::GRANT, &102, KeyType::Client, &KEYSTORE_UUID),
             "Domain Domain(1) must be either App or SELinux.",
         );
         check_result_is_error_containing_string(
-            db.create_key_entry(&Domain::BLOB, &103, &KEYSTORE_UUID),
+            db.create_key_entry(&Domain::BLOB, &103, KeyType::Client, &KEYSTORE_UUID),
             "Domain Domain(3) must be either App or SELinux.",
         );
         check_result_is_error_containing_string(
-            db.create_key_entry(&Domain::KEY_ID, &104, &KEYSTORE_UUID),
+            db.create_key_entry(&Domain::KEY_ID, &104, KeyType::Client, &KEYSTORE_UUID),
             "Domain Domain(4) must be either App or SELinux.",
         );
 
@@ -3419,7 +3465,7 @@ mod tests {
             load_attestation_key_pool(&mut db, expiration_date, namespace, base_byte)?;
         let chain =
             db.retrieve_attestation_key_and_cert_chain(Domain::APP, namespace, &KEYSTORE_UUID)?;
-        assert_eq!(true, chain.is_some());
+        assert!(chain.is_some());
         let cert_chain = chain.unwrap();
         assert_eq!(cert_chain.private_key.to_vec(), loaded_values.priv_key);
         assert_eq!(cert_chain.batch_cert, loaded_values.batch_cert);
@@ -3552,7 +3598,7 @@ mod tests {
         let mut db = new_test_db()?;
         load_attestation_key_pool(&mut db, 45 /* expiration */, 1 /* namespace */, 0x02)?;
         load_attestation_key_pool(&mut db, 80 /* expiration */, 2 /* namespace */, 0x03)?;
-        db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::APP, &42, KeyType::Client, &KEYSTORE_UUID)?;
         let result = db.delete_all_attestation_keys()?;
 
         // Give the garbage collector half a second to catch up.
@@ -3573,8 +3619,8 @@ mod tests {
         }
 
         let mut db = new_test_db()?;
-        db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
-        db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::APP, &42, KeyType::Client, &KEYSTORE_UUID)?;
+        db.create_key_entry(&Domain::APP, &42, KeyType::Client, &KEYSTORE_UUID)?;
         let entries = get_keyentry(&db)?;
         assert_eq!(entries.len(), 2);
         assert_eq!(
@@ -3910,6 +3956,7 @@ mod tests {
                 alias: Some(TEST_ALIAS.to_string()),
                 blob: None,
             },
+            KeyType::Client,
             TEST_CERT_BLOB,
             &KEYSTORE_UUID,
         )
@@ -4261,8 +4308,8 @@ mod tests {
         let mut db = new_test_db()?;
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4330,8 +4377,8 @@ mod tests {
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
         const DESTINATION_NAMESPACE: i64 = 1000i64;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4398,8 +4445,8 @@ mod tests {
         let mut db = new_test_db()?;
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4427,6 +4474,152 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_upgrade_0_to_1() {
+        const ALIAS1: &str = "test_upgrade_0_to_1_1";
+        const ALIAS2: &str = "test_upgrade_0_to_1_2";
+        const ALIAS3: &str = "test_upgrade_0_to_1_3";
+        const UID: u32 = 33;
+        let temp_dir = Arc::new(TempDir::new("test_upgrade_0_to_1").unwrap());
+        let mut db = KeystoreDB::new(temp_dir.path(), None).unwrap();
+        let key_id_untouched1 =
+            make_test_key_entry(&mut db, Domain::APP, UID as i64, ALIAS1, None).unwrap().id();
+        let key_id_untouched2 =
+            make_bootlevel_key_entry(&mut db, Domain::APP, UID as i64, ALIAS2, false).unwrap().id();
+        let key_id_deleted =
+            make_bootlevel_key_entry(&mut db, Domain::APP, UID as i64, ALIAS3, true).unwrap().id();
+
+        let (_, key_entry) = db
+            .load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS1.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(key_entry, make_test_key_entry_test_vector(key_id_untouched1, None));
+        let (_, key_entry) = db
+            .load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS2.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(key_entry, make_bootlevel_test_key_entry_test_vector(key_id_untouched2, false));
+        let (_, key_entry) = db
+            .load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS3.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(key_entry, make_bootlevel_test_key_entry_test_vector(key_id_deleted, true));
+
+        db.with_transaction(TransactionBehavior::Immediate, |tx| {
+            KeystoreDB::from_0_to_1(tx).no_gc()
+        })
+        .unwrap();
+
+        let (_, key_entry) = db
+            .load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS1.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(key_entry, make_test_key_entry_test_vector(key_id_untouched1, None));
+        let (_, key_entry) = db
+            .load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS2.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(key_entry, make_bootlevel_test_key_entry_test_vector(key_id_untouched2, false));
+        assert_eq!(
+            Some(&KsError::Rc(ResponseCode::KEY_NOT_FOUND)),
+            db.load_key_entry(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some(ALIAS3.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+                KeyEntryLoadBits::BOTH,
+                UID,
+                |k, av| {
+                    assert_eq!(Domain::APP, k.domain);
+                    assert_eq!(UID as i64, k.nspace);
+                    assert!(av.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .root_cause()
+            .downcast_ref::<KsError>()
+        );
     }
 
     static KEY_LOCK_TEST_ALIAS: &str = "my super duper locked key";
@@ -4547,8 +4740,9 @@ mod tests {
 
         let test_begin = Instant::now();
 
-        let mut db = KeystoreDB::new(temp_dir.path()).expect("Failed to open database.");
         const KEY_COUNT: u32 = 500u32;
+        let mut db =
+            new_test_db_with_gc(temp_dir.path(), |_, _| Ok(())).expect("Failed to open database.");
         const OPEN_DB_COUNT: u32 = 50u32;
 
         let mut actual_key_count = KEY_COUNT;
@@ -4566,7 +4760,8 @@ mod tests {
         // Insert more keys from a different thread and into a different namespace.
         let temp_dir1 = temp_dir.clone();
         let handle1 = thread::spawn(move || {
-            let mut db = KeystoreDB::new(temp_dir1.path()).expect("Failed to open database.");
+            let mut db = new_test_db_with_gc(temp_dir1.path(), |_, _| Ok(()))
+                .expect("Failed to open database.");
 
             for count in 0..actual_key_count {
                 if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
@@ -4595,7 +4790,8 @@ mod tests {
         // And start unbinding the first set of keys.
         let temp_dir2 = temp_dir.clone();
         let handle2 = thread::spawn(move || {
-            let mut db = KeystoreDB::new(temp_dir2.path()).expect("Failed to open database.");
+            let mut db = new_test_db_with_gc(temp_dir2.path(), |_, _| Ok(()))
+                .expect("Failed to open database.");
 
             for count in 0..actual_key_count {
                 if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
@@ -4611,27 +4807,6 @@ mod tests {
             }
         });
 
-        let stop_deleting = Arc::new(AtomicU8::new(0));
-        let stop_deleting2 = stop_deleting.clone();
-
-        // And delete anything that is unreferenced keys.
-        let temp_dir3 = temp_dir.clone();
-        let handle3 = thread::spawn(move || {
-            let mut db = KeystoreDB::new(temp_dir3.path()).expect("Failed to open database.");
-
-            while stop_deleting2.load(Ordering::Relaxed) != 1 {
-                while let Some((key_guard, _key)) =
-                    db.get_unreferenced_key().expect("Failed to get unreferenced Key.")
-                {
-                    if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
-                        return;
-                    }
-                    db.purge_key_entry(key_guard).expect("Failed to purge key.");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
-
         // While a lot of inserting and deleting is going on we have to open database connections
         // successfully and use them.
         // This clone is not redundant, because temp_dir needs to be kept alive until db goes
@@ -4643,7 +4818,8 @@ mod tests {
                 if Instant::now().duration_since(test_begin) >= Duration::from_secs(40) {
                     return;
                 }
-                let mut db = KeystoreDB::new(temp_dir4.path()).expect("Failed to open database.");
+                let mut db = new_test_db_with_gc(temp_dir4.path(), |_, _| Ok(()))
+                    .expect("Failed to open database.");
 
                 let alias = format!("test_alias_{}", count);
                 make_test_key_entry(&mut db, Domain::APP, 3, &alias, None)
@@ -4661,9 +4837,6 @@ mod tests {
         handle1.join().expect("Thread 1 panicked.");
         handle2.join().expect("Thread 2 panicked.");
         handle4.join().expect("Thread 4 panicked.");
-
-        stop_deleting.store(1, Ordering::Relaxed);
-        handle3.join().expect("Thread 3 panicked.");
 
         Ok(())
     }
@@ -4723,7 +4896,7 @@ mod tests {
                 })
                 .collect();
             list_o_descriptors.sort();
-            let mut list_result = db.list(*domain, *namespace)?;
+            let mut list_result = db.list(*domain, *namespace, KeyType::Client)?;
             list_result.sort();
             assert_eq!(list_o_descriptors, list_result);
 
@@ -4753,7 +4926,7 @@ mod tests {
             loaded_entries.sort_unstable();
             assert_eq!(list_o_ids, loaded_entries);
         }
-        assert_eq!(Vec::<KeyDescriptor>::new(), db.list(Domain::SELINUX, 101)?);
+        assert_eq!(Vec::<KeyDescriptor>::new(), db.list(Domain::SELINUX, 101, KeyType::Client)?);
 
         Ok(())
     }
@@ -4792,10 +4965,7 @@ mod tests {
                 Ok(KeyEntryRow {
                     id: row.get(0)?,
                     key_type: row.get(1)?,
-                    domain: match row.get(2)? {
-                        Some(i) => Some(Domain(i)),
-                        None => None,
-                    },
+                    domain: row.get::<_, Option<_>>(2)?.map(Domain),
                     namespace: row.get(3)?,
                     alias: row.get(4)?,
                     state: row.get(5)?,
@@ -5071,7 +5241,7 @@ mod tests {
         alias: &str,
         max_usage_count: Option<i32>,
     ) -> Result<KeyIdGuard> {
-        let key_id = db.create_key_entry(&domain, &namespace, &KEYSTORE_UUID)?;
+        let key_id = db.create_key_entry(&domain, &namespace, KeyType::Client, &KEYSTORE_UUID)?;
         let mut blob_metadata = BlobMetaData::new();
         blob_metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::Password));
         blob_metadata.add(BlobMetaEntry::Salt(vec![1, 2, 3]));
@@ -5106,6 +5276,66 @@ mod tests {
         blob_metadata.add(BlobMetaEntry::Salt(vec![1, 2, 3]));
         blob_metadata.add(BlobMetaEntry::Iv(vec![2, 3, 1]));
         blob_metadata.add(BlobMetaEntry::AeadTag(vec![3, 1, 2]));
+        blob_metadata.add(BlobMetaEntry::KmUuid(KEYSTORE_UUID));
+
+        let mut metadata = KeyMetaData::new();
+        metadata.add(KeyMetaEntry::CreationDate(DateTime::from_millis_epoch(123456789)));
+
+        KeyEntry {
+            id: key_id,
+            key_blob_info: Some((TEST_KEY_BLOB.to_vec(), blob_metadata)),
+            cert: Some(TEST_CERT_BLOB.to_vec()),
+            cert_chain: Some(TEST_CERT_CHAIN_BLOB.to_vec()),
+            km_uuid: KEYSTORE_UUID,
+            parameters: params,
+            metadata,
+            pure_cert: false,
+        }
+    }
+
+    fn make_bootlevel_key_entry(
+        db: &mut KeystoreDB,
+        domain: Domain,
+        namespace: i64,
+        alias: &str,
+        logical_only: bool,
+    ) -> Result<KeyIdGuard> {
+        let key_id = db.create_key_entry(&domain, &namespace, KeyType::Client, &KEYSTORE_UUID)?;
+        let mut blob_metadata = BlobMetaData::new();
+        if !logical_only {
+            blob_metadata.add(BlobMetaEntry::MaxBootLevel(3));
+        }
+        blob_metadata.add(BlobMetaEntry::KmUuid(KEYSTORE_UUID));
+
+        db.set_blob(
+            &key_id,
+            SubComponentType::KEY_BLOB,
+            Some(TEST_KEY_BLOB),
+            Some(&blob_metadata),
+        )?;
+        db.set_blob(&key_id, SubComponentType::CERT, Some(TEST_CERT_BLOB), None)?;
+        db.set_blob(&key_id, SubComponentType::CERT_CHAIN, Some(TEST_CERT_CHAIN_BLOB), None)?;
+
+        let mut params = make_test_params(None);
+        params.push(KeyParameter::new(KeyParameterValue::MaxBootLevel(3), SecurityLevel::KEYSTORE));
+
+        db.insert_keyparameter(&key_id, &params)?;
+
+        let mut metadata = KeyMetaData::new();
+        metadata.add(KeyMetaEntry::CreationDate(DateTime::from_millis_epoch(123456789)));
+        db.insert_key_metadata(&key_id, &metadata)?;
+        rebind_alias(db, &key_id, alias, domain, namespace)?;
+        Ok(key_id)
+    }
+
+    fn make_bootlevel_test_key_entry_test_vector(key_id: i64, logical_only: bool) -> KeyEntry {
+        let mut params = make_test_params(None);
+        params.push(KeyParameter::new(KeyParameterValue::MaxBootLevel(3), SecurityLevel::KEYSTORE));
+
+        let mut blob_metadata = BlobMetaData::new();
+        if !logical_only {
+            blob_metadata.add(BlobMetaEntry::MaxBootLevel(3));
+        }
         blob_metadata.add(BlobMetaEntry::KmUuid(KEYSTORE_UUID));
 
         let mut metadata = KeyMetaData::new();
@@ -5216,11 +5446,11 @@ mod tests {
         make_test_key_entry(&mut db, Domain::APP, 110000, TEST_ALIAS, None)?;
         db.unbind_keys_for_user(2, false)?;
 
-        assert_eq!(1, db.list(Domain::APP, 110000)?.len());
-        assert_eq!(0, db.list(Domain::APP, 210000)?.len());
+        assert_eq!(1, db.list(Domain::APP, 110000, KeyType::Client)?.len());
+        assert_eq!(0, db.list(Domain::APP, 210000, KeyType::Client)?.len());
 
         db.unbind_keys_for_user(1, true)?;
-        assert_eq!(0, db.list(Domain::APP, 110000)?.len());
+        assert_eq!(0, db.list(Domain::APP, 110000, KeyType::Client)?.len());
 
         Ok(())
     }
@@ -5245,7 +5475,7 @@ mod tests {
         )?;
 
         //check if super key exists
-        assert!(db.key_exists(Domain::APP, 1, &USER_SUPER_KEY.alias, KeyType::Super)?);
+        assert!(db.key_exists(Domain::APP, 1, USER_SUPER_KEY.alias, KeyType::Super)?);
 
         let (_, key_entry) = db.load_super_key(&USER_SUPER_KEY, 1)?.unwrap();
         let loaded_super_key = SuperKeyManager::extract_super_key_from_key_entry(
@@ -5261,21 +5491,21 @@ mod tests {
         Ok(())
     }
 
-    fn get_valid_statsd_storage_types() -> Vec<StatsdStorageType> {
+    fn get_valid_statsd_storage_types() -> Vec<MetricsStorage> {
         vec![
-            StatsdStorageType::KeyEntry,
-            StatsdStorageType::KeyEntryIdIndex,
-            StatsdStorageType::KeyEntryDomainNamespaceIndex,
-            StatsdStorageType::BlobEntry,
-            StatsdStorageType::BlobEntryKeyEntryIdIndex,
-            StatsdStorageType::KeyParameter,
-            StatsdStorageType::KeyParameterKeyEntryIdIndex,
-            StatsdStorageType::KeyMetadata,
-            StatsdStorageType::KeyMetadataKeyEntryIdIndex,
-            StatsdStorageType::Grant,
-            StatsdStorageType::AuthToken,
-            StatsdStorageType::BlobMetadata,
-            StatsdStorageType::BlobMetadataBlobEntryIdIndex,
+            MetricsStorage::KEY_ENTRY,
+            MetricsStorage::KEY_ENTRY_ID_INDEX,
+            MetricsStorage::KEY_ENTRY_DOMAIN_NAMESPACE_INDEX,
+            MetricsStorage::BLOB_ENTRY,
+            MetricsStorage::BLOB_ENTRY_KEY_ENTRY_ID_INDEX,
+            MetricsStorage::KEY_PARAMETER,
+            MetricsStorage::KEY_PARAMETER_KEY_ENTRY_ID_INDEX,
+            MetricsStorage::KEY_METADATA,
+            MetricsStorage::KEY_METADATA_KEY_ENTRY_ID_INDEX,
+            MetricsStorage::GRANT,
+            MetricsStorage::AUTH_TOKEN,
+            MetricsStorage::BLOB_METADATA,
+            MetricsStorage::BLOB_METADATA_BLOB_ENTRY_ID_INDEX,
         ]
     }
 
@@ -5283,7 +5513,7 @@ mod tests {
     /// that are supported by the DB. Check for reasonable values.
     #[test]
     fn test_query_all_valid_table_sizes() -> Result<()> {
-        const PAGE_SIZE: i64 = 4096;
+        const PAGE_SIZE: i32 = 4096;
 
         let mut db = new_test_db()?;
 
@@ -5291,7 +5521,7 @@ mod tests {
             let stat = db.get_storage_stat(t)?;
             // AuthToken can be less than a page since it's in a btree, not sqlite
             // TODO(b/187474736) stop using if-let here
-            if let StatsdStorageType::AuthToken = t {
+            if let MetricsStorage::AUTH_TOKEN = t {
             } else {
                 assert!(stat.size >= PAGE_SIZE);
             }
@@ -5301,35 +5531,35 @@ mod tests {
         Ok(())
     }
 
-    fn get_storage_stats_map(db: &mut KeystoreDB) -> BTreeMap<i32, Keystore2StorageStats> {
+    fn get_storage_stats_map(db: &mut KeystoreDB) -> BTreeMap<i32, StorageStats> {
         get_valid_statsd_storage_types()
             .into_iter()
-            .map(|t| (t as i32, db.get_storage_stat(t).unwrap()))
+            .map(|t| (t.0, db.get_storage_stat(t).unwrap()))
             .collect()
     }
 
     fn assert_storage_increased(
         db: &mut KeystoreDB,
-        increased_storage_types: Vec<StatsdStorageType>,
-        baseline: &mut BTreeMap<i32, Keystore2StorageStats>,
+        increased_storage_types: Vec<MetricsStorage>,
+        baseline: &mut BTreeMap<i32, StorageStats>,
     ) {
         for storage in increased_storage_types {
             // Verify the expected storage increased.
             let new = db.get_storage_stat(storage).unwrap();
-            let storage = storage as i32;
-            let old = &baseline[&storage];
-            assert!(new.size >= old.size, "{}: {} >= {}", storage, new.size, old.size);
+            let storage = storage;
+            let old = &baseline[&storage.0];
+            assert!(new.size >= old.size, "{}: {} >= {}", storage.0, new.size, old.size);
             assert!(
                 new.unused_size <= old.unused_size,
                 "{}: {} <= {}",
-                storage,
+                storage.0,
                 new.unused_size,
                 old.unused_size
             );
 
             // Update the baseline with the new value so that it succeeds in the
             // later comparison.
-            baseline.insert(storage, new);
+            baseline.insert(storage.0, new);
         }
 
         // Get an updated map of the storage and verify there were no unexpected changes.
@@ -5337,7 +5567,7 @@ mod tests {
         assert_eq!(updated_stats.len(), baseline.len());
 
         for &k in baseline.keys() {
-            let stringify = |map: &BTreeMap<i32, Keystore2StorageStats>| -> String {
+            let stringify = |map: &BTreeMap<i32, StorageStats>| -> String {
                 let mut s = String::new();
                 for &k in map.keys() {
                     writeln!(&mut s, "  {}: {}, {}", &k, map[&k].size, map[&k].unused_size)
@@ -5351,7 +5581,7 @@ mod tests {
                     && updated_stats[&k].unused_size == baseline[&k].unused_size,
                 "updated_stats:\n{}\nbaseline:\n{}",
                 stringify(&updated_stats),
-                stringify(&baseline)
+                stringify(baseline)
             );
         }
     }
@@ -5361,13 +5591,13 @@ mod tests {
         let mut db = new_test_db()?;
         let mut working_stats = get_storage_stats_map(&mut db);
 
-        let key_id = db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
+        let key_id = db.create_key_entry(&Domain::APP, &42, KeyType::Client, &KEYSTORE_UUID)?;
         assert_storage_increased(
             &mut db,
             vec![
-                StatsdStorageType::KeyEntry,
-                StatsdStorageType::KeyEntryIdIndex,
-                StatsdStorageType::KeyEntryDomainNamespaceIndex,
+                MetricsStorage::KEY_ENTRY,
+                MetricsStorage::KEY_ENTRY_ID_INDEX,
+                MetricsStorage::KEY_ENTRY_DOMAIN_NAMESPACE_INDEX,
             ],
             &mut working_stats,
         );
@@ -5378,10 +5608,10 @@ mod tests {
         assert_storage_increased(
             &mut db,
             vec![
-                StatsdStorageType::BlobEntry,
-                StatsdStorageType::BlobEntryKeyEntryIdIndex,
-                StatsdStorageType::BlobMetadata,
-                StatsdStorageType::BlobMetadataBlobEntryIdIndex,
+                MetricsStorage::BLOB_ENTRY,
+                MetricsStorage::BLOB_ENTRY_KEY_ENTRY_ID_INDEX,
+                MetricsStorage::BLOB_METADATA,
+                MetricsStorage::BLOB_METADATA_BLOB_ENTRY_ID_INDEX,
             ],
             &mut working_stats,
         );
@@ -5390,7 +5620,7 @@ mod tests {
         db.insert_keyparameter(&key_id, &params)?;
         assert_storage_increased(
             &mut db,
-            vec![StatsdStorageType::KeyParameter, StatsdStorageType::KeyParameterKeyEntryIdIndex],
+            vec![MetricsStorage::KEY_PARAMETER, MetricsStorage::KEY_PARAMETER_KEY_ENTRY_ID_INDEX],
             &mut working_stats,
         );
 
@@ -5399,7 +5629,7 @@ mod tests {
         db.insert_key_metadata(&key_id, &metadata)?;
         assert_storage_increased(
             &mut db,
-            vec![StatsdStorageType::KeyMetadata, StatsdStorageType::KeyMetadataKeyEntryIdIndex],
+            vec![MetricsStorage::KEY_METADATA, MetricsStorage::KEY_METADATA_KEY_ENTRY_ID_INDEX],
             &mut working_stats,
         );
 
@@ -5407,7 +5637,7 @@ mod tests {
         for stat in working_stats.values() {
             sum += stat.size;
         }
-        let total = db.get_storage_stat(StatsdStorageType::Database)?.size;
+        let total = db.get_storage_stat(MetricsStorage::DATABASE)?.size;
         assert!(sum <= total, "Expected sum <= total. sum: {}, total: {}", sum, total);
 
         Ok(())
@@ -5425,7 +5655,7 @@ mod tests {
             timestamp: Timestamp { milliSeconds: 10 },
             mac: b"mac".to_vec(),
         });
-        assert_storage_increased(&mut db, vec![StatsdStorageType::AuthToken], &mut working_stats);
+        assert_storage_increased(&mut db, vec![MetricsStorage::AUTH_TOKEN], &mut working_stats);
         Ok(())
     }
 
@@ -5449,7 +5679,7 @@ mod tests {
             |_, _| Ok(()),
         )?;
 
-        assert_storage_increased(&mut db, vec![StatsdStorageType::Grant], &mut working_stats);
+        assert_storage_increased(&mut db, vec![MetricsStorage::GRANT], &mut working_stats);
 
         Ok(())
     }
@@ -5491,24 +5721,18 @@ mod tests {
     }
 
     #[test]
-    fn test_set_wal_mode() -> Result<()> {
-        let temp_dir = TempDir::new("test_set_wal_mode")?;
-        let mut db = KeystoreDB::new(temp_dir.path(), None)?;
-        let mode: String =
-            db.conn.pragma_query_value(Some(Attached("persistent")), "journal_mode", |row| {
-                row.get(0)
-            })?;
-        assert_eq!(mode, "delete");
-        db.conn.close().expect("Close didn't work");
+    fn test_load_key_descriptor() -> Result<()> {
+        let mut db = new_test_db()?;
+        let key_id = make_test_key_entry(&mut db, Domain::APP, 1, TEST_ALIAS, None)?.0;
 
-        KeystoreDB::set_wal_mode(temp_dir.path())?;
+        let key = db.load_key_descriptor(key_id)?.unwrap();
 
-        db = KeystoreDB::new(temp_dir.path(), None)?;
-        let mode: String =
-            db.conn.pragma_query_value(Some(Attached("persistent")), "journal_mode", |row| {
-                row.get(0)
-            })?;
-        assert_eq!(mode, "wal");
+        assert_eq!(key.domain, Domain::APP);
+        assert_eq!(key.nspace, 1);
+        assert_eq!(key.alias, Some(TEST_ALIAS.to_string()));
+
+        // No such id
+        assert_eq!(db.load_key_descriptor(key_id + 1)?, None);
         Ok(())
     }
 }

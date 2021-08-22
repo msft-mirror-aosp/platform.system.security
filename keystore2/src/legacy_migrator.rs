@@ -14,11 +14,11 @@
 
 //! This module acts as a bridge between the legacy key database and the keystore2 database.
 
-use crate::error::Error;
 use crate::key_parameter::KeyParameterValue;
 use crate::legacy_blob::BlobValue;
 use crate::utils::{uid_to_android_user, watchdog as wd};
 use crate::{async_task::AsyncTask, legacy_blob::LegacyBlobLoader};
+use crate::{database::KeyType, error::Error};
 use crate::{
     database::{
         BlobMetaData, BlobMetaEntry, CertificateInfo, DateTime, EncryptedBy, KeyMetaData,
@@ -523,6 +523,7 @@ impl LegacyMigratorState {
                 self.db
                     .store_new_key(
                         &key,
+                        KeyType::Client,
                         &params,
                         &(&blob, &blob_metadata),
                         &CertificateInfo::new(user_cert, ca_cert),
@@ -535,7 +536,7 @@ impl LegacyMigratorState {
             None => {
                 if let Some(ca_cert) = ca_cert {
                     self.db
-                        .store_new_certificate(&key, &ca_cert, &KEYSTORE_UUID)
+                        .store_new_certificate(&key, KeyType::Client, &ca_cert, &KEYSTORE_UUID)
                         .context("In check_and_migrate: Failed to insert new certificate.")?;
                     Ok(())
                 } else {
@@ -566,7 +567,7 @@ impl LegacyMigratorState {
 
         if let Some(super_key) = self
             .legacy_loader
-            .load_super_key(user_id, &pw)
+            .load_super_key(user_id, pw)
             .context("In check_and_migrate_super_key: Trying to load legacy super key.")?
         {
             let (blob, blob_metadata) =
@@ -723,8 +724,8 @@ impl Deref for LegacyBlob {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Vec(v) => &v,
-            Self::ZVec(v) => &v,
+            Self::Vec(v) => v,
+            Self::ZVec(v) => v,
         }
     }
 }

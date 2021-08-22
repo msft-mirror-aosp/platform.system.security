@@ -20,12 +20,12 @@
 
 #include <android-base/macros.h>
 #include <android-base/result.h>
-#include <android-base/unique_fd.h>
 
 #include <utils/StrongPointer.h>
 
 #include <android/system/keystore2/IKeystoreService.h>
 
+#include "KeystoreHmacKey.h"
 #include "SigningKey.h"
 
 class KeystoreKey : public SigningKey {
@@ -44,9 +44,13 @@ class KeystoreKey : public SigningKey {
   private:
     KeystoreKey();
     bool initialize();
-    android::base::Result<KeyMetadata> createNewKey(const KeyDescriptor& descriptor);
+    android::base::Result<std::vector<uint8_t>> verifyExistingKey();
+    android::base::Result<std::vector<uint8_t>> createKey();
+    android::base::Result<std::vector<uint8_t>> getOrCreateKey();
 
+    KeyDescriptor mDescriptor;
+    KeystoreHmacKey mHmacKey;
     android::sp<IKeystoreService> mService;
     android::sp<IKeystoreSecurityLevel> mSecurityLevel;
-    KeyMetadata mKeyMetadata;
+    std::vector<uint8_t> mPublicKey;
 };

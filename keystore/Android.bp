@@ -47,8 +47,8 @@ cc_binary {
         "keystore_client.proto",
     ],
     shared_libs: [
-        "android.security.apc-ndk_platform",
-        "android.system.keystore2-V1-ndk_platform",
+        "android.security.apc-ndk",
+        "android.system.keystore2-V1-ndk",
         "libbinder",
         "libbinder_ndk",
         "libchrome",
@@ -87,7 +87,7 @@ cc_library_shared {
 }
 
 // Library for keystore clients using the WiFi HIDL interface
-cc_library_shared {
+cc_library {
     name: "libkeystore-wifi-hidl",
     defaults: ["keystore_defaults"],
 
@@ -102,5 +102,5 @@ cc_library_shared {
 
     export_include_dirs: ["include"],
 
-    vendor: true,
+    vendor_available: true,
 }
