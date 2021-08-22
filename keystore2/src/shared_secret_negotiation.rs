@@ -24,6 +24,7 @@ use android_security_compat::aidl::android::security::compat::IKeystoreCompatSer
 use anyhow::{Context, Result};
 use keystore2_vintf::{get_aidl_instances, get_hidl_instances};
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 /// This function initiates the shared secret negotiation. It starts a thread and then returns
 /// immediately. The thread consults the vintf manifest to enumerate expected negotiation
@@ -109,7 +110,11 @@ static COMPAT_PACKAGE_NAME: &str = "android.security.compat";
 
 /// Lists participants.
 fn list_participants() -> Result<Vec<SharedSecretParticipant>> {
-    Ok([(4, 0), (4, 1)]
+    // 4.1 implementation always also register as 4.0. So only the highest version of each
+    // "default" and "strongbox" makes the cut.
+    let mut legacy_default_found: bool = false;
+    let mut legacy_strongbox_found: bool = false;
+    Ok([(4, 1), (4, 0)]
         .iter()
         .map(|(ma, mi)| {
             get_hidl_instances(KEYMASTER_PACKAGE_NAME, *ma, *mi, KEYMASTER_INTERFACE_NAME)
@@ -119,7 +124,24 @@ fn list_participants() -> Result<Vec<SharedSecretParticipant>> {
                     instances
                         .into_iter()
                         .filter_map(|name| {
-                            filter_map_legacy_km_instances(name.to_string(), (*ma, *mi))
+                            filter_map_legacy_km_instances(name.to_string(), (*ma, *mi)).and_then(
+                                |sp| {
+                                    if let SharedSecretParticipant::Hidl {
+                                        is_strongbox: true,
+                                        ..
+                                    } = &sp
+                                    {
+                                        if !legacy_strongbox_found {
+                                            legacy_strongbox_found = true;
+                                            return Some(sp);
+                                        }
+                                    } else if !legacy_default_found {
+                                        legacy_default_found = true;
+                                        return Some(sp);
+                                    }
+                                    None
+                                },
+                            )
                         })
                         .collect::<Vec<SharedSecretParticipant>>()
                 })
@@ -127,14 +149,15 @@ fn list_participants() -> Result<Vec<SharedSecretParticipant>> {
         .collect::<Result<Vec<_>>>()
         .map(|v| v.into_iter().flatten())
         .and_then(|i| {
-            let participants_aidl: Vec<SharedSecretParticipant> =
+            Ok(i.chain(
                 get_aidl_instances(SHARED_SECRET_PACKAGE_NAME, 1, SHARED_SECRET_INTERFACE_NAME)
                     .as_vec()
                     .context("In list_participants: Trying to convert KM1.0 names to vector.")?
                     .into_iter()
                     .map(|name| SharedSecretParticipant::Aidl(name.to_string()))
-                    .collect();
-            Ok(i.chain(participants_aidl.into_iter()))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ))
         })
         .context("In list_participants.")?
         .collect())
@@ -215,7 +238,7 @@ fn connect_participants(
         if participants.is_empty() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(1000));
     }
     connected_participants
 }
@@ -237,7 +260,7 @@ fn negotiate_shared_secret(
             Err(e) => {
                 log::warn!("{:?}", e);
                 log::warn!("Retrying in one second.");
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+                std::thread::sleep(Duration::from_millis(1000));
             }
             Ok(params) => break params,
         }
@@ -246,20 +269,28 @@ fn negotiate_shared_secret(
     params.sort_unstable();
 
     // Phase 2: Send the sorted sharing parameters to all participants.
-    participants
-        .into_iter()
-        .try_fold(None, |acc, (s, p)| {
-            match (acc, map_binder_status(s.computeSharedSecret(&params))) {
-                (None, Ok(new_sum)) => Ok(Some(new_sum)),
-                (Some(old_sum), Ok(new_sum)) => {
-                    if old_sum == new_sum {
-                        Ok(Some(old_sum))
-                    } else {
-                        Err(SharedSecretError::Checksum(p))
-                    }
+    let negotiation_result = participants.into_iter().try_fold(None, |acc, (s, p)| {
+        match (acc, map_binder_status(s.computeSharedSecret(&params))) {
+            (None, Ok(new_sum)) => Ok(Some(new_sum)),
+            (Some(old_sum), Ok(new_sum)) => {
+                if old_sum == new_sum {
+                    Ok(Some(old_sum))
+                } else {
+                    Err(SharedSecretError::Checksum(p))
                 }
-                (_, Err(e)) => Err(SharedSecretError::Computation { e, p }),
             }
-        })
-        .expect("Fatal: Shared secret computation failed.");
+            (_, Err(e)) => Err(SharedSecretError::Computation { e, p }),
+        }
+    });
+
+    if let Err(e) = negotiation_result {
+        log::error!("In negotiate_shared_secret: {:?}.", e);
+        if let SharedSecretError::Checksum(_) = e {
+            log::error!(concat!(
+                "This means that this device is NOT PROVISIONED CORRECTLY.\n",
+                "User authorization and other security functions will not work\n",
+                "as expected. Please contact your OEM for instructions.",
+            ));
+        }
+    }
 }

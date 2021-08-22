@@ -20,9 +20,13 @@
 
 #include "SigningKey.h"
 
-android::base::Result<void> addCertToFsVerityKeyring(const std::string& path);
+android::base::Result<void> addCertToFsVerityKeyring(const std::string& path, const char* keyName);
 android::base::Result<std::vector<uint8_t>> createDigest(const std::string& path);
 android::base::Result<std::map<std::string, std::string>>
 verifyAllFilesInVerity(const std::string& path);
+
 android::base::Result<std::map<std::string, std::string>>
 addFilesToVerityRecursive(const std::string& path, const SigningKey& key);
+
+android::base::Result<std::map<std::string, std::string>>
+verifyAllFilesUsingCompOs(const std::string& path, const std::vector<uint8_t>& compos_key);

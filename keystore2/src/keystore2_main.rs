@@ -17,21 +17,23 @@
 use keystore2::entropy;
 use keystore2::globals::ENFORCEMENTS;
 use keystore2::maintenance::Maintenance;
-use keystore2::metrics;
+use keystore2::metrics::Metrics;
+use keystore2::metrics_store;
 use keystore2::remote_provisioning::RemoteProvisioningService;
 use keystore2::service::KeystoreService;
 use keystore2::{apc::ApcManager, shared_secret_negotiation};
 use keystore2::{authorization::AuthorizationManager, id_rotation::IdRotationState};
+use legacykeystore::LegacyKeystore;
 use log::{error, info};
 use std::{panic, path::Path, sync::mpsc::channel};
-use vpnprofilestore::VpnProfileStore;
 
 static KS2_SERVICE_NAME: &str = "android.system.keystore2.IKeystoreService/default";
 static APC_SERVICE_NAME: &str = "android.security.apc";
 static AUTHORIZATION_SERVICE_NAME: &str = "android.security.authorization";
+static METRICS_SERVICE_NAME: &str = "android.security.metrics";
 static REMOTE_PROVISIONING_SERVICE_NAME: &str = "android.security.remoteprovisioning";
 static USER_MANAGER_SERVICE_NAME: &str = "android.security.maintenance";
-static VPNPROFILESTORE_SERVICE_NAME: &str = "android.security.vpnprofilestore";
+static LEGACY_KEYSTORE_SERVICE_NAME: &str = "android.security.legacykeystore";
 
 /// Keystore 2.0 takes one argument which is a path indicating its designated working directory.
 fn main() {
@@ -50,6 +52,9 @@ fn main() {
     let mut args = std::env::args();
     args.next().expect("That's odd. How is there not even a first argument?");
 
+    // Write/update keystore.crash_count system property.
+    metrics_store::update_keystore_crash_sysprop();
+
     // Keystore 2.0 cannot change to the database directory (typically /data/misc/keystore) on
     // startup as Keystore 1.0 did because Keystore 2.0 is intended to run much earlier than
     // Keystore 1.0. Instead we set a global variable to the database path.
@@ -58,7 +63,7 @@ fn main() {
         let db_path = Path::new(&dir);
         *keystore2::globals::DB_PATH.write().expect("Could not lock DB_PATH.") =
             db_path.to_path_buf();
-        IdRotationState::new(&db_path)
+        IdRotationState::new(db_path)
     } else {
         panic!("Must specify a database directory.");
     };
@@ -96,7 +101,11 @@ fn main() {
             panic!("Failed to register service {} because of {:?}.", AUTHORIZATION_SERVICE_NAME, e);
         });
 
-    let maintenance_service = Maintenance::new_native_binder().unwrap_or_else(|e| {
+    let (delete_listener, legacykeystore) = LegacyKeystore::new_native_binder(
+        &keystore2::globals::DB_PATH.read().expect("Could not get DB_PATH."),
+    );
+
+    let maintenance_service = Maintenance::new_native_binder(delete_listener).unwrap_or_else(|e| {
         panic!("Failed to create service {} because of {:?}.", USER_MANAGER_SERVICE_NAME, e);
     });
     binder::add_service(USER_MANAGER_SERVICE_NAME, maintenance_service.as_binder()).unwrap_or_else(
@@ -104,6 +113,13 @@ fn main() {
             panic!("Failed to register service {} because of {:?}.", USER_MANAGER_SERVICE_NAME, e);
         },
     );
+
+    let metrics_service = Metrics::new_native_binder().unwrap_or_else(|e| {
+        panic!("Failed to create service {} because of {:?}.", METRICS_SERVICE_NAME, e);
+    });
+    binder::add_service(METRICS_SERVICE_NAME, metrics_service.as_binder()).unwrap_or_else(|e| {
+        panic!("Failed to register service {} because of {:?}.", METRICS_SERVICE_NAME, e);
+    });
 
     // Devices with KS2 and KM 1.0 may not have any IRemotelyProvisionedComponent HALs at all. Do
     // not panic if new_native_binder returns failure because it could not find the TEE HAL.
@@ -120,24 +136,14 @@ fn main() {
         });
     }
 
-    let vpnprofilestore = VpnProfileStore::new_native_binder(
-        &keystore2::globals::DB_PATH.read().expect("Could not get DB_PATH."),
-    );
-    binder::add_service(VPNPROFILESTORE_SERVICE_NAME, vpnprofilestore.as_binder()).unwrap_or_else(
+    binder::add_service(LEGACY_KEYSTORE_SERVICE_NAME, legacykeystore.as_binder()).unwrap_or_else(
         |e| {
             panic!(
                 "Failed to register service {} because of {:?}.",
-                VPNPROFILESTORE_SERVICE_NAME, e
+                LEGACY_KEYSTORE_SERVICE_NAME, e
             );
         },
     );
-
-    std::thread::spawn(|| {
-        match metrics::register_pull_metrics_callbacks() {
-            Err(e) => error!("register_pull_metrics_callbacks failed: {:?}.", e),
-            _ => info!("Pull metrics callbacks successfully registered."),
-        };
-    });
 
     info!("Successfully registered Keystore 2.0 service.");
 

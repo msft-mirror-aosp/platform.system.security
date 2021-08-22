@@ -29,14 +29,13 @@ use android_security_apc::aidl::android::security::apc::{
 use android_system_keystore2::aidl::android::system::keystore2::{
     Authorization::Authorization, KeyDescriptor::KeyDescriptor,
 };
-use anyhow::{anyhow, Context};
-use binder::{FromIBinder, SpIBinder, ThreadState};
+use anyhow::Context;
+use binder::{Strong, ThreadState};
 use keystore2_apc_compat::{
     ApcCompatUiOptions, APC_COMPAT_ERROR_ABORTED, APC_COMPAT_ERROR_CANCELLED,
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
-use std::sync::Mutex;
 
 /// This function uses its namesake in the permission module and in
 /// combination with with_calling_sid from the binder crate to check
@@ -44,7 +43,7 @@ use std::sync::Mutex;
 pub fn check_keystore_permission(perm: KeystorePerm) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_keystore_permission(
-            &calling_sid.ok_or_else(Error::sys).context(
+            calling_sid.ok_or_else(Error::sys).context(
                 "In check_keystore_permission: Cannot check permission without calling_sid.",
             )?,
             perm,
@@ -58,7 +57,7 @@ pub fn check_keystore_permission(perm: KeystorePerm) -> anyhow::Result<()> {
 pub fn check_grant_permission(access_vec: KeyPermSet, key: &KeyDescriptor) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_grant_permission(
-            &calling_sid.ok_or_else(Error::sys).context(
+            calling_sid.ok_or_else(Error::sys).context(
                 "In check_grant_permission: Cannot check permission without calling_sid.",
             )?,
             access_vec,
@@ -78,7 +77,7 @@ pub fn check_key_permission(
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_key_permission(
             ThreadState::get_calling_uid(),
-            &calling_sid
+            calling_sid
                 .ok_or_else(Error::sys)
                 .context("In check_key_permission: Cannot check permission without calling_sid.")?,
             perm,
@@ -103,7 +102,7 @@ pub fn is_device_id_attestation_tag(tag: Tag) -> bool {
 /// identifiers. It throws an error if the permissions cannot be verified, or if the caller doesn't
 /// have the right permissions, and returns silently otherwise.
 pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
-    let permission_controller: binder::Strong<dyn IPermissionController::IPermissionController> =
+    let permission_controller: Strong<dyn IPermissionController::IPermissionController> =
         binder::get_interface("permission")?;
 
     let binder_result = {
@@ -125,39 +124,6 @@ pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
             "In check_device_attestation_permissions: ",
             "caller does not have the permission to attest device IDs"
         )),
-    }
-}
-
-/// Thread safe wrapper around SpIBinder. It is safe to have SpIBinder smart pointers to the
-/// same object in multiple threads, but cloning a SpIBinder is not thread safe.
-/// Keystore frequently hands out binder tokens to the security level interface. If this
-/// is to happen from a multi threaded thread pool, the SpIBinder needs to be protected by a
-/// Mutex.
-#[derive(Debug)]
-pub struct Asp(Mutex<SpIBinder>);
-
-impl Asp {
-    /// Creates a new instance owning a SpIBinder wrapped in a Mutex.
-    pub fn new(i: SpIBinder) -> Self {
-        Self(Mutex::new(i))
-    }
-
-    /// Clones the owned SpIBinder and attempts to convert it into the requested interface.
-    pub fn get_interface<T: FromIBinder + ?Sized>(&self) -> anyhow::Result<binder::Strong<T>> {
-        // We can use unwrap here because we never panic when locked, so the mutex
-        // can never be poisoned.
-        let lock = self.0.lock().unwrap();
-        (*lock)
-            .clone()
-            .into_interface()
-            .map_err(|e| anyhow!(format!("get_interface failed with error code {:?}", e)))
-    }
-}
-
-impl Clone for Asp {
-    fn clone(&self) -> Self {
-        let lock = self.0.lock().unwrap();
-        Self(Mutex::new((*lock).clone()))
     }
 }
 
@@ -222,16 +188,15 @@ pub fn ui_opts_2_compat(opt: i32) -> ApcCompatUiOptions {
 }
 
 /// AID offset for uid space partitioning.
-pub const AID_USER_OFFSET: u32 = cutils_bindgen::AID_USER_OFFSET;
+pub const AID_USER_OFFSET: u32 = rustutils::users::AID_USER_OFFSET;
 
 /// AID of the keystore process itself, used for keys that
 /// keystore generates for its own use.
-pub const AID_KEYSTORE: u32 = cutils_bindgen::AID_KEYSTORE;
+pub const AID_KEYSTORE: u32 = rustutils::users::AID_KEYSTORE;
 
 /// Extracts the android user from the given uid.
 pub fn uid_to_android_user(uid: u32) -> u32 {
-    // Safety: No memory access
-    unsafe { cutils_bindgen::multiuser_get_user_id(uid) }
+    rustutils::users::multiuser_get_user_id(uid)
 }
 
 /// This module provides helpers for simplified use of the watchdog module.

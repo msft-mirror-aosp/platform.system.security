@@ -35,17 +35,16 @@ rust_defaults {
         "android.security.authorization-rust",
         "android.security.compat-rust",
         "android.security.maintenance-rust",
+        "android.security.metrics-rust",
         "android.security.remoteprovisioning-rust",
         "android.system.keystore2-V1-rust",
         "libanyhow",
         "libbinder_rs",
-        "libcutils_bindgen",
         "libkeystore2_aaid-rust",
         "libkeystore2_apc_compat-rust",
         "libkeystore2_crypto_rust",
         "libkeystore2_km_compat",
         "libkeystore2_selinux",
-        "libkeystore2_system_property-rust",
         "libkeystore2_vintf_rust",
         "liblazy_static",
         "liblibc",
@@ -54,9 +53,7 @@ rust_defaults {
         "liblog_rust",
         "librand",
         "librusqlite",
-        "libstatslog_rust",
-        "libstatslog_rust_header",
-        "libstatspull_rust",
+        "librustutils",
         "libthiserror",
     ],
     shared_libs: [
@@ -108,7 +105,7 @@ rust_binary {
         "libbinder_rs",
         "libkeystore2",
         "liblog_rust",
-        "libvpnprofilestore-rust",
+        "liblegacykeystore-rust",
     ],
     init_rc: ["keystore2.rc"],
 
@@ -126,8 +123,8 @@ rust_binary {
     // be removed once that works correctly.
     shared_libs: [
         "android.hardware.confirmationui@1.0",
-        "android.hardware.security.sharedsecret-V1-ndk_platform",
-        "android.security.compat-ndk_platform",
+        "android.hardware.security.sharedsecret-V1-ndk",
+        "android.security.compat-ndk",
         "libc",
         "libdl_android",
         "libdl",
@@ -145,4 +142,6 @@ rust_binary {
     ],
 
     vintf_fragments: ["android.system.keystore2-service.xml"],
+
+    required: ["keystore_cli_v2"],
 }

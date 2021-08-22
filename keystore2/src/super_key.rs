@@ -19,7 +19,7 @@ use crate::{
     database::EncryptedBy,
     database::KeyEntry,
     database::KeyType,
-    database::{KeyIdGuard, KeyMetaData, KeyMetaEntry, KeystoreDB},
+    database::{KeyEntryLoadBits, KeyIdGuard, KeyMetaData, KeyMetaEntry, KeystoreDB},
     ec_crypto::ECDHPrivateKey,
     enforcements::Enforcements,
     error::Error,
@@ -30,6 +30,7 @@ use crate::{
     raw_device::KeyMintDevice,
     try_insert::TryInsert,
     utils::watchdog as wd,
+    utils::AID_KEYSTORE,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, BlockMode::BlockMode, HardwareAuthToken::HardwareAuthToken,
@@ -45,7 +46,7 @@ use keystore2_crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, generate_aes256_key, generate_salt, Password, ZVec,
     AES_256_KEY_LENGTH,
 };
-use keystore2_system_property::PropertyWatcher;
+use rustutils::system_properties::PropertyWatcher;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -67,8 +68,8 @@ type UserId = u32;
 pub enum SuperEncryptionAlgorithm {
     /// Symmetric encryption with AES-256-GCM
     Aes256Gcm,
-    /// Public-key encryption with ECDH P-256
-    EcdhP256,
+    /// Public-key encryption with ECDH P-521
+    EcdhP521,
 }
 
 /// A particular user may have several superencryption keys in the database, each for a
@@ -95,9 +96,9 @@ pub const USER_SCREEN_LOCK_BOUND_KEY: SuperKeyType = SuperKeyType {
 /// Key used for ScreenLockBound keys; the corresponding superencryption key is loaded in memory
 /// each time the user enters their LSKF, and cleared from memory each time the device is locked.
 /// Asymmetric, so keys can be encrypted when the device is locked.
-pub const USER_SCREEN_LOCK_BOUND_ECDH_KEY: SuperKeyType = SuperKeyType {
-    alias: "USER_SCREEN_LOCK_BOUND_ECDH_KEY",
-    algorithm: SuperEncryptionAlgorithm::EcdhP256,
+pub const USER_SCREEN_LOCK_BOUND_P521_KEY: SuperKeyType = SuperKeyType {
+    alias: "USER_SCREEN_LOCK_BOUND_P521_KEY",
+    algorithm: SuperEncryptionAlgorithm::EcdhP521,
 };
 
 /// Superencryption to apply to a new key.
@@ -125,10 +126,8 @@ impl SuperKeyIdentifier {
     fn from_metadata(metadata: &BlobMetaData) -> Option<Self> {
         if let Some(EncryptedBy::KeyId(key_id)) = metadata.encrypted_by() {
             Some(SuperKeyIdentifier::DatabaseId(*key_id))
-        } else if let Some(boot_level) = metadata.max_boot_level() {
-            Some(SuperKeyIdentifier::BootLevel(*boot_level))
         } else {
-            None
+            metadata.max_boot_level().map(|boot_level| SuperKeyIdentifier::BootLevel(*boot_level))
         }
     }
 
@@ -194,6 +193,12 @@ impl LockedKey {
         auth_token: &HardwareAuthToken,
         reencrypt_with: Option<Arc<SuperKey>>,
     ) -> Result<Arc<SuperKey>> {
+        let key_blob = key_entry
+            .key_blob_info()
+            .as_ref()
+            .map(|(key_blob, _)| KeyBlob::Ref(key_blob))
+            .ok_or(Error::Rc(ResponseCode::KEY_NOT_FOUND))
+            .context("In LockedKey::decrypt: Missing key blob info.")?;
         let key_params = vec![
             KeyParameterValue::Algorithm(Algorithm::AES),
             KeyParameterValue::KeySize(256),
@@ -206,7 +211,7 @@ impl LockedKey {
         let key = ZVec::try_from(km_dev.use_key_in_one_step(
             db,
             key_id_guard,
-            key_entry,
+            &key_blob,
             KeyPurpose::DECRYPT,
             &key_params,
             Some(auth_token),
@@ -391,7 +396,7 @@ impl SuperKeyManager {
             .get_or_create_key_with(
                 Domain::APP,
                 user as u64 as i64,
-                &USER_SUPER_KEY.alias,
+                USER_SUPER_KEY.alias,
                 crate::database::KEYSTORE_UUID,
                 || {
                     // For backward compatibility we need to check if there is a super key present.
@@ -461,7 +466,7 @@ impl SuperKeyManager {
                     tag.is_some(),
                 )),
             },
-            SuperEncryptionAlgorithm::EcdhP256 => {
+            SuperEncryptionAlgorithm::EcdhP521 => {
                 match (metadata.public_key(), metadata.salt(), metadata.iv(), metadata.aead_tag()) {
                     (Some(public_key), Some(salt), Some(iv), Some(aead_tag)) => {
                         ECDHPrivateKey::from_private_key(&key.key)
@@ -494,7 +499,7 @@ impl SuperKeyManager {
         user_id: UserId,
     ) -> Result<bool> {
         let key_in_db = db
-            .key_exists(Domain::APP, user_id as u64 as i64, &USER_SUPER_KEY.alias, KeyType::Super)
+            .key_exists(Domain::APP, user_id as u64 as i64, USER_SUPER_KEY.alias, KeyType::Super)
             .context("In super_key_exists_in_db_for_user.")?;
 
         if key_in_db {
@@ -730,7 +735,7 @@ impl SuperKeyManager {
         match Enforcements::super_encryption_required(domain, key_parameters, flags) {
             SuperEncryptionType::None => Ok((key_blob.to_vec(), BlobMetaData::new())),
             SuperEncryptionType::LskfBound => self
-                .super_encrypt_on_key_init(db, legacy_migrator, user_id, &key_blob)
+                .super_encrypt_on_key_init(db, legacy_migrator, user_id, key_blob)
                 .context(concat!(
                     "In handle_super_encryption_on_key_init. ",
                     "Failed to super encrypt with LskfBound key."
@@ -739,14 +744,14 @@ impl SuperKeyManager {
                 let mut data = self.data.lock().unwrap();
                 let entry = data.user_keys.entry(user_id).or_default();
                 if let Some(super_key) = entry.screen_lock_bound.as_ref() {
-                    Self::encrypt_with_aes_super_key(key_blob, &super_key).context(concat!(
+                    Self::encrypt_with_aes_super_key(key_blob, super_key).context(concat!(
                         "In handle_super_encryption_on_key_init. ",
                         "Failed to encrypt with ScreenLockBound key."
                     ))
                 } else {
                     // Symmetric key is not available, use public key encryption
                     let loaded =
-                        db.load_super_key(&USER_SCREEN_LOCK_BOUND_ECDH_KEY, user_id).context(
+                        db.load_super_key(&USER_SCREEN_LOCK_BOUND_P521_KEY, user_id).context(
                             "In handle_super_encryption_on_key_init: load_super_key failed.",
                         )?;
                     let (key_id_guard, key_entry) = loaded.ok_or_else(Error::sys).context(
@@ -829,7 +834,7 @@ impl SuperKeyManager {
                         .context("In get_or_create_super_key: Failed to generate AES 256 key.")?,
                     None,
                 ),
-                SuperEncryptionAlgorithm::EcdhP256 => {
+                SuperEncryptionAlgorithm::EcdhP521 => {
                     let key = ECDHPrivateKey::generate()
                         .context("In get_or_create_super_key: Failed to generate ECDH key")?;
                     (
@@ -896,7 +901,7 @@ impl SuperKeyManager {
                 Self::get_or_create_super_key(
                     db,
                     user_id,
-                    &USER_SCREEN_LOCK_BOUND_ECDH_KEY,
+                    &USER_SCREEN_LOCK_BOUND_P521_KEY,
                     password,
                     Some(aes.clone()),
                 )
@@ -949,13 +954,23 @@ impl SuperKeyManager {
                     }
                     let key_params: Vec<KmKeyParameter> =
                         key_params.into_iter().map(|x| x.into()).collect();
-                    km_dev.create_and_store_key(db, &key_desc, |dev| {
-                        let _wp = wd::watch_millis(
-                            "In lock_screen_lock_bound_key: calling importKey.",
-                            500,
-                        );
-                        dev.importKey(key_params.as_slice(), KeyFormat::RAW, &encrypting_key, None)
-                    })?;
+                    km_dev.create_and_store_key(
+                        db,
+                        &key_desc,
+                        KeyType::Client, /* TODO Should be Super b/189470584 */
+                        |dev| {
+                            let _wp = wd::watch_millis(
+                                "In lock_screen_lock_bound_key: calling importKey.",
+                                500,
+                            );
+                            dev.importKey(
+                                key_params.as_slice(),
+                                KeyFormat::RAW,
+                                &encrypting_key,
+                                None,
+                            )
+                        },
+                    )?;
                     entry.biometric_unlock = Some(BiometricUnlock {
                         sids: unlocking_sids.into(),
                         key_desc,
@@ -985,8 +1000,15 @@ impl SuperKeyManager {
         let mut data = self.data.lock().unwrap();
         let mut entry = data.user_keys.entry(user_id).or_default();
         if let Some(biometric) = entry.biometric_unlock.as_ref() {
-            let (key_id_guard, key_entry) =
-                KeyMintDevice::lookup_from_desc(db, &biometric.key_desc)?;
+            let (key_id_guard, key_entry) = db
+                .load_key_entry(
+                    &biometric.key_desc,
+                    KeyType::Client, // This should not be a Client key.
+                    KeyEntryLoadBits::KM,
+                    AID_KEYSTORE,
+                    |_, _| Ok(()),
+                )
+                .context("In try_unlock_user_with_biometric: load_key_entry failed")?;
             let km_dev: KeyMintDevice = KeyMintDevice::get(SecurityLevel::TRUSTED_ENVIRONMENT)
                 .context("In try_unlock_user_with_biometric: KeyMintDevice::get failed")?;
             for sid in &biometric.sids {
@@ -1191,8 +1213,8 @@ impl<'a> Deref for KeyBlob<'a> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Sensitive { key, .. } => &key,
-            Self::NonSensitive(key) => &key,
+            Self::Sensitive { key, .. } => key,
+            Self::NonSensitive(key) => key,
             Self::Ref(key) => key,
         }
     }
