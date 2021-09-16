@@ -106,6 +106,7 @@ rust_binary {
         "libkeystore2",
         "liblog_rust",
         "liblegacykeystore-rust",
+        "librusqlite",
     ],
     init_rc: ["keystore2.rc"],
 
@@ -133,7 +134,6 @@ rust_binary {
         "libkeystore2_aaid",
         "libkeystore2_apc_compat",
         "libkeystore2_crypto",
-        "libkeystore2_vintf_cpp",
         "libkm_compat_service",
         "libkm_compat",
         "libm",
