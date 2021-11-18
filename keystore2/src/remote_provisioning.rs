@@ -30,7 +30,7 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
 };
 use android_security_remoteprovisioning::aidl::android::security::remoteprovisioning::{
     AttestationPoolStatus::AttestationPoolStatus, IRemoteProvisioning::BnRemoteProvisioning,
-    IRemoteProvisioning::IRemoteProvisioning,
+    IRemoteProvisioning::IRemoteProvisioning, ImplInfo::ImplInfo,
 };
 use android_security_remoteprovisioning::binder::{BinderFeatures, Strong};
 use android_system_keystore2::aidl::android::system::keystore2::{
@@ -43,7 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::database::{CertificateChain, KeystoreDB, Uuid};
 use crate::error::{self, map_or_log_err, map_rem_prov_error, Error};
 use crate::globals::{get_keymint_device, get_remotely_provisioned_component, DB};
+use crate::metrics_store::log_rkp_error_stats;
 use crate::utils::{watchdog as wd, Asp};
+use android_security_metrics::aidl::android::security::metrics::RkpError::RkpError as MetricsRkpError;
 
 /// Contains helper functions to check if remote provisioning is enabled on the system and, if so,
 /// to assign and retrieve attestation keys and certificate chains.
@@ -180,23 +182,35 @@ impl RemProvState {
             // and therefore will not be attested.
             Ok(None)
         } else {
-            match self.get_rem_prov_attest_key(&key, caller_uid, db).context(concat!(
-                "In get_remote_provisioning_key_and_certs: Failed to get ",
-                "attestation key"
-            ))? {
-                Some(cert_chain) => Ok(Some((
-                    AttestationKey {
-                        keyBlob: cert_chain.private_key.to_vec(),
-                        attestKeyParams: vec![],
-                        issuerSubjectName: parse_subject_from_certificate(&cert_chain.batch_cert)
+            match self.get_rem_prov_attest_key(&key, caller_uid, db) {
+                Err(e) => {
+                    log::error!(
+                        concat!(
+                            "In get_remote_provisioning_key_and_certs: Failed to get ",
+                            "attestation key. {:?}"
+                        ),
+                        e
+                    );
+                    log_rkp_error_stats(MetricsRkpError::FALL_BACK_DURING_HYBRID);
+                    Ok(None)
+                }
+                Ok(v) => match v {
+                    Some(cert_chain) => Ok(Some((
+                        AttestationKey {
+                            keyBlob: cert_chain.private_key.to_vec(),
+                            attestKeyParams: vec![],
+                            issuerSubjectName: parse_subject_from_certificate(
+                                &cert_chain.batch_cert,
+                            )
                             .context(concat!(
-                            "In get_remote_provisioning_key_and_certs: Failed to ",
-                            "parse subject."
-                        ))?,
-                    },
-                    Certificate { encodedCertificate: cert_chain.cert_chain },
-                ))),
-                None => Ok(None),
+                                "In get_remote_provisioning_key_and_certs: Failed to ",
+                                "parse subject."
+                            ))?,
+                        },
+                        Certificate { encodedCertificate: cert_chain.cert_chain },
+                    ))),
+                    None => Ok(None),
+                },
             }
         }
     }
@@ -205,6 +219,7 @@ impl RemProvState {
 #[derive(Default)]
 pub struct RemoteProvisioningService {
     device_by_sec_level: HashMap<SecurityLevel, Asp>,
+    curve_by_sec_level: HashMap<SecurityLevel, i32>,
 }
 
 impl RemoteProvisioningService {
@@ -227,31 +242,27 @@ impl RemoteProvisioningService {
         let mut result: Self = Default::default();
         let dev = get_remotely_provisioned_component(&SecurityLevel::TRUSTED_ENVIRONMENT)
             .context("In new_native_binder: Failed to get TEE Remote Provisioner instance.")?;
+        let rkp_tee_dev: Strong<dyn IRemotelyProvisionedComponent> = dev.get_interface()?;
+        result.curve_by_sec_level.insert(
+            SecurityLevel::TRUSTED_ENVIRONMENT,
+            rkp_tee_dev
+                .getHardwareInfo()
+                .context("In new_native_binder: Failed to get hardware info for the TEE.")?
+                .supportedEekCurve,
+        );
         result.device_by_sec_level.insert(SecurityLevel::TRUSTED_ENVIRONMENT, dev);
         if let Ok(dev) = get_remotely_provisioned_component(&SecurityLevel::STRONGBOX) {
+            let rkp_sb_dev: Strong<dyn IRemotelyProvisionedComponent> = dev.get_interface()?;
+            result.curve_by_sec_level.insert(
+                SecurityLevel::STRONGBOX,
+                rkp_sb_dev
+                    .getHardwareInfo()
+                    .context("In new_native_binder: Failed to get hardware info for StrongBox.")?
+                    .supportedEekCurve,
+            );
             result.device_by_sec_level.insert(SecurityLevel::STRONGBOX, dev);
         }
         Ok(BnRemoteProvisioning::new_binder(result, BinderFeatures::default()))
-    }
-
-    /// Populates the AttestationPoolStatus parcelable with information about how many
-    /// certs will be expiring by the date provided in `expired_by` along with how many
-    /// keys have not yet been assigned.
-    pub fn get_pool_status(
-        &self,
-        expired_by: i64,
-        sec_level: SecurityLevel,
-    ) -> Result<AttestationPoolStatus> {
-        let (_, _, uuid) = get_keymint_device(&sec_level)?;
-        DB.with::<_, Result<AttestationPoolStatus>>(|db| {
-            let mut db = db.borrow_mut();
-            // delete_expired_attestation_keys is always safe to call, and will remove anything
-            // older than the date at the time of calling. No work should be done on the
-            // attestation keys unless the pool status is checked first, so this call should be
-            // enough to routinely clean out expired keys.
-            db.delete_expired_attestation_keys()?;
-            db.get_attestation_pool_status(expired_by, &uuid)
-        })
     }
 
     /// Generates a CBOR blob which will be assembled by the calling code into a larger
@@ -302,9 +313,17 @@ impl RemoteProvisioningService {
             (mac.len() as u8),
         ];
         cose_mac_0.append(&mut mac);
+        // If this is a test mode key, there is an extra 6 bytes added as an additional entry in
+        // the COSE_Key struct to denote that.
+        let test_mode_entry_shift = if test_mode { 0 } else { 6 };
+        let byte_dist_mac0_payload = 8;
+        let cose_key_size = 83 - test_mode_entry_shift;
         for maced_public_key in keys_to_sign {
-            if maced_public_key.macedKey.len() > 83 + 8 {
-                cose_mac_0.extend_from_slice(&maced_public_key.macedKey[8..83 + 8]);
+            if maced_public_key.macedKey.len() > cose_key_size + byte_dist_mac0_payload {
+                cose_mac_0.extend_from_slice(
+                    &maced_public_key.macedKey
+                        [byte_dist_mac0_payload..cose_key_size + byte_dist_mac0_payload],
+                );
             }
         }
         Ok(cose_mac_0)
@@ -367,8 +386,12 @@ impl RemoteProvisioningService {
 
     /// Checks the security level of each available IRemotelyProvisionedComponent hal and returns
     /// all levels in an array to the caller.
-    pub fn get_security_levels(&self) -> Result<Vec<SecurityLevel>> {
-        Ok(self.device_by_sec_level.keys().cloned().collect())
+    pub fn get_implementation_info(&self) -> Result<Vec<ImplInfo>> {
+        Ok(self
+            .curve_by_sec_level
+            .iter()
+            .map(|(sec_level, curve)| ImplInfo { secLevel: *sec_level, supportedCurve: *curve })
+            .collect())
     }
 
     /// Deletes all attestation keys generated by the IRemotelyProvisionedComponent from the device,
@@ -379,6 +402,22 @@ impl RemoteProvisioningService {
             db.delete_all_attestation_keys()
         })
     }
+}
+
+/// Populates the AttestationPoolStatus parcelable with information about how many
+/// certs will be expiring by the date provided in `expired_by` along with how many
+/// keys have not yet been assigned.
+pub fn get_pool_status(expired_by: i64, sec_level: SecurityLevel) -> Result<AttestationPoolStatus> {
+    let (_, _, uuid) = get_keymint_device(&sec_level)?;
+    DB.with::<_, Result<AttestationPoolStatus>>(|db| {
+        let mut db = db.borrow_mut();
+        // delete_expired_attestation_keys is always safe to call, and will remove anything
+        // older than the date at the time of calling. No work should be done on the
+        // attestation keys unless the pool status is checked first, so this call should be
+        // enough to routinely clean out expired keys.
+        db.delete_expired_attestation_keys()?;
+        db.get_attestation_pool_status(expired_by, &uuid)
+    })
 }
 
 impl binder::Interface for RemoteProvisioningService {}
@@ -392,7 +431,7 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         sec_level: SecurityLevel,
     ) -> binder::public_api::Result<AttestationPoolStatus> {
         let _wp = wd::watch_millis("IRemoteProvisioning::getPoolStatus", 500);
-        map_or_log_err(self.get_pool_status(expired_by, sec_level), Ok)
+        map_or_log_err(get_pool_status(expired_by, sec_level), Ok)
     }
 
     fn generateCsr(
@@ -444,9 +483,9 @@ impl IRemoteProvisioning for RemoteProvisioningService {
         map_or_log_err(self.generate_key_pair(is_test_mode, sec_level), Ok)
     }
 
-    fn getSecurityLevels(&self) -> binder::public_api::Result<Vec<SecurityLevel>> {
+    fn getImplementationInfo(&self) -> binder::public_api::Result<Vec<ImplInfo>> {
         let _wp = wd::watch_millis("IRemoteProvisioning::getSecurityLevels", 500);
-        map_or_log_err(self.get_security_levels(), Ok)
+        map_or_log_err(self.get_implementation_info(), Ok)
     }
 
     fn deleteAllKeys(&self) -> binder::public_api::Result<i64> {
