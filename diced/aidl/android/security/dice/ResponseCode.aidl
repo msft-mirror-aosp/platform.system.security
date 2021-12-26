@@ -14,20 +14,24 @@
  * limitations under the License.
  */
 
-package android.security.metrics;
+package android.security.dice;
 
+@Backing(type="int")
 /**
- * EcCurve enum as defined in Keystore2KeyCreationWithGeneralInfo of
- * frameworks/proto_logging/stats/atoms.proto.
+ * Service specific error codes.
  * @hide
  */
-@Backing(type="int")
-enum EcCurve {
-    /** Unspecified takes 0. Other values are incremented by 1 compared to the keymint spec. */
-    EC_CURVE_UNSPECIFIED = 0,
-    P_224 = 1,
-    P_256 = 2,
-    P_384 = 3,
-    P_521 = 4,
-    CURVE_25519 = 5,
+enum ResponseCode {
+    /**
+     * The caller has insufficient privilege to access the DICE API.
+     */
+    PERMISSION_DENIED = 1,
+    /**
+     * An unexpected error occurred, likely with IO or IPC.
+     */
+    SYSTEM_ERROR = 2,
+    /**
+     * Returned if the called function is not implemented.
+     */
+    NOT_IMPLEMENTED = 3,
 }
