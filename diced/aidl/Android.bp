@@ -1,10 +1,10 @@
-// Copyright (C) 2021 The Android Open Source Project
+// Copyright 2021, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,35 +21,22 @@ package {
     default_applicable_licenses: ["system_security_license"],
 }
 
-python_library_host {
-    name: "fsverity_digests_proto_python",
-    srcs: [
-        "fsverity_digests.proto",
-    ],
-    required: [
-        "fsverity",
-    ],
-    proto: {
-        canonical_path_from_root: false,
-    },
-    version: {
-        py2: {
+aidl_interface {
+    name: "android.security.dice",
+    srcs: [ "android/security/dice/*.aidl" ],
+    unstable: true,
+    imports: ["android.hardware.security.dice-V1"],
+    backend: {
+         java: {
+            enabled: false,
+            platform_apis: false,
+        },
+        rust: {
             enabled: true,
         },
-        py3: {
+        ndk: {
             enabled: true,
-        },
+            apps_enabled: false,
+        }
     },
-}
-
-rust_protobuf {
-    name: "libfsverity_digests_proto_rust",
-    crate_name: "fsverity_digests_proto",
-    source_stem: "fsverity_digests_proto",
-    protos: [
-        "fsverity_digests.proto",
-    ],
-    apex_available: [
-        "com.android.compos",
-    ],
 }
