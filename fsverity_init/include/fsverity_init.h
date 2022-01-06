@@ -14,17 +14,8 @@
  * limitations under the License.
  */
 
-syntax = "proto3";
+#include <mini_keyctl_utils.h>
 
-package compos.proto;
-
-// Data provided by CompOS to allow validation of a file it generated.
-message Signature {
-    // The fs-verity digest (which is derived from the root hash of
-    // the Merkle tree) of the file contents.
-    bytes digest = 1;
-
-    // Signature of a fsverity_formatted_digest structure containing
-    // the digest, signed using CompOS's private key.
-    bytes signature = 2;
-}
+bool LoadKeyFromStdin(key_serial_t keyring_id, const char* keyname);
+void LoadKeyFromFile(key_serial_t keyring_id, const char* keyname, const std::string& path);
+void LoadKeyFromVerifiedPartitions(key_serial_t keyring_id);

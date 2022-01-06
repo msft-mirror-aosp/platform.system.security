@@ -21,35 +21,24 @@ package {
     default_applicable_licenses: ["system_security_license"],
 }
 
-python_library_host {
-    name: "fsverity_digests_proto_python",
-    srcs: [
-        "fsverity_digests.proto",
-    ],
-    required: [
-        "fsverity",
-    ],
-    proto: {
-        canonical_path_from_root: false,
-    },
-    version: {
-        py2: {
-            enabled: true,
-        },
-        py3: {
-            enabled: true,
-        },
-    },
-}
-
-rust_protobuf {
-    name: "libfsverity_digests_proto_rust",
-    crate_name: "fsverity_digests_proto",
-    source_stem: "fsverity_digests_proto",
-    protos: [
-        "fsverity_digests.proto",
-    ],
-    apex_available: [
-        "com.android.compos",
-    ],
+cc_test {
+  name: "libsigningutils_test",
+  srcs: ["SigningUtilsTest.cpp"],
+  test_suites: ["device-tests"],
+  compile_multilib: "both",
+  defaults: [
+    "odsign_flags_defaults",
+  ],
+  static_libs: [
+    "libsigningutils",
+  ],
+  shared_libs: [
+    "libbase",
+    "libcrypto",
+  ],
+  data: [
+    "test_file",
+    "test_file.sig",
+    "SigningUtils.cert.der",
+  ],
 }
