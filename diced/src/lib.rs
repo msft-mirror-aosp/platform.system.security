@@ -30,7 +30,7 @@ use android_security_dice::aidl::android::security::dice::{
     IDiceNode::IDiceNode, ResponseCode::ResponseCode,
 };
 use anyhow::{Context, Result};
-use binder::{public_api::Result as BinderResult, BinderFeatures, Strong, ThreadState};
+use binder::{BinderFeatures, Result as BinderResult, Strong, ThreadState};
 pub use diced_open_dice_cbor as dice;
 use error::{map_or_log_err, Error};
 use keystore2_selinux as selinux;
@@ -98,14 +98,14 @@ pub fn check_caller_permission<T: selinux::ClassPermission>(perm: T) -> Result<(
 
 fn client_input_values(uid: uid_t) -> Result<BinderInputValues> {
     Ok(BinderInputValues {
-        codeHash: vec![0; dice::HASH_SIZE],
+        codeHash: [0; dice::HASH_SIZE],
         config: BinderConfig {
             desc: dice::bcc::format_config_descriptor(Some(&format!("{}", uid)), None, true)
                 .context("In client_input_values: failed to format config descriptor")?,
         },
-        authorityHash: vec![0; dice::HASH_SIZE],
+        authorityHash: [0; dice::HASH_SIZE],
         authorityDescriptor: None,
-        hidden: vec![0; dice::HIDDEN_SIZE],
+        hidden: [0; dice::HIDDEN_SIZE],
         mode: Mode::NORMAL,
     })
 }
