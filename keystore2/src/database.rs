@@ -3207,7 +3207,7 @@ impl KeystoreDB {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use super::*;
     use crate::key_parameter::{
@@ -3231,13 +3231,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fmt::Write;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::thread;
     use std::time::{Duration, SystemTime};
     #[cfg(disabled)]
     use std::time::Instant;
 
-    fn new_test_db() -> Result<KeystoreDB> {
+    pub fn new_test_db() -> Result<KeystoreDB> {
         let conn = KeystoreDB::make_connection("file::memory:")?;
 
         let mut db = KeystoreDB { conn, gc: None, perboot: Arc::new(perboot::PerbootDB::new()) };
@@ -3251,7 +3251,7 @@ mod tests {
     where
         F: Fn(&Uuid, &[u8]) -> Result<()> + Send + 'static,
     {
-        let super_key: Arc<SuperKeyManager> = Default::default();
+        let super_key: Arc<RwLock<SuperKeyManager>> = Default::default();
 
         let gc_db = KeystoreDB::new(path, None).expect("Failed to open test gc db_connection.");
         let gc = Gc::new_init_with(Default::default(), move || (Box::new(cb), gc_db, super_key));
