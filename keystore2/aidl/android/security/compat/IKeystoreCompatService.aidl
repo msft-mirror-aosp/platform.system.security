@@ -29,17 +29,8 @@ import android.hardware.security.sharedsecret.ISharedSecret;
  */
 interface IKeystoreCompatService {
     /**
-     * Return an implementation of IKeyMintDevice, that it implemented by Keystore 2.0 itself.
-     * The underlying implementation depends on the requested securityLevel:
-     * - TRUSTED_ENVIRONMENT or STRONGBOX: implementation is by means of a hardware-backed
-     *   Keymaster 4.x instance. In this case, the returned device supports version 1 of
-     *   the IKeyMintDevice interface, with some small omissions:
-     *     - KeyPurpose::ATTEST_KEY is not supported (b/216437537)
-     *     - Specification of the MGF1 digest for RSA-OAEP is not supported (b/216436980)
-     *     - Specification of CERTIFICATE_{SUBJECT,SERIAL} is not supported for keys attested
-     *       by hardware (b/216468666).
-     * - SOFTWARE: implementation is entirely software based.  In this case, the returned device
-     *   supports the current version of the IKeyMintDevice interface.
+     * Return an implementation of IKeyMintDevice, that it implemented by Keystore 2.0 itself
+     * by means of Keymaster 4.1 or lower.
      */
     IKeyMintDevice getKeyMintDevice (SecurityLevel securityLevel);
 

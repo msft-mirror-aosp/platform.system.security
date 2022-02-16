@@ -111,8 +111,7 @@ class CredentialData : public RefBase {
 
     // Returns |nullptr| if a suitable key cannot be found. Otherwise returns
     // the authentication and increases its use-count.
-    const AuthKeyData* selectAuthKey(bool allowUsingExhaustedKeys, bool allowUsingExpiredKeys,
-                                     bool incrementUsageCount);
+    const AuthKeyData* selectAuthKey(bool allowUsingExhaustedKeys, bool allowUsingExpiredKeys);
 
     optional<vector<vector<uint8_t>>>
     getAuthKeysNeedingCertification(const sp<IIdentityCredential>& halBinder);
