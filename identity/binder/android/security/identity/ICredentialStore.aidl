@@ -19,7 +19,6 @@ package android.security.identity;
 import android.security.identity.IWritableCredential;
 import android.security.identity.ICredential;
 import android.security.identity.SecurityHardwareInfoParcel;
-import android.security.identity.ISession;
 
 /**
  * @hide
@@ -46,9 +45,6 @@ interface ICredentialStore {
 
     IWritableCredential createCredential(in @utf8InCpp String credentialName,
                                          in @utf8InCpp String docType);
-
     ICredential getCredentialByName(in @utf8InCpp String credentialName,
                                     in int cipherSuite);
-
-    ISession createPresentationSession(in int cipherSuite);
 }

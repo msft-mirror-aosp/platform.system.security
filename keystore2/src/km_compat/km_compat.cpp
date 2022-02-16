@@ -1340,7 +1340,7 @@ KeymasterDevices initializeKeymasters() {
     CHECK(serviceManager.get()) << "Failed to get ServiceManager";
     auto result = enumerateKeymasterDevices<Keymaster4>(serviceManager.get());
     auto softKeymaster = result[SecurityLevel::SOFTWARE];
-    if ((!result[SecurityLevel::TRUSTED_ENVIRONMENT]) && (!result[SecurityLevel::STRONGBOX])) {
+    if (!result[SecurityLevel::TRUSTED_ENVIRONMENT]) {
         result = enumerateKeymasterDevices<Keymaster3>(serviceManager.get());
     }
     if (softKeymaster) result[SecurityLevel::SOFTWARE] = softKeymaster;
@@ -1391,31 +1391,12 @@ sp<Keymaster> getDevice(KeyMintSecurityLevel securityLevel) {
     }
 }
 
-std::shared_ptr<IKeyMintDevice> getSoftwareKeymintDevice() {
-    static std::mutex mutex;
-    static std::shared_ptr<IKeyMintDevice> swDevice;
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!swDevice) {
-        swDevice.reset(CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE));
-    }
-    return swDevice;
-}
-
 std::shared_ptr<KeyMintDevice>
-KeyMintDevice::getWrappedKeymasterDevice(KeyMintSecurityLevel securityLevel) {
+KeyMintDevice::createKeyMintDevice(KeyMintSecurityLevel securityLevel) {
     if (auto dev = getDevice(securityLevel)) {
         return ndk::SharedRefBase::make<KeyMintDevice>(std::move(dev), securityLevel);
     }
     return {};
-}
-
-std::shared_ptr<IKeyMintDevice>
-KeyMintDevice::createKeyMintDevice(KeyMintSecurityLevel securityLevel) {
-    if (securityLevel == KeyMintSecurityLevel::SOFTWARE) {
-        return getSoftwareKeymintDevice();
-    } else {
-        return getWrappedKeymasterDevice(securityLevel);
-    }
 }
 
 std::shared_ptr<SharedSecret> SharedSecret::createSharedSecret(KeyMintSecurityLevel securityLevel) {
