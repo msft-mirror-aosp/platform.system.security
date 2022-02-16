@@ -14,13 +14,20 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef __VINTF_H__
+#define __VINTF_H__
 
-#include "rust/cxx.h"
+#include <stddef.h>
 
-rust::Vec<rust::String> get_hal_names();
-rust::Vec<rust::String> get_hal_names_and_versions();
-rust::Vec<rust::String> get_hidl_instances(rust::Str package, size_t major_version,
-                                           size_t minor_version, rust::Str interfaceName);
-rust::Vec<rust::String> get_aidl_instances(rust::Str package, size_t version,
-                                           rust::Str interfaceName);
+extern "C" {
+
+char** getHalNames(size_t* len);
+char** getHalNamesAndVersions(size_t* len);
+char** getHidlInstances(size_t* len, const char* package, size_t major_version,
+                        size_t minor_version, const char* interfaceName);
+char** getAidlInstances(size_t* len, const char* package, size_t version,
+                        const char* interfaceName);
+void freeNames(char** names, size_t len);
+}
+
+#endif  //  __VINTF_H__
