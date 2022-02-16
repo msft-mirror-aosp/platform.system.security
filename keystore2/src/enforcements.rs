@@ -28,13 +28,14 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     KeyParameter::KeyParameter as KmKeyParameter, KeyPurpose::KeyPurpose, Tag::Tag,
 };
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
-    TimeStampToken::TimeStampToken,
+    ISecureClock::ISecureClock, TimeStampToken::TimeStampToken,
 };
 use android_security_authorization::aidl::android::security::authorization::ResponseCode::ResponseCode as AuthzResponseCode;
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, IKeystoreSecurityLevel::KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING,
     OperationChallenge::OperationChallenge,
 };
+use android_system_keystore2::binder::Strong;
 use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, HashSet},
@@ -218,10 +219,13 @@ impl TokenReceiver {
 }
 
 fn get_timestamp_token(challenge: i64) -> Result<TimeStampToken, Error> {
-    let dev = get_timestamp_service().expect(concat!(
-        "Secure Clock service must be present ",
-        "if TimeStampTokens are required."
-    ));
+    let dev: Strong<dyn ISecureClock> = get_timestamp_service()
+        .expect(concat!(
+            "Secure Clock service must be present ",
+            "if TimeStampTokens are required."
+        ))
+        .get_interface()
+        .expect("Fatal: Timestamp service does not implement ISecureClock.");
     map_binder_status(dev.generateTimeStamp(challenge))
 }
 
@@ -450,7 +454,7 @@ impl Enforcements {
                         KeyParameterValue::Algorithm(Algorithm::RSA)
                         | KeyParameterValue::Algorithm(Algorithm::EC) => {
                             return Err(Error::Km(Ec::UNSUPPORTED_PURPOSE)).context(
-                                "In authorize_create: public operations on asymmetric keys are not \
+                                "In authorize_create: public operations on asymmetric keys are not
                                  supported.",
                             );
                         }
@@ -566,7 +570,8 @@ impl Enforcements {
         // if both NO_AUTH_REQUIRED and USER_SECURE_ID tags are present, return error
         if !user_secure_ids.is_empty() && no_auth_required {
             return Err(Error::Km(Ec::INVALID_KEY_BLOB)).context(
-                "In authorize_create: key has both NO_AUTH_REQUIRED and USER_SECURE_ID tags.",
+                "In authorize_create: key has both NO_AUTH_REQUIRED
+                and USER_SECURE_ID tags.",
             );
         }
 
@@ -575,8 +580,8 @@ impl Enforcements {
             || (user_auth_type.is_none() && !user_secure_ids.is_empty())
         {
             return Err(Error::Km(Ec::KEY_USER_NOT_AUTHENTICATED)).context(
-                "In authorize_create: Auth required, but either auth type or secure ids \
-                 are not present.",
+                "In authorize_create: Auth required, but either auth type or secure ids
+                are not present.",
             );
         }
 
@@ -586,7 +591,8 @@ impl Enforcements {
             && op_params.iter().any(|kp| kp.tag == Tag::NONCE)
         {
             return Err(Error::Km(Ec::CALLER_NONCE_PROHIBITED)).context(
-                "In authorize_create, NONCE is present, although CALLER_NONCE is not present",
+                "In authorize_create, NONCE is present,
+                    although CALLER_NONCE is not present",
             );
         }
 
@@ -600,7 +606,7 @@ impl Enforcements {
         }
 
         if let Some(level) = max_boot_level {
-            if !SUPER_KEY.read().unwrap().level_accessible(level) {
+            if !SUPER_KEY.level_accessible(level) {
                 return Err(Error::Km(Ec::BOOT_LEVEL_EXCEEDED))
                     .context("In authorize_create: boot level is too late.");
             }
@@ -627,7 +633,7 @@ impl Enforcements {
 
         let hat_and_last_off_body = if need_auth_token {
             let hat_and_last_off_body = Self::find_auth_token(|hat: &AuthTokenEntry| {
-                if let (Some(auth_type), true) = (user_auth_type, timeout_bound) {
+                if let (Some(auth_type), true) = (user_auth_type, has_sids) {
                     hat.satisfies(&user_secure_ids, auth_type)
                 } else {
                     unlocked_device_required
@@ -835,12 +841,8 @@ impl Enforcements {
                         .context("In get_auth_tokens: No auth token found.");
                 }
             } else {
-                return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND)).context(
-                    concat!(
-                        "In get_auth_tokens: No auth token found for ",
-                        "the given challenge and passed-in auth token max age is zero."
-                    ),
-                );
+                return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND))
+                    .context("In get_auth_tokens: Passed-in auth token max age is zero.");
             }
         };
         // Wait and obtain the timestamp token from secure clock service.
