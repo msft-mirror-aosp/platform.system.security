@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Implements ZVec, a vector that is mlocked during its lifetime and zeroed
-//! when dropped.
-
+use crate::error::Error;
 use nix::sys::mman::{mlock, munlock};
 use std::convert::TryFrom;
 use std::fmt;
@@ -29,14 +27,6 @@ use std::ptr::write_volatile;
 pub struct ZVec {
     elems: Box<[u8]>,
     len: usize,
-}
-
-/// ZVec specific error codes.
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
-pub enum Error {
-    /// Underlying libc error.
-    #[error(transparent)]
-    NixError(#[from] nix::Error),
 }
 
 impl ZVec {
@@ -57,14 +47,6 @@ impl ZVec {
         if len <= self.elems.len() {
             self.len = len;
         }
-    }
-
-    /// Attempts to make a clone of the Zvec. This may fail due trying to mlock
-    /// the new memory region.
-    pub fn try_clone(&self) -> Result<Self, Error> {
-        let mut result = Self::new(self.len())?;
-        result[..].copy_from_slice(&self[..]);
-        Ok(result)
     }
 }
 
