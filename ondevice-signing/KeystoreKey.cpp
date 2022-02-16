@@ -119,7 +119,7 @@ Result<std::vector<uint8_t>> KeystoreKey::createKey() {
     KeyMetadata metadata;
     auto status = mSecurityLevel->generateKey(mDescriptor, {}, params, 0, {}, &metadata);
     if (!status.isOk()) {
-        return Error() << "Failed to create new key: " << status;
+        return Error() << "Failed to create new key";
     }
 
     // Extract the public key from the certificate, HMAC it and store the signature
@@ -172,13 +172,11 @@ bool KeystoreKey::initialize() {
 
     auto key = getOrCreateKey();
     if (!key.ok()) {
-        // Delete the HMAC, just in case signing failed, and we could recover by recreating it.
-        mHmacKey.deleteKey();
         LOG(ERROR) << key.error().message();
         return false;
     }
     mPublicKey = *key;
-    LOG(INFO) << "Initialized Keystore key.";
+    LOG(ERROR) << "Initialized Keystore key.";
     return true;
 }
 
@@ -299,13 +297,19 @@ Result<std::string> KeystoreKey::sign(const std::string& message) const {
 
     auto status = mSecurityLevel->createOperation(mDescriptor, opParameters, false, &opResponse);
     if (!status.isOk()) {
-        return Error() << "Failed to create keystore signing operation: " << status;
+        return Error() << "Failed to create keystore signing operation: "
+                       << status.serviceSpecificErrorCode();
     }
     auto operation = opResponse.iOperation;
 
-    std::optional<std::vector<uint8_t>> input{std::in_place, message.begin(), message.end()};
+    std::optional<std::vector<uint8_t>> out;
+    status = operation->update({message.begin(), message.end()}, &out);
+    if (!status.isOk()) {
+        return Error() << "Failed to call keystore update operation.";
+    }
+
     std::optional<std::vector<uint8_t>> signature;
-    status = operation->finish(input, {}, &signature);
+    status = operation->finish({}, {}, &signature);
     if (!status.isOk()) {
         return Error() << "Failed to call keystore finish operation.";
     }

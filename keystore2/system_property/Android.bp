@@ -21,26 +21,33 @@ package {
     default_applicable_licenses: ["system_security_license"],
 }
 
-aidl_interface {
-    name: "android.security.dice",
-    srcs: [ "android/security/dice/*.aidl" ],
-    unstable: true,
-    imports: ["android.hardware.security.dice-V1"],
-    backend: {
-         java: {
-            enabled: false,
-            platform_apis: false,
-        },
-        rust: {
-            enabled: true,
-            apex_available: [
-                "//apex_available:platform",
-                "com.android.compos",
-            ],
-        },
-        ndk: {
-            enabled: true,
-            apps_enabled: false,
-        }
-    },
+rust_bindgen {
+    name: "libkeystore2_system_property_bindgen",
+    wrapper_src: "system_property_bindgen.hpp",
+    crate_name: "keystore2_system_property_bindgen",
+    source_stem: "bindings",
+
+    bindgen_flags: [
+        "--size_t-is-usize",
+        "--allowlist-function=__system_property_find",
+        "--allowlist-function=__system_property_read_callback",
+        "--allowlist-function=__system_property_set",
+        "--allowlist-function=__system_property_wait",
+    ],
+}
+
+rust_library {
+    name: "libkeystore2_system_property-rust",
+    crate_name: "keystore2_system_property",
+    srcs: [
+        "lib.rs",
+    ],
+    rustlibs: [
+        "libanyhow",
+        "libkeystore2_system_property_bindgen",
+        "libthiserror",
+    ],
+    shared_libs: [
+        "libbase",
+    ],
 }
