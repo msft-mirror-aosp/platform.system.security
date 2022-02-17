@@ -10,7 +10,23 @@
       "name": "keystore2_test"
     },
     {
+      "name": "keystore2_test_utils_test"
+    },
+    {
       "name": "CtsIdentityTestCases"
+    },
+    {
+      "name": "CtsKeystoreTestCases",
+      "options": [
+        {
+          "include-annotation": "android.platform.test.annotations.RequiresDevice"
+        }
+      ]
+    }
+  ],
+  "postsubmit": [
+    {
+      "name": "CtsKeystorePerformanceTestCases"
     }
   ]
 }
