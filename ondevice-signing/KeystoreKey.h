@@ -20,7 +20,6 @@
 
 #include <android-base/macros.h>
 #include <android-base/result.h>
-#include <android-base/unique_fd.h>
 
 #include <utils/StrongPointer.h>
 
