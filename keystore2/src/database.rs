@@ -45,6 +45,7 @@ mod perboot;
 pub(crate) mod utils;
 mod versioning;
 
+use crate::gc::Gc;
 use crate::impl_metadata; // This is in db_utils.rs
 use crate::key_parameter::{KeyParameter, Tag};
 use crate::metrics_store::log_rkp_error_stats;
@@ -54,7 +55,6 @@ use crate::{
     error::{Error as KsError, ErrorCode, ResponseCode},
     super_key::SuperKeyType,
 };
-use crate::{gc::Gc, super_key::USER_SUPER_KEY};
 use anyhow::{anyhow, Context, Result};
 use std::{convert::TryFrom, convert::TryInto, ops::Deref, time::SystemTimeError};
 use utils as db_utils;
@@ -82,7 +82,7 @@ use log::error;
 #[cfg(not(test))]
 use rand::prelude::random;
 use rusqlite::{
-    params,
+    params, params_from_iter,
     types::FromSql,
     types::FromSqlResult,
     types::ToSqlOutput,
@@ -142,7 +142,7 @@ impl KeyMetaData {
             let db_tag: i64 = row.get(0).context("Failed to read tag.")?;
             metadata.insert(
                 db_tag,
-                KeyMetaEntry::new_from_sql(db_tag, &SqlField::new(1, &row))
+                KeyMetaEntry::new_from_sql(db_tag, &SqlField::new(1, row))
                     .context("Failed to read KeyMetaEntry.")?,
             );
             Ok(())
@@ -217,7 +217,7 @@ impl BlobMetaData {
             let db_tag: i64 = row.get(0).context("Failed to read tag.")?;
             metadata.insert(
                 db_tag,
-                BlobMetaEntry::new_from_sql(db_tag, &SqlField::new(1, &row))
+                BlobMetaEntry::new_from_sql(db_tag, &SqlField::new(1, row))
                     .context("Failed to read BlobMetaEntry.")?,
             );
             Ok(())
@@ -388,12 +388,12 @@ impl DateTime {
     }
 
     /// Returns unix epoch time in milliseconds.
-    pub fn to_millis_epoch(&self) -> i64 {
+    pub fn to_millis_epoch(self) -> i64 {
         self.0
     }
 
     /// Returns unix epoch time in seconds.
-    pub fn to_secs_epoch(&self) -> i64 {
+    pub fn to_secs_epoch(self) -> i64 {
         self.0 / 1000
     }
 }
@@ -576,6 +576,36 @@ impl Drop for KeyIdGuard {
 pub struct CertificateInfo {
     cert: Option<Vec<u8>>,
     cert_chain: Option<Vec<u8>>,
+}
+
+/// This type represents a Blob with its metadata and an optional superseded blob.
+#[derive(Debug)]
+pub struct BlobInfo<'a> {
+    blob: &'a [u8],
+    metadata: &'a BlobMetaData,
+    /// Superseded blobs are an artifact of legacy import. In some rare occasions
+    /// the key blob needs to be upgraded during import. In that case two
+    /// blob are imported, the superseded one will have to be imported first,
+    /// so that the garbage collector can reap it.
+    superseded_blob: Option<(&'a [u8], &'a BlobMetaData)>,
+}
+
+impl<'a> BlobInfo<'a> {
+    /// Create a new instance of blob info with blob and corresponding metadata
+    /// and no superseded blob info.
+    pub fn new(blob: &'a [u8], metadata: &'a BlobMetaData) -> Self {
+        Self { blob, metadata, superseded_blob: None }
+    }
+
+    /// Create a new instance of blob info with blob and corresponding metadata
+    /// as well as superseded blob info.
+    pub fn new_with_superseded(
+        blob: &'a [u8],
+        metadata: &'a BlobMetaData,
+        superseded_blob: Option<(&'a [u8], &'a BlobMetaData)>,
+    ) -> Self {
+        Self { blob, metadata, superseded_blob }
+    }
 }
 
 impl CertificateInfo {
@@ -832,7 +862,7 @@ impl KeystoreDB {
     const UPGRADERS: &'static [fn(&Transaction) -> Result<u32>] = &[Self::from_0_to_1];
 
     /// Name of the file that holds the cross-boot persistent database.
-    pub const PERSISTENT_DB_FILENAME: &'static str = &"persistent.sqlite";
+    pub const PERSISTENT_DB_FILENAME: &'static str = "persistent.sqlite";
 
     /// This will create a new database connection connecting the two
     /// files persistent.sqlite and perboot.sqlite in the given directory.
@@ -842,7 +872,7 @@ impl KeystoreDB {
     pub fn new(db_root: &Path, gc: Option<Arc<Gc>>) -> Result<Self> {
         let _wp = wd::watch_millis("KeystoreDB::new", 500);
 
-        let persistent_path = Self::make_persistent_path(&db_root)?;
+        let persistent_path = Self::make_persistent_path(db_root)?;
         let conn = Self::make_connection(&persistent_path)?;
 
         let mut db = Self { conn, gc, perboot: perboot::PERBOOT_DB.clone() };
@@ -1029,7 +1059,7 @@ impl KeystoreDB {
         params: &[&str],
     ) -> Result<StorageStats> {
         let (total, unused) = self.with_transaction(TransactionBehavior::Deferred, |tx| {
-            tx.query_row(query, params, |row| Ok((row.get(0)?, row.get(1)?)))
+            tx.query_row(query, params_from_iter(params), |row| Ok((row.get(0)?, row.get(1)?)))
                 .with_context(|| {
                     format!("get_storage_stat: Error size of storage type {}", storage_type.0)
                 })
@@ -1244,7 +1274,7 @@ impl KeystoreDB {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             let key_descriptor =
                 KeyDescriptor { domain, nspace, alias: Some(alias.to_string()), blob: None };
-            let result = Self::load_key_entry_id(&tx, &key_descriptor, key_type);
+            let result = Self::load_key_entry_id(tx, &key_descriptor, key_type);
             match result {
                 Ok(_) => Ok(true),
                 Err(error) => match error.root_cause().downcast_ref::<KsError>() {
@@ -1290,7 +1320,7 @@ impl KeystoreDB {
             key_metadata.store_in_db(key_id, tx).context("KeyMetaData::store_in_db failed")?;
 
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id,
                 SubComponentType::KEY_BLOB,
                 Some(blob),
@@ -1320,10 +1350,10 @@ impl KeystoreDB {
                 alias: Some(key_type.alias.into()),
                 blob: None,
             };
-            let id = Self::load_key_entry_id(&tx, &key_descriptor, KeyType::Super);
+            let id = Self::load_key_entry_id(tx, &key_descriptor, KeyType::Super);
             match id {
                 Ok(id) => {
-                    let key_entry = Self::load_key_components(&tx, KeyEntryLoadBits::KM, id)
+                    let key_entry = Self::load_key_components(tx, KeyEntryLoadBits::KM, id)
                         .context("In load_super_key. Failed to load key entry.")?;
                     Ok(Some((KEY_ID_LOCK.get(id), key_entry)))
                 }
@@ -1383,7 +1413,7 @@ impl KeystoreDB {
             let (id, entry) = match id {
                 Some(id) => (
                     id,
-                    Self::load_key_components(&tx, KeyEntryLoadBits::KM, id)
+                    Self::load_key_components(tx, KeyEntryLoadBits::KM, id)
                         .context("In get_or_create_key_with.")?,
                 ),
 
@@ -1409,7 +1439,7 @@ impl KeystoreDB {
                     let (blob, metadata) =
                         create_new_key().context("In get_or_create_key_with.")?;
                     Self::set_blob_internal(
-                        &tx,
+                        tx,
                         id,
                         SubComponentType::KEY_BLOB,
                         Some(&blob),
@@ -1560,7 +1590,7 @@ impl KeystoreDB {
                 .context("In create_key_entry")?,
             );
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id.0,
                 SubComponentType::KEY_BLOB,
                 Some(private_key),
@@ -1569,7 +1599,7 @@ impl KeystoreDB {
             let mut metadata = KeyMetaData::new();
             metadata.add(KeyMetaEntry::AttestationMacedPublicKey(maced_public_key.to_vec()));
             metadata.add(KeyMetaEntry::AttestationRawPubKey(raw_public_key.to_vec()));
-            metadata.store_in_db(key_id.0, &tx)?;
+            metadata.store_in_db(key_id.0, tx)?;
             Ok(()).no_gc()
         })
         .context("In create_attestation_key_entry")
@@ -1592,7 +1622,7 @@ impl KeystoreDB {
         let _wp = wd::watch_millis("KeystoreDB::set_blob", 500);
 
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            Self::set_blob_internal(&tx, key_id.0, sc_type, blob, blob_metadata).need_gc()
+            Self::set_blob_internal(tx, key_id.0, sc_type, blob, blob_metadata).need_gc()
         })
         .context("In set_blob.")
     }
@@ -1606,7 +1636,7 @@ impl KeystoreDB {
 
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             Self::set_blob_internal(
-                &tx,
+                tx,
                 Self::UNASSIGNED_KEY_ID,
                 SubComponentType::KEY_BLOB,
                 Some(blob),
@@ -1699,7 +1729,7 @@ impl KeystoreDB {
     #[cfg(test)]
     fn insert_key_metadata(&mut self, key_id: &KeyIdGuard, metadata: &KeyMetaData) -> Result<()> {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
-            metadata.store_in_db(key_id.0, &tx).no_gc()
+            metadata.store_in_db(key_id.0, tx).no_gc()
         })
         .context("In insert_key_metadata.")
     }
@@ -1761,16 +1791,16 @@ impl KeystoreDB {
             metadata.add(KeyMetaEntry::AttestationExpirationDate(DateTime::from_millis_epoch(
                 expiration_date,
             )));
-            metadata.store_in_db(key_id, &tx).context("Failed to insert key metadata.")?;
+            metadata.store_in_db(key_id, tx).context("Failed to insert key metadata.")?;
             Self::set_blob_internal(
-                &tx,
+                tx,
                 key_id,
                 SubComponentType::CERT_CHAIN,
                 Some(cert_chain),
                 None,
             )
             .context("Failed to insert cert chain")?;
-            Self::set_blob_internal(&tx, key_id, SubComponentType::CERT, Some(batch_cert), None)
+            Self::set_blob_internal(tx, key_id, SubComponentType::CERT, Some(batch_cert), None)
                 .context("Failed to insert cert")?;
             Ok(()).no_gc()
         })
@@ -1914,7 +1944,7 @@ impl KeystoreDB {
             );
             let mut num_deleted = 0;
             for id in key_ids_to_check.iter().filter(|kt| kt.1 < curr_time).map(|kt| kt.0) {
-                if Self::mark_unreferenced(&tx, id)? {
+                if Self::mark_unreferenced(tx, id)? {
                     num_deleted += 1;
                 }
             }
@@ -1941,7 +1971,7 @@ impl KeystoreDB {
                 .context("Failed to execute statement")?;
             let num_deleted = keys_to_delete
                 .iter()
-                .map(|id| Self::mark_unreferenced(&tx, *id))
+                .map(|id| Self::mark_unreferenced(tx, *id))
                 .collect::<Result<Vec<bool>>>()
                 .context("Failed to execute mark_unreferenced on a keyid")?
                 .into_iter()
@@ -2227,13 +2257,13 @@ impl KeystoreDB {
     /// fields, and rebinds the given alias to the new key.
     /// The boolean returned is a hint for the garbage collector. If true, a key was replaced,
     /// is now unreferenced and needs to be collected.
-    #[allow(clippy::clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn store_new_key(
         &mut self,
         key: &KeyDescriptor,
         key_type: KeyType,
         params: &[KeyParameter],
-        blob_info: &(&[u8], &BlobMetaData),
+        blob_info: &BlobInfo,
         cert_info: &CertificateInfo,
         metadata: &KeyMetaData,
         km_uuid: &Uuid,
@@ -2253,17 +2283,37 @@ impl KeystoreDB {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             let key_id = Self::create_key_entry_internal(tx, &domain, namespace, key_type, km_uuid)
                 .context("Trying to create new key entry.")?;
-            let (blob, blob_metadata) = *blob_info;
+            let BlobInfo { blob, metadata: blob_metadata, superseded_blob } = *blob_info;
+
+            // In some occasions the key blob is already upgraded during the import.
+            // In order to make sure it gets properly deleted it is inserted into the
+            // database here and then immediately replaced by the superseding blob.
+            // The garbage collector will then subject the blob to deleteKey of the
+            // KM back end to permanently invalidate the key.
+            let need_gc = if let Some((blob, blob_metadata)) = superseded_blob {
+                Self::set_blob_internal(
+                    tx,
+                    key_id.id(),
+                    SubComponentType::KEY_BLOB,
+                    Some(blob),
+                    Some(blob_metadata),
+                )
+                .context("Trying to insert superseded key blob.")?;
+                true
+            } else {
+                false
+            };
+
             Self::set_blob_internal(
                 tx,
                 key_id.id(),
                 SubComponentType::KEY_BLOB,
                 Some(blob),
-                Some(&blob_metadata),
+                Some(blob_metadata),
             )
             .context("Trying to insert the key blob.")?;
             if let Some(cert) = &cert_info.cert {
-                Self::set_blob_internal(tx, key_id.id(), SubComponentType::CERT, Some(&cert), None)
+                Self::set_blob_internal(tx, key_id.id(), SubComponentType::CERT, Some(cert), None)
                     .context("Trying to insert the certificate.")?;
             }
             if let Some(cert_chain) = &cert_info.cert_chain {
@@ -2271,7 +2321,7 @@ impl KeystoreDB {
                     tx,
                     key_id.id(),
                     SubComponentType::CERT_CHAIN,
-                    Some(&cert_chain),
+                    Some(cert_chain),
                     None,
                 )
                 .context("Trying to insert the certificate chain.")?;
@@ -2279,8 +2329,9 @@ impl KeystoreDB {
             Self::insert_keyparameter_internal(tx, &key_id, params)
                 .context("Trying to insert key parameters.")?;
             metadata.store_in_db(key_id.id(), tx).context("Trying to insert key metadata.")?;
-            let need_gc = Self::rebind_alias(tx, &key_id, &alias, &domain, namespace, key_type)
-                .context("Trying to rebind alias.")?;
+            let need_gc = Self::rebind_alias(tx, &key_id, alias, &domain, namespace, key_type)
+                .context("Trying to rebind alias.")?
+                || need_gc;
             Ok(key_id).do_gc(need_gc)
         })
         .context("In store_new_key.")
@@ -2329,7 +2380,7 @@ impl KeystoreDB {
 
             metadata.store_in_db(key_id.id(), tx).context("Trying to insert key metadata.")?;
 
-            let need_gc = Self::rebind_alias(tx, &key_id, &alias, &domain, namespace, key_type)
+            let need_gc = Self::rebind_alias(tx, &key_id, alias, &domain, namespace, key_type)
                 .context("Trying to rebind alias.")?;
             Ok(key_id).do_gc(need_gc)
         })
@@ -2398,7 +2449,7 @@ impl KeystoreDB {
                 if access_key.domain == Domain::APP {
                     access_key.nspace = caller_uid as i64;
                 }
-                let key_id = Self::load_key_entry_id(&tx, &access_key, key_type)
+                let key_id = Self::load_key_entry_id(tx, &access_key, key_type)
                     .with_context(|| format!("With key.domain = {:?}.", access_key.domain))?;
 
                 Ok((key_id, access_key, None))
@@ -2563,7 +2614,7 @@ impl KeystoreDB {
             let tag = Tag(row.get(0).context("Failed to read tag.")?);
             let sec_level = SecurityLevel(row.get(2).context("Failed to read sec_level.")?);
             parameters.push(
-                KeyParameter::new_from_sql(tag, &SqlField::new(1, &row), sec_level)
+                KeyParameter::new_from_sql(tag, &SqlField::new(1, row), sec_level)
                     .context("Failed to read KeyParameter.")?,
             );
             Ok(())
@@ -2895,7 +2946,6 @@ impl KeystoreDB {
                      ) OR (
                          key_type = ?
                          AND namespace = ?
-                         AND alias = ?
                          AND state = ?
                      );",
                     aid_user_offset = AID_USER_OFFSET
@@ -2915,7 +2965,6 @@ impl KeystoreDB {
                     // OR super key:
                     KeyType::Super,
                     user_id,
-                    USER_SUPER_KEY.alias,
                     KeyLifeCycle::Live
                 ])
                 .context("In unbind_keys_for_user. Failed to query the keys created by apps.")?;
@@ -2941,7 +2990,7 @@ impl KeystoreDB {
                         }
                     }
                 }
-                notify_gc = Self::mark_unreferenced(&tx, key_id)
+                notify_gc = Self::mark_unreferenced(tx, key_id)
                     .context("In unbind_keys_for_user.")?
                     || notify_gc;
             }
@@ -2955,16 +3004,15 @@ impl KeystoreDB {
         load_bits: KeyEntryLoadBits,
         key_id: i64,
     ) -> Result<KeyEntry> {
-        let metadata = KeyMetaData::load_from_db(key_id, &tx).context("In load_key_components.")?;
+        let metadata = KeyMetaData::load_from_db(key_id, tx).context("In load_key_components.")?;
 
         let (has_km_blob, key_blob_info, cert_blob, cert_chain_blob) =
-            Self::load_blob_components(key_id, load_bits, &tx)
-                .context("In load_key_components.")?;
+            Self::load_blob_components(key_id, load_bits, tx).context("In load_key_components.")?;
 
-        let parameters = Self::load_key_parameters(key_id, &tx)
+        let parameters = Self::load_key_parameters(key_id, tx)
             .context("In load_key_components: Trying to load key parameters.")?;
 
-        let km_uuid = Self::get_key_km_uuid(&tx, key_id)
+        let km_uuid = Self::get_key_km_uuid(tx, key_id)
             .context("In load_key_components: Trying to get KM uuid.")?;
 
         Ok(KeyEntry {
@@ -3048,7 +3096,7 @@ impl KeystoreDB {
             // But even if we load the access tuple by grant here, the permission
             // check denies the attempt to create a grant by grant descriptor.
             let (key_id, access_key_descriptor, _) =
-                Self::load_access_tuple(&tx, key, KeyType::Client, caller_uid)
+                Self::load_access_tuple(tx, key, KeyType::Client, caller_uid)
                     .context("In grant")?;
 
             // Perform access control. It is vital that we return here if the permission
@@ -3108,7 +3156,7 @@ impl KeystoreDB {
             // Load the key_id and complete the access control tuple.
             // We ignore the access vector here because grants cannot be granted.
             let (key_id, access_key_descriptor, _) =
-                Self::load_access_tuple(&tx, key, KeyType::Client, caller_uid)
+                Self::load_access_tuple(tx, key, KeyType::Client, caller_uid)
                     .context("In ungrant.")?;
 
             // Perform access control. We must return here if the permission
@@ -3210,7 +3258,7 @@ impl KeystoreDB {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use super::*;
     use crate::key_parameter::{
@@ -3219,7 +3267,7 @@ mod tests {
     };
     use crate::key_perm_set;
     use crate::permission::{KeyPerm, KeyPermSet};
-    use crate::super_key::SuperKeyManager;
+    use crate::super_key::{SuperKeyManager, USER_SUPER_KEY, SuperEncryptionAlgorithm, SuperKeyType};
     use keystore2_test_utils::TempDir;
     use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
         HardwareAuthToken::HardwareAuthToken,
@@ -3234,13 +3282,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fmt::Write;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::thread;
     use std::time::{Duration, SystemTime};
+    use crate::utils::AesGcm;
     #[cfg(disabled)]
     use std::time::Instant;
 
-    fn new_test_db() -> Result<KeystoreDB> {
+    pub fn new_test_db() -> Result<KeystoreDB> {
         let conn = KeystoreDB::make_connection("file::memory:")?;
 
         let mut db = KeystoreDB { conn, gc: None, perboot: Arc::new(perboot::PerbootDB::new()) };
@@ -3254,7 +3303,7 @@ mod tests {
     where
         F: Fn(&Uuid, &[u8]) -> Result<()> + Send + 'static,
     {
-        let super_key: Arc<SuperKeyManager> = Default::default();
+        let super_key: Arc<RwLock<SuperKeyManager>> = Default::default();
 
         let gc_db = KeystoreDB::new(path, None).expect("Failed to open test gc db_connection.");
         let gc = Gc::new_init_with(Default::default(), move || (Box::new(cb), gc_db, super_key));
@@ -3466,7 +3515,7 @@ mod tests {
             load_attestation_key_pool(&mut db, expiration_date, namespace, base_byte)?;
         let chain =
             db.retrieve_attestation_key_and_cert_chain(Domain::APP, namespace, &KEYSTORE_UUID)?;
-        assert_eq!(true, chain.is_some());
+        assert!(chain.is_some());
         let cert_chain = chain.unwrap();
         assert_eq!(cert_chain.private_key.to_vec(), loaded_values.priv_key);
         assert_eq!(cert_chain.batch_cert, loaded_values.batch_cert);
@@ -3705,8 +3754,8 @@ mod tests {
             alias: Some("key".to_string()),
             blob: None,
         };
-        const PVEC1: KeyPermSet = key_perm_set![KeyPerm::use_(), KeyPerm::get_info()];
-        const PVEC2: KeyPermSet = key_perm_set![KeyPerm::use_()];
+        const PVEC1: KeyPermSet = key_perm_set![KeyPerm::Use, KeyPerm::GetInfo];
+        const PVEC2: KeyPermSet = key_perm_set![KeyPerm::Use];
 
         // Reset totally predictable random number generator in case we
         // are not the first test running on this thread.
@@ -4182,7 +4231,7 @@ mod tests {
                 },
                 1,
                 2,
-                key_perm_set![KeyPerm::use_()],
+                key_perm_set![KeyPerm::Use],
                 |_k, _av| Ok(()),
             )
             .unwrap();
@@ -4192,7 +4241,7 @@ mod tests {
         let (_key_guard, key_entry) = db
             .load_key_entry(&granted_key, KeyType::Client, KeyEntryLoadBits::BOTH, 2, |k, av| {
                 assert_eq!(Domain::GRANT, k.domain);
-                assert!(av.unwrap().includes(KeyPerm::use_()));
+                assert!(av.unwrap().includes(KeyPerm::Use));
                 Ok(())
             })
             .unwrap();
@@ -4239,7 +4288,7 @@ mod tests {
             },
             OWNER_UID,
             GRANTEE_UID,
-            key_perm_set![KeyPerm::use_()],
+            key_perm_set![KeyPerm::Use],
             |_k, _av| Ok(()),
         )
         .unwrap();
@@ -4258,7 +4307,7 @@ mod tests {
                 |k, av| {
                     assert_eq!(Domain::APP, k.domain);
                     assert_eq!(OWNER_UID as i64, k.nspace);
-                    assert!(av.unwrap().includes(KeyPerm::use_()));
+                    assert!(av.unwrap().includes(KeyPerm::Use));
                     Ok(())
                 },
             )
@@ -4309,8 +4358,8 @@ mod tests {
         let mut db = new_test_db()?;
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4378,8 +4427,8 @@ mod tests {
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
         const DESTINATION_NAMESPACE: i64 = 1000i64;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4446,8 +4495,8 @@ mod tests {
         let mut db = new_test_db()?;
         const SOURCE_UID: u32 = 1u32;
         const DESTINATION_UID: u32 = 2u32;
-        static SOURCE_ALIAS: &str = &"SOURCE_ALIAS";
-        static DESTINATION_ALIAS: &str = &"DESTINATION_ALIAS";
+        static SOURCE_ALIAS: &str = "SOURCE_ALIAS";
+        static DESTINATION_ALIAS: &str = "DESTINATION_ALIAS";
         let key_id_guard =
             make_test_key_entry(&mut db, Domain::APP, SOURCE_UID as i64, SOURCE_ALIAS, None)
                 .context("test_insert_and_load_full_keyentry_from_grant_by_key_id")?;
@@ -4479,9 +4528,9 @@ mod tests {
 
     #[test]
     fn test_upgrade_0_to_1() {
-        const ALIAS1: &str = &"test_upgrade_0_to_1_1";
-        const ALIAS2: &str = &"test_upgrade_0_to_1_2";
-        const ALIAS3: &str = &"test_upgrade_0_to_1_3";
+        const ALIAS1: &str = "test_upgrade_0_to_1_1";
+        const ALIAS2: &str = "test_upgrade_0_to_1_2";
+        const ALIAS3: &str = "test_upgrade_0_to_1_3";
         const UID: u32 = 33;
         let temp_dir = Arc::new(TempDir::new("test_upgrade_0_to_1").unwrap());
         let mut db = KeystoreDB::new(temp_dir.path(), None).unwrap();
@@ -4966,10 +5015,7 @@ mod tests {
                 Ok(KeyEntryRow {
                     id: row.get(0)?,
                     key_type: row.get(1)?,
-                    domain: match row.get(2)? {
-                        Some(i) => Some(Domain(i)),
-                        None => None,
-                    },
+                    domain: row.get::<_, Option<_>>(2)?.map(Domain),
                     namespace: row.get(3)?,
                     alias: row.get(4)?,
                     state: row.get(5)?,
@@ -5460,6 +5506,80 @@ mod tests {
     }
 
     #[test]
+    fn test_unbind_keys_for_user_removes_superkeys() -> Result<()> {
+        let mut db = new_test_db()?;
+        let super_key = keystore2_crypto::generate_aes256_key()?;
+        let pw: keystore2_crypto::Password = (&b"xyzabc"[..]).into();
+        let (encrypted_super_key, metadata) =
+            SuperKeyManager::encrypt_with_password(&super_key, &pw)?;
+
+        let key_name_enc = SuperKeyType {
+            alias: "test_super_key_1",
+            algorithm: SuperEncryptionAlgorithm::Aes256Gcm,
+        };
+
+        let key_name_nonenc = SuperKeyType {
+            alias: "test_super_key_2",
+            algorithm: SuperEncryptionAlgorithm::Aes256Gcm,
+        };
+
+        // Install two super keys.
+        db.store_super_key(
+            1,
+            &key_name_nonenc,
+            &super_key,
+            &BlobMetaData::new(),
+            &KeyMetaData::new(),
+        )?;
+        db.store_super_key(1, &key_name_enc, &encrypted_super_key, &metadata, &KeyMetaData::new())?;
+
+        // Check that both can be found in the database.
+        assert!(db.load_super_key(&key_name_enc, 1)?.is_some());
+        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
+
+        // Install the same keys for a different user.
+        db.store_super_key(
+            2,
+            &key_name_nonenc,
+            &super_key,
+            &BlobMetaData::new(),
+            &KeyMetaData::new(),
+        )?;
+        db.store_super_key(2, &key_name_enc, &encrypted_super_key, &metadata, &KeyMetaData::new())?;
+
+        // Check that the second pair of keys can be found in the database.
+        assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
+        assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
+
+        // Delete only encrypted keys.
+        db.unbind_keys_for_user(1, true)?;
+
+        // The encrypted superkey should be gone now.
+        assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
+        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
+
+        // Reinsert the encrypted key.
+        db.store_super_key(1, &key_name_enc, &encrypted_super_key, &metadata, &KeyMetaData::new())?;
+
+        // Check that both can be found in the database, again..
+        assert!(db.load_super_key(&key_name_enc, 1)?.is_some());
+        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
+
+        // Delete all even unencrypted keys.
+        db.unbind_keys_for_user(1, false)?;
+
+        // Both should be gone now.
+        assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
+        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_none());
+
+        // Check that the second pair of keys was untouched.
+        assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
+        assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_store_super_key() -> Result<()> {
         let mut db = new_test_db()?;
         let pw: keystore2_crypto::Password = (&b"xyzabc"[..]).into();
@@ -5478,8 +5598,8 @@ mod tests {
             &KeyMetaData::new(),
         )?;
 
-        //check if super key exists
-        assert!(db.key_exists(Domain::APP, 1, &USER_SUPER_KEY.alias, KeyType::Super)?);
+        // Check if super key exists.
+        assert!(db.key_exists(Domain::APP, 1, USER_SUPER_KEY.alias, KeyType::Super)?);
 
         let (_, key_entry) = db.load_super_key(&USER_SUPER_KEY, 1)?.unwrap();
         let loaded_super_key = SuperKeyManager::extract_super_key_from_key_entry(
@@ -5489,9 +5609,9 @@ mod tests {
             None,
         )?;
 
-        let decrypted_secret_bytes =
-            loaded_super_key.aes_gcm_decrypt(&encrypted_secret, &iv, &tag)?;
+        let decrypted_secret_bytes = loaded_super_key.decrypt(&encrypted_secret, &iv, &tag)?;
         assert_eq!(secret_bytes, &*decrypted_secret_bytes);
+
         Ok(())
     }
 
@@ -5585,7 +5705,7 @@ mod tests {
                     && updated_stats[&k].unused_size == baseline[&k].unused_size,
                 "updated_stats:\n{}\nbaseline:\n{}",
                 stringify(&updated_stats),
-                stringify(&baseline)
+                stringify(baseline)
             );
         }
     }
@@ -5679,7 +5799,7 @@ mod tests {
             },
             OWNER as u32,
             123,
-            key_perm_set![KeyPerm::use_()],
+            key_perm_set![KeyPerm::Use],
             |_, _| Ok(()),
         )?;
 
