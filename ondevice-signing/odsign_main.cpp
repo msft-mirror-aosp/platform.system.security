@@ -44,6 +44,12 @@ using android::base::SetProperty;
 
 using OdsignInfo = ::odsign::proto::OdsignInfo;
 
+// Keystore boot level that the odsign key uses
+const int kKeyBootLevel = 30;
+const std::string kPublicKeySignature = "/data/misc/odsign/publickey.signature";
+const android::String16 kKeyAlias{"ondevice-signing"};
+constexpr int kKeyNspace = 101;  // odsign_key
+
 const std::string kSigningKeyCert = "/data/misc/odsign/key.cert";
 const std::string kOdsignInfo = "/data/misc/odsign/odsign.info";
 const std::string kOdsignInfoSignature = "/data/misc/odsign/odsign.info.signature";
@@ -51,18 +57,11 @@ const std::string kOdsignInfoSignature = "/data/misc/odsign/odsign.info.signatur
 const std::string kArtArtifactsDir = "/data/misc/apexdata/com.android.art/dalvik-cache";
 
 constexpr const char* kOdrefreshPath = "/apex/com.android.art/bin/odrefresh";
-constexpr const char* kCompOsVerifyPath = "/apex/com.android.compos/bin/compos_verify_key";
-constexpr const char* kFsVerityProcPath = "/proc/sys/fs/verity";
+constexpr const char* kCompOsVerifyPath = "/apex/com.android.compos/bin/compos_verify";
 
 constexpr bool kForceCompilation = false;
 constexpr bool kUseCompOs = true;
 
-const std::string kCompOsCert = "/data/misc/odsign/compos_key.cert";
-
-const std::string kCompOsCurrentPublicKey =
-    "/data/misc/apexdata/com.android.compos/current/key.pubkey";
-const std::string kCompOsPendingPublicKey =
-    "/data/misc/apexdata/com.android.compos/pending/key.pubkey";
 const std::string kCompOsPendingArtifactsDir = "/data/misc/apexdata/com.android.art/compos-pending";
 const std::string kCompOsInfo = kArtArtifactsDir + "/compos.info";
 const std::string kCompOsInfoSignature = kCompOsInfo + ".signature";
@@ -84,12 +83,6 @@ constexpr const char* kStopServiceProp = "ctl.stop";
 enum class CompOsInstance { kCurrent, kPending };
 
 namespace {
-
-std::vector<uint8_t> readBytesFromFile(const std::string& path) {
-    std::string str;
-    android::base::ReadFileToString(path, &str);
-    return std::vector<uint8_t>(str.begin(), str.end());
-}
 
 bool rename(const std::string& from, const std::string& to) {
     std::error_code ec;
@@ -180,108 +173,6 @@ Result<void> createX509RootCert(const SigningKey& key, const std::string& outPat
 
     auto keySignFunction = [&](const std::string& to_be_signed) { return key.sign(to_be_signed); };
     return createSelfSignedCertificate(*publicKey, keySignFunction, outPath);
-}
-
-Result<std::vector<uint8_t>> extractRsaPublicKeyFromLeafCert(const SigningKey& key,
-                                                             const std::string& certPath,
-                                                             const std::string& expectedCn) {
-    if (access(certPath.c_str(), F_OK) < 0) {
-        return ErrnoError() << "Certificate not found: " << certPath;
-    }
-    auto trustedPublicKey = key.getPublicKey();
-    if (!trustedPublicKey.ok()) {
-        return Error() << "Failed to retrieve signing public key: " << trustedPublicKey.error();
-    }
-
-    auto existingCertInfo = verifyAndExtractCertInfoFromX509(certPath, trustedPublicKey.value());
-    if (!existingCertInfo.ok()) {
-        return Error() << "Failed to verify certificate at " << certPath << ": "
-                       << existingCertInfo.error();
-    }
-
-    auto& actualCn = existingCertInfo.value().subjectCn;
-    if (actualCn != expectedCn) {
-        return Error() << "CN of existing certificate at " << certPath << " is " << actualCn
-                       << ", should be " << expectedCn;
-    }
-
-    return existingCertInfo.value().subjectRsaPublicKey;
-}
-
-// Attempt to start a CompOS VM for the specified instance to get it to
-// verify ita public key & key blob.
-bool startCompOsAndVerifyKey(CompOsInstance instance) {
-    bool isCurrent = instance == CompOsInstance::kCurrent;
-    const std::string& keyPath = isCurrent ? kCompOsCurrentPublicKey : kCompOsPendingPublicKey;
-    if (access(keyPath.c_str(), R_OK) != 0) {
-        return false;
-    }
-
-    const char* const argv[] = {kCompOsVerifyPath, "--instance", isCurrent ? "current" : "pending"};
-    int result =
-        logwrap_fork_execvp(arraysize(argv), argv, nullptr, false, LOG_ALOG, false, nullptr);
-    if (result == 0) {
-        return true;
-    }
-
-    LOG(ERROR) << kCompOsVerifyPath << " returned " << result;
-    return false;
-}
-
-Result<std::vector<uint8_t>> verifyCompOsKey(const SigningKey& signingKey) {
-    bool verified = false;
-
-    // If a pending key has been generated we don't know if it is the correct
-    // one for the pending CompOS VM, so we need to start it and ask it.
-    if (startCompOsAndVerifyKey(CompOsInstance::kPending)) {
-        verified = true;
-    }
-
-    if (!verified) {
-        // Alternatively if we signed a cert for the key on a previous boot, then we
-        // can use that straight away.
-        auto existing_key =
-            extractRsaPublicKeyFromLeafCert(signingKey, kCompOsCert, kCompOsSubject.commonName);
-        if (existing_key.ok()) {
-            LOG(INFO) << "Found and verified existing CompOS public key certificate: "
-                      << kCompOsCert;
-            return existing_key.value();
-        }
-    }
-
-    // Otherwise, if there is an existing key that we haven't signed yet, then we can sign
-    // it now if CompOS confirms it's OK.
-    if (!verified && startCompOsAndVerifyKey(CompOsInstance::kCurrent)) {
-        verified = true;
-    }
-
-    if (!verified) {
-        return Error() << "No valid CompOS key present.";
-    }
-
-    // If the pending key was verified it will have been promoted to current, so
-    // at this stage if there is a key it will be the current one.
-    auto publicKey = readBytesFromFile(kCompOsCurrentPublicKey);
-    if (publicKey.empty()) {
-        // This shouldn`t really happen.
-        return Error() << "Failed to read CompOS key.";
-    }
-
-    // One way or another we now have a valid public key. Persist a certificate so
-    // we can simplify the checks on subsequent boots.
-
-    auto signFunction = [&](const std::string& to_be_signed) {
-        return signingKey.sign(to_be_signed);
-    };
-    auto certStatus = createLeafCertificate(kCompOsSubject, publicKey, signFunction,
-                                            kSigningKeyCert, kCompOsCert);
-    if (!certStatus.ok()) {
-        return Error() << "Failed to create CompOS cert: " << certStatus.error();
-    }
-
-    LOG(INFO) << "Verified key, wrote new CompOS cert";
-
-    return publicKey;
 }
 
 Result<std::map<std::string, std::string>> computeDigests(const std::string& path) {
@@ -439,27 +330,12 @@ Result<void> verifyArtifacts(const SigningKey& key, bool supportsFsVerity) {
     return {};
 }
 
-Result<std::vector<uint8_t>> addCompOsCertToFsVerityKeyring(const SigningKey& signingKey) {
-    auto publicKey = verifyCompOsKey(signingKey);
-    if (!publicKey.ok()) {
-        return publicKey.error();
-    }
-
-    auto cert_add_result = addCertToFsVerityKeyring(kCompOsCert, "fsv_compos");
-    if (!cert_add_result.ok()) {
-        // Best efforts only - nothing we can do if deletion fails.
-        unlink(kCompOsCert.c_str());
-        return Error() << "Failed to add CompOS certificate to fs-verity keyring: "
-                       << cert_add_result.error();
-    }
-
-    return publicKey;
-}
-
-Result<OdsignInfo> getComposInfo(const std::vector<uint8_t>& compos_key) {
-    std::string compos_signature;
-    if (!android::base::ReadFileToString(kCompOsInfoSignature, &compos_signature)) {
-        return ErrnoError() << "Failed to read " << kCompOsInfoSignature;
+Result<OdsignInfo> getComposInfo() {
+    const char* const argv[] = {kCompOsVerifyPath, "--instance", "current"};
+    int result =
+        logwrap_fork_execvp(arraysize(argv), argv, nullptr, false, LOG_ALOG, false, nullptr);
+    if (result != 0) {
+        return Error() << kCompOsVerifyPath << " returned " << result;
     }
 
     std::string compos_info_str;
@@ -467,19 +343,10 @@ Result<OdsignInfo> getComposInfo(const std::vector<uint8_t>& compos_key) {
         return ErrnoError() << "Failed to read " << kCompOsInfo;
     }
 
-    // Delete the files - if they're valid we don't need them any more, and
-    // they'd confuse artifact verification; if they're not we never need to
-    // look at them again.
+    // Delete the files - we don't need them any more, and they'd confuse
+    // artifact verification
     if (unlink(kCompOsInfo.c_str()) != 0 || unlink(kCompOsInfoSignature.c_str()) != 0) {
         return ErrnoError() << "Unable to delete CompOS info/signature file";
-    }
-
-    // Verify the signature
-    auto verified = verifyRsaPublicKeySignature(compos_info_str, compos_signature, compos_key);
-    if (!verified.ok()) {
-        return Error() << kCompOsInfoSignature << " does not match.";
-    } else {
-        LOG(INFO) << kCompOsInfoSignature << " matches.";
     }
 
     OdsignInfo compos_info;
@@ -491,8 +358,7 @@ Result<OdsignInfo> getComposInfo(const std::vector<uint8_t>& compos_key) {
     return compos_info;
 }
 
-art::odrefresh::ExitCode checkCompOsPendingArtifacts(const std::vector<uint8_t>& compos_key,
-                                                     const SigningKey& signing_key,
+art::odrefresh::ExitCode checkCompOsPendingArtifacts(const SigningKey& signing_key,
                                                      bool* digests_verified) {
     if (!directoryHasContent(kCompOsPendingArtifactsDir)) {
         return art::odrefresh::ExitCode::kCompilationRequired;
@@ -527,7 +393,7 @@ art::odrefresh::ExitCode checkCompOsPendingArtifacts(const std::vector<uint8_t>&
 
     // Make sure the artifacts we have are genuinely produced by the current
     // instance of CompOS.
-    auto compos_info = getComposInfo(compos_key);
+    auto compos_info = getComposInfo();
     if (!compos_info.ok()) {
         LOG(WARNING) << compos_info.error();
     } else {
@@ -591,15 +457,15 @@ int main(int /* argc */, char** argv) {
         LOG(INFO) << "Device doesn't support updatable APEX, exiting.";
         return 0;
     }
-
-    auto keystoreResult = KeystoreKey::getInstance();
+    auto keystoreResult =
+        KeystoreKey::getInstance(kPublicKeySignature, kKeyAlias, kKeyNspace, kKeyBootLevel);
     if (!keystoreResult.ok()) {
         LOG(ERROR) << "Could not create keystore key: " << keystoreResult.error();
         return -1;
     }
     SigningKey* key = keystoreResult.value();
 
-    bool supportsFsVerity = access(kFsVerityProcPath, F_OK) == 0;
+    bool supportsFsVerity = SupportsFsVerity();
     if (!supportsFsVerity) {
         LOG(INFO) << "Device doesn't support fsverity. Falling back to full verification.";
     }
@@ -633,13 +499,7 @@ int main(int /* argc */, char** argv) {
     bool digests_verified = false;
 
     if (useCompOs) {
-        auto compos_key = addCompOsCertToFsVerityKeyring(*key);
-        if (!compos_key.ok()) {
-            LOG(WARNING) << compos_key.error();
-        } else {
-            odrefresh_status =
-                checkCompOsPendingArtifacts(compos_key.value(), *key, &digests_verified);
-        }
+        odrefresh_status = checkCompOsPendingArtifacts(*key, &digests_verified);
     }
 
     if (odrefresh_status == art::odrefresh::ExitCode::kCompilationRequired) {
