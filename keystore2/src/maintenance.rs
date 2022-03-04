@@ -19,11 +19,12 @@ use crate::error::map_km_error;
 use crate::error::map_or_log_err;
 use crate::error::Error;
 use crate::globals::get_keymint_device;
-use crate::globals::{DB, LEGACY_MIGRATOR, SUPER_KEY};
+use crate::globals::{DB, LEGACY_IMPORTER, SUPER_KEY};
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::super_key::{SuperKeyManager, UserState};
 use crate::utils::{
-    check_key_permission, check_keystore_permission, list_key_entries, watchdog as wd,
+    check_key_permission, check_keystore_permission, list_key_entries, uid_to_android_user,
+    watchdog as wd,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     IKeyMintDevice::IKeyMintDevice, SecurityLevel::SecurityLevel,
@@ -88,7 +89,7 @@ impl Maintenance {
             .with(|db| {
                 skm.reset_or_init_user_and_get_user_state(
                     &mut db.borrow_mut(),
-                    &LEGACY_MIGRATOR,
+                    &LEGACY_IMPORTER,
                     user_id as u32,
                     password.as_ref(),
                 )
@@ -115,7 +116,7 @@ impl Maintenance {
         DB.with(|db| {
             SUPER_KEY.write().unwrap().reset_user(
                 &mut db.borrow_mut(),
-                &LEGACY_MIGRATOR,
+                &LEGACY_IMPORTER,
                 user_id as u32,
                 false,
             )
@@ -130,7 +131,7 @@ impl Maintenance {
         // Permission check. Must return on error. Do not touch the '?'.
         check_keystore_permission(KeystorePerm::ClearUID).context("In clear_namespace.")?;
 
-        LEGACY_MIGRATOR
+        LEGACY_IMPORTER
             .bulk_delete_uid(domain, nspace)
             .context("In clear_namespace: Trying to delete legacy keys.")?;
         DB.with(|db| db.borrow_mut().unbind_keys_for_namespace(domain, nspace))
@@ -148,7 +149,7 @@ impl Maintenance {
             .with(|db| {
                 SUPER_KEY.read().unwrap().get_user_state(
                     &mut db.borrow_mut(),
-                    &LEGACY_MIGRATOR,
+                    &LEGACY_IMPORTER,
                     user_id as u32,
                 )
             })
@@ -235,7 +236,7 @@ impl Maintenance {
             }
             _ => {
                 return Err(Error::Rc(ResponseCode::INVALID_ARGUMENT)).context(
-                    "In migrate_key_namespace:
+                    "In migrate_key_namespace: \
                      Source domain must be one of APP, SELINUX, or KEY_ID.",
                 )
             }
@@ -249,40 +250,61 @@ impl Maintenance {
             }
             _ => {
                 return Err(Error::Rc(ResponseCode::INVALID_ARGUMENT)).context(
-                    "In migrate_key_namespace:
+                    "In migrate_key_namespace: \
                      Destination domain must be one of APP or SELINUX.",
                 )
             }
         };
 
-        DB.with(|db| {
-            let (key_id_guard, _) = LEGACY_MIGRATOR
-                .with_try_migrate(source, src_uid, || {
-                    db.borrow_mut().load_key_entry(
-                        source,
-                        KeyType::Client,
-                        KeyEntryLoadBits::NONE,
-                        src_uid,
-                        |k, av| {
-                            if migrate_any_key_permission {
-                                Ok(())
-                            } else {
-                                check_key_permission(KeyPerm::Use, k, &av)?;
-                                check_key_permission(KeyPerm::Delete, k, &av)?;
-                                check_key_permission(KeyPerm::Grant, k, &av)
-                            }
-                        },
-                    )
-                })
-                .context("In migrate_key_namespace: Failed to load key blob.")?;
+        let user_id = uid_to_android_user(dest_uid);
 
-            db.borrow_mut().migrate_key_namespace(key_id_guard, destination, dest_uid, |k| {
-                if migrate_any_key_permission {
-                    Ok(())
-                } else {
-                    check_key_permission(KeyPerm::Rebind, k, &None)
-                }
-            })
+        if user_id != uid_to_android_user(src_uid)
+            && (source.domain == Domain::APP || destination.domain == Domain::APP)
+        {
+            return Err(Error::sys()).context(
+                "In migrate_key_namespace: Keys cannot be migrated across android users.",
+            );
+        }
+
+        let super_key = SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(user_id);
+
+        DB.with(|db| {
+            if let Some((key_id_guard, _)) = LEGACY_IMPORTER
+                .with_try_import_or_migrate_namespaces(
+                    (src_uid, source),
+                    (dest_uid, destination),
+                    super_key,
+                    migrate_any_key_permission,
+                    || {
+                        db.borrow_mut().load_key_entry(
+                            source,
+                            KeyType::Client,
+                            KeyEntryLoadBits::NONE,
+                            src_uid,
+                            |k, av| {
+                                if migrate_any_key_permission {
+                                    Ok(())
+                                } else {
+                                    check_key_permission(KeyPerm::Use, k, &av)?;
+                                    check_key_permission(KeyPerm::Delete, k, &av)?;
+                                    check_key_permission(KeyPerm::Grant, k, &av)
+                                }
+                            },
+                        )
+                    },
+                )
+                .context("In migrate_key_namespace: Failed to load key blob.")?
+            {
+                db.borrow_mut().migrate_key_namespace(key_id_guard, destination, dest_uid, |k| {
+                    if migrate_any_key_permission {
+                        Ok(())
+                    } else {
+                        check_key_permission(KeyPerm::Rebind, k, &None)
+                    }
+                })
+            } else {
+                Ok(())
+            }
         })
     }
 
