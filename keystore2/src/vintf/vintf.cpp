@@ -14,43 +14,55 @@
  * limitations under the License.
  */
 
-#include <algorithm>
+#include "vintf.hpp"
+
 #include <vintf/HalManifest.h>
 #include <vintf/VintfObject.h>
 
-#include "rust/cxx.h"
-
-rust::Vec<rust::String> convert(const std::set<std::string>& names) {
-    rust::Vec<rust::String> result;
-    std::copy(names.begin(), names.end(), std::back_inserter(result));
-    return result;
+// Converts a set<string> into a C-style array of C strings.
+static char** convert(const std::set<std::string>& names) {
+    char** ret = new char*[names.size()];
+    char** ptr = ret;
+    for (const auto& name : names) {
+        *(ptr++) = strdup(name.c_str());
+    }
+    return ret;
 }
 
-rust::Vec<rust::String> get_hal_names() {
-    const auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
+char** getHalNames(size_t* len) {
+    auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
     const auto names = manifest->getHalNames();
+    *len = names.size();
     return convert(names);
 }
 
-rust::Vec<rust::String> get_hal_names_and_versions() {
-    const auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
+char** getHalNamesAndVersions(size_t* len) {
+    auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
     const auto names = manifest->getHalNamesAndVersions();
+    *len = names.size();
     return convert(names);
 }
 
-rust::Vec<rust::String> get_hidl_instances(rust::Str package, size_t major_version,
-                                           size_t minor_version, rust::Str interfaceName) {
+char** getHidlInstances(size_t* len, const char* package, size_t major_version,
+                        size_t minor_version, const char* interfaceName) {
     android::vintf::Version version(major_version, minor_version);
-    const auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
-    const auto names = manifest->getHidlInstances(static_cast<std::string>(package), version,
-                                                  static_cast<std::string>(interfaceName));
+    auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
+    const auto names = manifest->getHidlInstances(package, version, interfaceName);
+    *len = names.size();
     return convert(names);
 }
 
-rust::Vec<rust::String> get_aidl_instances(rust::Str package, size_t version,
-                                           rust::Str interfaceName) {
-    const auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
-    const auto names = manifest->getAidlInstances(static_cast<std::string>(package), version,
-                                                  static_cast<std::string>(interfaceName));
+char** getAidlInstances(size_t* len, const char* package, size_t version,
+                        const char* interfaceName) {
+    auto manifest = android::vintf::VintfObject::GetDeviceHalManifest();
+    const auto names = manifest->getAidlInstances(package, version, interfaceName);
+    *len = names.size();
     return convert(names);
+}
+
+void freeNames(char** names, size_t len) {
+    for (int i = 0; i < len; i++) {
+        free(names[i]);
+    }
+    delete[] names;
 }

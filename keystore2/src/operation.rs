@@ -128,12 +128,12 @@
 use crate::enforcements::AuthInfo;
 use crate::error::{map_err_with, map_km_error, map_or_log_err, Error, ErrorCode, ResponseCode};
 use crate::metrics_store::log_key_operation_event_stats;
-use crate::utils::watchdog as wd;
+use crate::utils::{watchdog as wd, Asp};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     IKeyMintOperation::IKeyMintOperation, KeyParameter::KeyParameter, KeyPurpose::KeyPurpose,
     SecurityLevel::SecurityLevel,
 };
-use android_hardware_security_keymint::binder::{BinderFeatures, Strong};
+use android_hardware_security_keymint::binder::BinderFeatures;
 use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreOperation::BnKeystoreOperation, IKeystoreOperation::IKeystoreOperation,
 };
@@ -170,7 +170,7 @@ pub enum Outcome {
 pub struct Operation {
     // The index of this operation in the OperationDb.
     index: usize,
-    km_op: Strong<dyn IKeyMintOperation>,
+    km_op: Asp,
     last_usage: Mutex<Instant>,
     outcome: Mutex<Outcome>,
     owner: u32, // Uid of the operation's owner.
@@ -222,7 +222,7 @@ impl Operation {
     ) -> Self {
         Self {
             index,
-            km_op,
+            km_op: Asp::new(km_op.as_binder()),
             last_usage: Mutex::new(Instant::now()),
             outcome: Mutex::new(Outcome::Unknown),
             owner,
@@ -282,10 +282,19 @@ impl Operation {
         }
         *locked_outcome = Outcome::Pruned;
 
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            match self.km_op.get_interface() {
+                Ok(km_op) => km_op,
+                Err(e) => {
+                    log::error!("In prune: Failed to get KeyMintOperation interface.\n    {:?}", e);
+                    return Err(Error::sys());
+                }
+            };
+
         let _wp = wd::watch_millis("In Operation::prune: calling abort()", 500);
 
         // We abort the operation. If there was an error we log it but ignore it.
-        if let Err(e) = map_km_error(self.km_op.abort()) {
+        if let Err(e) = map_km_error(km_op.abort()) {
             log::error!("In prune: KeyMint::abort failed with {:?}.", e);
         }
 
@@ -353,6 +362,9 @@ impl Operation {
         Self::check_input_length(aad_input).context("In update_aad")?;
         self.touch();
 
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
+
         let (hat, tst) = self
             .auth_info
             .lock()
@@ -362,7 +374,7 @@ impl Operation {
 
         self.update_outcome(&mut *outcome, {
             let _wp = wd::watch_millis("Operation::update_aad: calling updateAad", 500);
-            map_km_error(self.km_op.updateAad(aad_input, hat.as_ref(), tst.as_ref()))
+            map_km_error(km_op.updateAad(aad_input, hat.as_ref(), tst.as_ref()))
         })
         .context("In update_aad: KeyMint::update failed.")?;
 
@@ -376,6 +388,9 @@ impl Operation {
         Self::check_input_length(input).context("In update")?;
         self.touch();
 
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            self.km_op.get_interface().context("In update: Failed to get KeyMintOperation.")?;
+
         let (hat, tst) = self
             .auth_info
             .lock()
@@ -386,7 +401,7 @@ impl Operation {
         let output = self
             .update_outcome(&mut *outcome, {
                 let _wp = wd::watch_millis("Operation::update: calling update", 500);
-                map_km_error(self.km_op.update(input, hat.as_ref(), tst.as_ref()))
+                map_km_error(km_op.update(input, hat.as_ref(), tst.as_ref()))
             })
             .context("In update: KeyMint::update failed.")?;
 
@@ -406,6 +421,9 @@ impl Operation {
         }
         self.touch();
 
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            self.km_op.get_interface().context("In finish: Failed to get KeyMintOperation.")?;
+
         let (hat, tst, confirmation_token) = self
             .auth_info
             .lock()
@@ -416,7 +434,7 @@ impl Operation {
         let output = self
             .update_outcome(&mut *outcome, {
                 let _wp = wd::watch_millis("Operation::finish: calling finish", 500);
-                map_km_error(self.km_op.finish(
+                map_km_error(km_op.finish(
                     input,
                     signature,
                     hat.as_ref(),
@@ -444,10 +462,12 @@ impl Operation {
     fn abort(&self, outcome: Outcome) -> Result<()> {
         let mut locked_outcome = self.check_active().context("In abort")?;
         *locked_outcome = outcome;
+        let km_op: binder::public_api::Strong<dyn IKeyMintOperation> =
+            self.km_op.get_interface().context("In abort: Failed to get KeyMintOperation.")?;
 
         {
             let _wp = wd::watch_millis("Operation::abort: calling abort", 500);
-            map_km_error(self.km_op.abort()).context("In abort: KeyMint::abort failed.")
+            map_km_error(km_op.abort()).context("In abort: KeyMint::abort failed.")
         }
     }
 }
@@ -493,7 +513,7 @@ impl OperationDb {
     /// owner uid and returns a new Operation wrapped in a `std::sync::Arc`.
     pub fn create_operation(
         &self,
-        km_op: binder::Strong<dyn IKeyMintOperation>,
+        km_op: binder::public_api::Strong<dyn IKeyMintOperation>,
         owner: u32,
         auth_info: AuthInfo,
         forced: bool,
@@ -771,7 +791,9 @@ impl KeystoreOperation {
     /// BnKeystoreOperation proxy object. It also enables
     /// `BinderFeatures::set_requesting_sid` on the new interface, because
     /// we need it for checking Keystore permissions.
-    pub fn new_native_binder(operation: Arc<Operation>) -> binder::Strong<dyn IKeystoreOperation> {
+    pub fn new_native_binder(
+        operation: Arc<Operation>,
+    ) -> binder::public_api::Strong<dyn IKeystoreOperation> {
         BnKeystoreOperation::new_binder(
             Self { operation: Mutex::new(Some(operation)) },
             BinderFeatures { set_requesting_sid: true, ..BinderFeatures::default() },
@@ -819,7 +841,7 @@ impl KeystoreOperation {
 impl binder::Interface for KeystoreOperation {}
 
 impl IKeystoreOperation for KeystoreOperation {
-    fn updateAad(&self, aad_input: &[u8]) -> binder::Result<()> {
+    fn updateAad(&self, aad_input: &[u8]) -> binder::public_api::Result<()> {
         let _wp = wd::watch_millis("IKeystoreOperation::updateAad", 500);
         map_or_log_err(
             self.with_locked_operation(
@@ -830,7 +852,7 @@ impl IKeystoreOperation for KeystoreOperation {
         )
     }
 
-    fn update(&self, input: &[u8]) -> binder::Result<Option<Vec<u8>>> {
+    fn update(&self, input: &[u8]) -> binder::public_api::Result<Option<Vec<u8>>> {
         let _wp = wd::watch_millis("IKeystoreOperation::update", 500);
         map_or_log_err(
             self.with_locked_operation(
@@ -844,7 +866,7 @@ impl IKeystoreOperation for KeystoreOperation {
         &self,
         input: Option<&[u8]>,
         signature: Option<&[u8]>,
-    ) -> binder::Result<Option<Vec<u8>>> {
+    ) -> binder::public_api::Result<Option<Vec<u8>>> {
         let _wp = wd::watch_millis("IKeystoreOperation::finish", 500);
         map_or_log_err(
             self.with_locked_operation(
@@ -855,7 +877,7 @@ impl IKeystoreOperation for KeystoreOperation {
         )
     }
 
-    fn abort(&self) -> binder::Result<()> {
+    fn abort(&self) -> binder::public_api::Result<()> {
         let _wp = wd::watch_millis("IKeystoreOperation::abort", 500);
         map_err_with(
             self.with_locked_operation(
