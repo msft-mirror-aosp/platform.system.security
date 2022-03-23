@@ -49,16 +49,14 @@ interface ICredential {
     byte[] getCredentialKeyCertificateChain();
 
     long selectAuthKey(in boolean allowUsingExhaustedKeys,
-                       in boolean allowUsingExpiredKeys,
-                       in boolean incrementUsageCount);
+                       in boolean allowUsingExpiredKeys);
 
     GetEntriesResultParcel getEntries(in byte[] requestMessage,
                                       in RequestNamespaceParcel[] requestNamespaces,
                                       in byte[] sessionTranscript,
                                       in byte[] readerSignature,
                                       in boolean allowUsingExhaustedKeys,
-                                      in boolean allowUsingExpiredKeys,
-                                      in boolean incrementUsageCount);
+                                      in boolean allowUsingExpiredKeys);
 
     void setAvailableAuthenticationKeys(in int keyCount, in int maxUsesPerKey);
 
