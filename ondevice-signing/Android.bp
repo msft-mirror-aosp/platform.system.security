@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// List of clang-tidy checks that are reported as errors.
+// Please keep this list ordered lexicographically.
 
 package {
     // See: http://go/android-license-faq
@@ -21,8 +23,6 @@ package {
     default_applicable_licenses: ["system_security_license"],
 }
 
-// List of clang-tidy checks that are reported as errors.
-// Please keep this list ordered lexicographically.
 tidy_errors = [
   "cert-err34-c",
   "google-default-arguments",
@@ -74,33 +74,6 @@ cc_defaults {
   ],
 }
 
-cc_library {
-  name: "libsigningutils",
-  defaults: [
-    "odsign_flags_defaults",
-  ],
-  cpp_std: "experimental",
-  srcs: [
-    "CertUtils.cpp",
-    "VerityUtils.cpp",
-  ],
-
-  static_libs: [
-    "libc++fs",
-  ],
-
-  shared_libs: [
-    "libbase",
-    "libcrypto",
-    "libcrypto_utils",
-    "libfsverity",
-    "libprotobuf-cpp-lite",
-    "libutils",
-  ],
-  export_include_dirs: ["include"],
-  recovery_available: true,
-}
-
 cc_binary {
   name: "odsign",
   defaults: [
@@ -109,18 +82,20 @@ cc_binary {
   cpp_std: "experimental",
   init_rc: ["odsign.rc"],
   srcs: [
+    "odsign_main.cpp",
+    "CertUtils.cpp",
     "KeystoreKey.cpp",
     "KeystoreHmacKey.cpp",
-    "odsign_main.cpp",
+    "VerityUtils.cpp",
   ],
 
   header_libs: ["odrefresh_headers"],
 
   static_libs: [
     "libc++fs",
-    "libsigningutils",
     "lib_odsign_proto",
   ],
+
   shared_libs: [
     "android.system.keystore2-V1-cpp",
     "android.hardware.security.keymint-V1-cpp",
@@ -130,7 +105,7 @@ cc_binary {
     "libcrypto_utils",
     "libfsverity",
     "liblogwrap",
-    "libprotobuf-cpp-lite",
+    "libprotobuf-cpp-full",
     "libutils",
   ],
 }
