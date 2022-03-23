@@ -417,9 +417,7 @@ mod tests {
             Err(RecvTimeoutError::Timeout)
         );
         done_receiver.recv().unwrap();
-        // Now that the last low-priority job has completed, the idle task should
-        // fire pretty much immediately.
-        idle_done_receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        idle_done_receiver.recv_timeout(Duration::from_millis(1)).unwrap();
 
         // Idle callback not executed again even if we wait for a while.
         assert_eq!(
@@ -440,7 +438,7 @@ mod tests {
             Err(RecvTimeoutError::Timeout)
         );
         done_receiver.recv().unwrap();
-        idle_done_receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        idle_done_receiver.recv_timeout(Duration::from_millis(1)).unwrap();
     }
 
     #[test]
