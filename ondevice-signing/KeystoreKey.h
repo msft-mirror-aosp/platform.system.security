@@ -20,6 +20,7 @@
 
 #include <android-base/macros.h>
 #include <android-base/result.h>
+#include <android-base/unique_fd.h>
 
 #include <utils/StrongPointer.h>
 
@@ -36,16 +37,13 @@ class KeystoreKey : public SigningKey {
 
   public:
     virtual ~KeystoreKey(){};
-    static android::base::Result<SigningKey*> getInstance(const std::string& signedPubKeyPath,
-                                                          const android::String16& keyAlias,
-                                                          int64_t KeyNspace, int keyBootLevel);
+    static android::base::Result<SigningKey*> getInstance();
 
     virtual android::base::Result<std::string> sign(const std::string& message) const;
     virtual android::base::Result<std::vector<uint8_t>> getPublicKey() const;
 
   private:
-    KeystoreKey(std::string signedPubKeyPath, const android::String16& keyAlias, int64_t keyNspace,
-                int keyBootLevel);
+    KeystoreKey();
     bool initialize();
     android::base::Result<std::vector<uint8_t>> verifyExistingKey();
     android::base::Result<std::vector<uint8_t>> createKey();
@@ -56,7 +54,4 @@ class KeystoreKey : public SigningKey {
     android::sp<IKeystoreService> mService;
     android::sp<IKeystoreSecurityLevel> mSecurityLevel;
     std::vector<uint8_t> mPublicKey;
-
-    std::string mSignedPubKeyPath;
-    int mKeyBootLevel;
 };

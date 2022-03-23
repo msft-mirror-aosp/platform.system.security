@@ -19,7 +19,6 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/mem.h>
-#include <openssl/ossl_typ.h>
 #include <openssl/x509v3.h>
 
 #include <functional>
@@ -518,7 +517,10 @@ std::variant<CertUtilsError, ASN1_STRING_Ptr> buildRsaPssParameter(Digest digest
     return ASN1_STRING_Ptr(algo_str);
 }
 
-std::variant<CertUtilsError, X509_ALGOR_Ptr> makeAlgo(Algo algo, Padding padding, Digest digest) {
+CertUtilsError makeAndSetAlgo(X509_ALGOR* algo_field, Algo algo, Padding padding, Digest digest) {
+    if (algo_field == nullptr) {
+        return CertUtilsError::UnexpectedNullPointer;
+    }
     ASN1_STRING_Ptr param;
     int param_type = V_ASN1_UNDEF;
     int nid = 0;
@@ -587,29 +589,23 @@ std::variant<CertUtilsError, X509_ALGOR_Ptr> makeAlgo(Algo algo, Padding padding
         return CertUtilsError::InvalidArgument;
     }
 
-    X509_ALGOR_Ptr result(X509_ALGOR_new());
-    if (!result) {
-        return CertUtilsError::MemoryAllocation;
-    }
-    if (!X509_ALGOR_set0(result.get(), OBJ_nid2obj(nid), param_type, param.get())) {
+    if (!X509_ALGOR_set0(algo_field, OBJ_nid2obj(nid), param_type, param.get())) {
         return CertUtilsError::Encoding;
     }
     // The X509 struct took ownership.
     param.release();
-    return result;
+    return CertUtilsError::Ok;
 }
 
 // This function allows for signing a
 CertUtilsError signCertWith(X509* certificate,
                             std::function<std::vector<uint8_t>(const uint8_t*, size_t)> sign,
                             Algo algo, Padding padding, Digest digest) {
-    auto algo_objV = makeAlgo(algo, padding, digest);
-    if (auto error = std::get_if<CertUtilsError>(&algo_objV)) {
-        return *error;
+    if (auto error = makeAndSetAlgo(certificate->sig_alg, algo, padding, digest)) {
+        return error;
     }
-    auto& algo_obj = std::get<X509_ALGOR_Ptr>(algo_objV);
-    if (!X509_set1_signature_algo(certificate, algo_obj.get())) {
-        return CertUtilsError::BoringSsl;
+    if (auto error = makeAndSetAlgo(certificate->cert_info->signature, algo, padding, digest)) {
+        return error;
     }
 
     uint8_t* cert_buf = nullptr;
@@ -624,9 +620,12 @@ CertUtilsError signCertWith(X509* certificate,
         return CertUtilsError::SignatureFailed;
     }
 
-    if (!X509_set1_signature_value(certificate, signature.data(), signature.size())) {
+    if (!ASN1_STRING_set(certificate->signature, signature.data(), signature.size())) {
         return CertUtilsError::BoringSsl;
     }
+
+    certificate->signature->flags &= ~(0x07);
+    certificate->signature->flags |= ASN1_STRING_FLAG_BITS_LEFT;
 
     return CertUtilsError::Ok;
 }
