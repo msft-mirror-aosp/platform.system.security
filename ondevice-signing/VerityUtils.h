@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-#include <keystore/keystore_attestation_id.h>
+#pragma once
 
-#include "fuzzer/FuzzedDataProvider.h"
+#include <android-base/result.h>
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    FuzzedDataProvider fdp = FuzzedDataProvider(data, size);
-    uint32_t uid = fdp.ConsumeIntegral<uint32_t>();
-    auto result = android::security::gather_attestation_application_id(uid);
-    result.isOk();
-    result.status();
-    result.value();
-    return 0;
-}
+#include "SigningKey.h"
+
+android::base::Result<void> addCertToFsVerityKeyring(const std::string& path);
+android::base::Result<std::vector<uint8_t>> createDigest(const std::string& path);
+android::base::Result<std::map<std::string, std::string>>
+verifyAllFilesInVerity(const std::string& path);
+android::base::Result<std::map<std::string, std::string>>
+addFilesToVerityRecursive(const std::string& path, const SigningKey& key);

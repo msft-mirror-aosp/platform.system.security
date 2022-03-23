@@ -21,7 +21,6 @@ use std::{
     sync::{mpsc::Sender, Arc, Mutex},
 };
 
-use crate::error::anyhow_error_to_cstring;
 use crate::utils::{compat_2_response_code, ui_opts_2_compat, watchdog as wd};
 use android_security_apc::aidl::android::security::apc::{
     IConfirmationCallback::IConfirmationCallback,
@@ -111,10 +110,7 @@ where
                     _ => ResponseCode::SYSTEM_ERROR.0,
                 },
             };
-            Err(BinderStatus::new_service_specific_error(
-                rc,
-                anyhow_error_to_cstring(&e).as_deref(),
-            ))
+            Err(BinderStatus::new_service_specific_error(rc, None))
         },
         handle_ok,
     )
