@@ -19,7 +19,9 @@ use keystore2::globals::ENFORCEMENTS;
 use keystore2::maintenance::Maintenance;
 use keystore2::metrics::Metrics;
 use keystore2::metrics_store;
-use keystore2::remote_provisioning::RemoteProvisioningService;
+use keystore2::remote_provisioning::{
+    RemoteProvisioningService, RemotelyProvisionedKeyPoolService,
+};
 use keystore2::service::KeystoreService;
 use keystore2::{apc::ApcManager, shared_secret_negotiation};
 use keystore2::{authorization::AuthorizationManager, id_rotation::IdRotationState};
@@ -33,6 +35,8 @@ static APC_SERVICE_NAME: &str = "android.security.apc";
 static AUTHORIZATION_SERVICE_NAME: &str = "android.security.authorization";
 static METRICS_SERVICE_NAME: &str = "android.security.metrics";
 static REMOTE_PROVISIONING_SERVICE_NAME: &str = "android.security.remoteprovisioning";
+static REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME: &str =
+    "android.security.remoteprovisioning.IRemotelyProvisionedKeyPool";
 static USER_MANAGER_SERVICE_NAME: &str = "android.security.maintenance";
 static LEGACY_KEYSTORE_SERVICE_NAME: &str = "android.security.legacykeystore";
 
@@ -40,7 +44,10 @@ static LEGACY_KEYSTORE_SERVICE_NAME: &str = "android.security.legacykeystore";
 fn main() {
     // Initialize android logging.
     android_logger::init_once(
-        android_logger::Config::default().with_tag("keystore2").with_min_level(log::Level::Debug),
+        android_logger::Config::default()
+            .with_tag("keystore2")
+            .with_min_level(log::Level::Debug)
+            .with_log_id(android_logger::LogId::System),
     );
     // Redirect panic messages to logcat.
     panic::set_hook(Box::new(|panic_info| {
@@ -143,6 +150,25 @@ fn main() {
                 REMOTE_PROVISIONING_SERVICE_NAME, e
             );
         });
+    }
+
+    // Even if the IRemotelyProvisionedComponent HAL is implemented, it doesn't mean that the keys
+    // may be fetched via the key pool. The HAL must be a new version that exports a unique id. If
+    // none of the HALs support this, then the key pool service is not published.
+    match RemotelyProvisionedKeyPoolService::new_native_binder() {
+        Ok(key_pool_service) => {
+            binder::add_service(
+                REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME,
+                key_pool_service.as_binder(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to register service {} because of {:?}.",
+                    REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME, e
+                );
+            });
+        }
+        Err(e) => log::info!("Not publishing IRemotelyProvisionedKeyPool service: {:?}", e),
     }
 
     binder::add_service(LEGACY_KEYSTORE_SERVICE_NAME, legacykeystore.as_binder()).unwrap_or_else(
