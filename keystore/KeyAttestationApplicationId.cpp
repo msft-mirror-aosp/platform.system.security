@@ -26,8 +26,8 @@ namespace keymaster {
 KeyAttestationApplicationId::KeyAttestationApplicationId() = default;
 
 KeyAttestationApplicationId::KeyAttestationApplicationId(
-    std::optional<KeyAttestationPackageInfo> package)
-    : packageInfos_(new std::vector<std::optional<KeyAttestationPackageInfo>>()) {
+        std::unique_ptr<KeyAttestationPackageInfo> package) :
+    packageInfos_(new std::vector<std::unique_ptr<KeyAttestationPackageInfo>>()) {
     packageInfos_->push_back(std::move(package));
 }
 
@@ -39,13 +39,10 @@ status_t KeyAttestationApplicationId::writeToParcel(Parcel* parcel) const {
 }
 
 status_t KeyAttestationApplicationId::readFromParcel(const Parcel* parcel) {
-    std::optional<std::vector<std::optional<KeyAttestationPackageInfo>>> temp_vector;
+    std::unique_ptr<std::vector<std::unique_ptr<KeyAttestationPackageInfo>>> temp_vector;
     auto rc = parcel->readParcelableVector(&temp_vector);
     if (rc != NO_ERROR) return rc;
-    packageInfos_.reset();
-    if (temp_vector) {
-        packageInfos_ = std::make_shared<PackageInfoVector>(std::move(*temp_vector));
-    }
+    packageInfos_.reset(temp_vector.release());
     return NO_ERROR;
 }
 

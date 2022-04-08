@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "credstore"
+#define LOG_TAG "Util"
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -110,7 +110,7 @@ bool fileSetContents(const string& path, const vector<uint8_t>& data) {
         remaining -= numWritten;
     }
 
-    if (TEMP_FAILURE_RETRY(fsync(fd))) {
+    if (TEMP_FAILURE_RETRY(fsync(fd) == -1)) {
         PLOG(ERROR) << "Failed fsyncing temp file for '" << path << "'";
         close(fd);
         return false;

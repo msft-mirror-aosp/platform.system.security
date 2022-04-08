@@ -16,7 +16,6 @@
 #define KEYSTORE_INCLUDE_KEYSTORE_KEYATTESTATIONAPPLICATIONID_H_
 
 #include <memory>
-#include <optional>
 #include <vector>
 
 #include <binder/Parcelable.h>
@@ -31,10 +30,10 @@ class KeyAttestationApplicationId : public Parcelable {
   public:
     typedef SharedNullableIterator<const KeyAttestationPackageInfo, std::vector>
         ConstKeyAttestationPackageInfoIterator;
-    typedef std::vector<std::optional<KeyAttestationPackageInfo>> PackageInfoVector;
+    typedef std::vector<std::unique_ptr<KeyAttestationPackageInfo>> PackageInfoVector;
     KeyAttestationApplicationId();
     // Following c'tors are for initializing instances containing test data.
-    explicit KeyAttestationApplicationId(std::optional<KeyAttestationPackageInfo> package);
+    explicit KeyAttestationApplicationId(std::unique_ptr<KeyAttestationPackageInfo> package);
     explicit KeyAttestationApplicationId(PackageInfoVector packages);
 
     status_t writeToParcel(Parcel*) const override;
@@ -48,7 +47,7 @@ class KeyAttestationApplicationId : public Parcelable {
     }
 
   private:
-    std::shared_ptr<PackageInfoVector> packageInfos_;
+    std::shared_ptr<std::vector<std::unique_ptr<KeyAttestationPackageInfo>>> packageInfos_;
 };
 
 }  // namespace keymaster

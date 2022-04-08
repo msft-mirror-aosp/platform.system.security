@@ -15,10 +15,11 @@
 ** limitations under the License.
 */
 
-#include <aidl/android/security/apc/BnConfirmationCallback.h>
-#include <aidl/android/security/apc/IProtectedConfirmation.h>
-#include <android/binder_manager.h>
-#include <android/binder_process.h>
+#include <android/hardware/confirmationui/1.0/types.h>
+#include <android/security/BnConfirmationPromptCallback.h>
+#include <android/security/keystore/IKeystoreService.h>
+#include <binder/IPCThreadState.h>
+#include <binder/IServiceManager.h>
 
 #include <gtest/gtest.h>
 
@@ -27,50 +28,65 @@
 #include <tuple>
 #include <vector>
 
+using ConfirmationResponseCode = android::hardware::confirmationui::V1_0::ResponseCode;
+using android::IBinder;
+using android::IServiceManager;
+using android::sp;
+using android::String16;
+using android::security::keystore::IKeystoreService;
+
 using namespace std::literals::chrono_literals;
-namespace apc = ::aidl::android::security::apc;
 
 class ConfirmationListener
-    : public apc::BnConfirmationCallback,
-      public std::promise<std::tuple<apc::ResponseCode, std::optional<std::vector<uint8_t>>>> {
+    : public android::security::BnConfirmationPromptCallback,
+      public std::promise<std::tuple<ConfirmationResponseCode, std::vector<uint8_t>>> {
   public:
     ConfirmationListener() {}
 
-    virtual ::ndk::ScopedAStatus
-    onCompleted(::aidl::android::security::apc::ResponseCode result,
-                const std::optional<std::vector<uint8_t>>& dataConfirmed) override {
-        this->set_value({result, dataConfirmed});
-        return ::ndk::ScopedAStatus::ok();
-    };
+    virtual ::android::binder::Status
+    onConfirmationPromptCompleted(int32_t result,
+                                  const ::std::vector<uint8_t>& dataThatWasConfirmed) override {
+        this->set_value({static_cast<ConfirmationResponseCode>(result), dataThatWasConfirmed});
+        return ::android::binder::Status::ok();
+    }
 };
 
 TEST(ConfirmationInvocationTest, InvokeAndCancel) {
-    ABinderProcess_startThreadPool();
+    android::ProcessState::self()->startThreadPool();
 
-    ::ndk::SpAIBinder apcBinder(AServiceManager_getService("android.security.apc"));
-    auto apcService = apc::IProtectedConfirmation::fromBinder(apcBinder);
-    ASSERT_TRUE(apcService);
+    sp<IServiceManager> sm = android::defaultServiceManager();
+    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
+    sp<IKeystoreService> service = android::interface_cast<IKeystoreService>(binder);
+    ASSERT_TRUE(service);
 
-    std::string promptText("Just a little test!");
-    std::string locale("en");
+    String16 promptText16("Just a little test!");
+    String16 locale16("en");
     std::vector<uint8_t> extraData{0xaa, 0xff, 0x00, 0x55};
 
-    auto listener = std::make_shared<ConfirmationListener>();
+    sp<ConfirmationListener> listener = new ConfirmationListener();
 
     auto future = listener->get_future();
+    int32_t aidl_return;
 
-    auto rc = apcService->presentPrompt(listener, promptText, extraData, locale, 0);
-
-    ASSERT_TRUE(rc.isOk());
+    android::binder::Status status = service->presentConfirmationPrompt(
+        listener, promptText16, extraData, locale16, 0, &aidl_return);
+    ASSERT_TRUE(status.isOk()) << "Presenting confirmation prompt failed with binder status '"
+                               << status.toString8().c_str() << "'.\n";
+    ConfirmationResponseCode responseCode = static_cast<ConfirmationResponseCode>(aidl_return);
+    ASSERT_EQ(responseCode, ConfirmationResponseCode::OK)
+        << "Presenting confirmation prompt failed with response code " << aidl_return << ".\n";
 
     auto fstatus = future.wait_for(2s);
     EXPECT_EQ(fstatus, std::future_status::timeout);
 
-    rc = apcService->cancelPrompt(listener);
-    ASSERT_TRUE(rc.isOk());
+    status = service->cancelConfirmationPrompt(listener, &aidl_return);
+    ASSERT_TRUE(status.isOk());
+
+    responseCode = static_cast<ConfirmationResponseCode>(aidl_return);
+    ASSERT_EQ(responseCode, ConfirmationResponseCode::OK);
 
     future.wait();
-    auto [responseCode, dataThatWasConfirmed] = future.get();
+    auto [rc, dataThatWasConfirmed] = future.get();
 
-    ASSERT_EQ(responseCode, apc::ResponseCode::ABORTED);
+    ASSERT_EQ(rc, ConfirmationResponseCode::Aborted);
 }

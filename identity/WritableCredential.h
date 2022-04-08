@@ -24,14 +24,11 @@
 
 #include <android/hardware/identity/IIdentityCredentialStore.h>
 
-#include "Credential.h"
-
 namespace android {
 namespace security {
 namespace identity {
 
 using ::android::binder::Status;
-using ::android::hardware::identity::HardwareInformation;
 using ::android::hardware::identity::IWritableIdentityCredential;
 using ::std::string;
 using ::std::vector;
@@ -39,16 +36,8 @@ using ::std::vector;
 class WritableCredential : public BnWritableCredential {
   public:
     WritableCredential(const string& dataPath, const string& credentialName, const string& docType,
-                       bool isUpdate, HardwareInformation hwInfo,
-                       sp<IWritableIdentityCredential> halBinder);
+                       size_t dataChunkSize, sp<IWritableIdentityCredential> halBinder);
     ~WritableCredential();
-
-    // Used when updating a credential
-    void setAttestationCertificate(const vector<uint8_t>& attestationCertificate);
-    void setAvailableAuthenticationKeys(int keyCount, int maxUsesPerKey);
-
-    // Used by Credential::update()
-    void setCredentialToReloadWhenUpdated(sp<Credential> credential);
 
     // IWritableCredential overrides
     Status getCredentialKeyCertificateChain(const vector<uint8_t>& challenge,
@@ -62,15 +51,9 @@ class WritableCredential : public BnWritableCredential {
     string dataPath_;
     string credentialName_;
     string docType_;
-    bool isUpdate_;
-    HardwareInformation hwInfo_;
+    size_t dataChunkSize_;
     sp<IWritableIdentityCredential> halBinder_;
-
     vector<uint8_t> attestationCertificate_;
-    int keyCount_ = 0;
-    int maxUsesPerKey_ = 1;
-
-    sp<Credential> credentialToReloadWhenUpdated_;
 
     ssize_t calcExpectedProofOfProvisioningSize(
         const vector<AccessControlProfileParcel>& accessControlProfiles,

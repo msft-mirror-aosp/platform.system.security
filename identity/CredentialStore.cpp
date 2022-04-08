@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "credstore"
+#define LOG_TAG "CredentialStore"
 
 #include <algorithm>
 
@@ -41,12 +41,11 @@ bool CredentialStore::init() {
         LOG(ERROR) << "Error getting hardware information: " << status.toString8();
         return false;
     }
-    halApiVersion_ = hal_->getInterfaceVersion();
 
-    LOG(INFO) << "Connected to Identity Credential HAL with API version " << halApiVersion_
-              << " and name '" << hwInfo_.credentialStoreName << "' authored by '"
-              << hwInfo_.credentialStoreAuthorName << "' with chunk size " << hwInfo_.dataChunkSize
-              << " and directoAccess set to " << (hwInfo_.isDirectAccess ? "true" : "false");
+    LOG(INFO) << "Connected to Identity Credential HAL with name '" << hwInfo_.credentialStoreName
+              << "' authored by '" << hwInfo_.credentialStoreAuthorName << "' with chunk size "
+              << hwInfo_.dataChunkSize << " and directoAccess set to "
+              << (hwInfo_.isDirectAccess ? "true" : "false");
     return true;
 }
 
@@ -90,7 +89,7 @@ Status CredentialStore::createCredential(const std::string& credentialName,
     }
 
     sp<IWritableCredential> writableCredential = new WritableCredential(
-        dataPath_, credentialName, docType, false, hwInfo_, halWritableCredential);
+        dataPath_, credentialName, docType, hwInfo_.dataChunkSize, halWritableCredential);
     *_aidl_return = writableCredential;
     return Status::ok();
 }
@@ -113,10 +112,9 @@ Status CredentialStore::getCredentialByName(const std::string& credentialName, i
 
     // Note: IdentityCredentialStore.java's CipherSuite enumeration and CipherSuite from the
     // HAL is manually kept in sync. So this cast is safe.
-    sp<Credential> credential = new Credential(CipherSuite(cipherSuite), dataPath_, credentialName,
-                                               callingUid, hwInfo_, hal_, halApiVersion_);
+    sp<Credential> credential = new Credential(CipherSuite(cipherSuite), dataPath_, credentialName);
 
-    Status loadStatus = credential->ensureOrReplaceHalBinder();
+    Status loadStatus = credential->loadCredential(hal_);
     if (!loadStatus.isOk()) {
         LOG(ERROR) << "Error loading credential";
     } else {

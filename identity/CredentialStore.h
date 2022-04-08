@@ -57,7 +57,6 @@ class CredentialStore : public BnCredentialStore {
     string dataPath_;
 
     sp<IIdentityCredentialStore> hal_;
-    int halApiVersion_;
 
     HardwareInformation hwInfo_;
 };
