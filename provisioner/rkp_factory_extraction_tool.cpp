@@ -30,6 +30,7 @@ using aidl::android::hardware::security::keymint::DeviceInfo;
 using aidl::android::hardware::security::keymint::IRemotelyProvisionedComponent;
 using aidl::android::hardware::security::keymint::MacedPublicKey;
 using aidl::android::hardware::security::keymint::ProtectedData;
+using aidl::android::hardware::security::keymint::RpcHardwareInfo;
 using aidl::android::hardware::security::keymint::remote_prov::generateEekChain;
 using aidl::android::hardware::security::keymint::remote_prov::getProdEekChain;
 using aidl::android::hardware::security::keymint::remote_prov::jsonEncodeCsrWithBuild;
@@ -113,10 +114,10 @@ Array composeCertificateRequest(const ProtectedData& protectedData,
     return certificateRequest;
 }
 
-std::vector<uint8_t> getEekChain() {
+std::vector<uint8_t> getEekChain(uint32_t curve) {
     if (FLAGS_test_mode) {
         const std::vector<uint8_t> kFakeEekId = {'f', 'a', 'k', 'e', 0};
-        auto eekOrErr = generateEekChain(3 /* chainlength */, kFakeEekId);
+        auto eekOrErr = generateEekChain(curve, 3 /* chainlength */, kFakeEekId);
         if (!eekOrErr) {
             std::cerr << "Failed to generate test EEK somehow: " << eekOrErr.message() << std::endl;
             exit(-1);
@@ -128,15 +129,15 @@ std::vector<uint8_t> getEekChain() {
         return eek;
     }
 
-    return getProdEekChain();
+    return getProdEekChain(curve);
 }
 
-void writeOutput(const Array& csr) {
+void writeOutput(const std::string instance_name, const Array& csr) {
     if (FLAGS_output_format == kBinaryCsrOutput) {
         auto bytes = csr.encode();
         std::copy(bytes.begin(), bytes.end(), std::ostream_iterator<char>(std::cout));
     } else if (FLAGS_output_format == kBuildPlusCsr) {
-        auto [json, error] = jsonEncodeCsrWithBuild(csr);
+        auto [json, error] = jsonEncodeCsrWithBuild(instance_name, csr);
         if (!error.empty()) {
             std::cerr << "Error JSON encoding the output: " << error;
             exit(1);
@@ -169,9 +170,16 @@ void getCsrForInstance(const char* name, void* /*context*/) {
     std::vector<MacedPublicKey> emptyKeys;
     DeviceInfo verifiedDeviceInfo;
     ProtectedData protectedData;
-    ::ndk::ScopedAStatus status = rkp_service->generateCertificateRequest(
-        FLAGS_test_mode, emptyKeys, getEekChain(), challenge, &verifiedDeviceInfo, &protectedData,
-        &keysToSignMac);
+    RpcHardwareInfo hwInfo;
+    ::ndk::ScopedAStatus status = rkp_service->getHardwareInfo(&hwInfo);
+    if (!status.isOk()) {
+        std::cerr << "Failed to get hardware info for '" << fullName
+                  << "'. Error code: " << status.getServiceSpecificError() << "." << std::endl;
+        exit(-1);
+    }
+    status = rkp_service->generateCertificateRequest(
+        FLAGS_test_mode, emptyKeys, getEekChain(hwInfo.supportedEekCurve), challenge,
+        &verifiedDeviceInfo, &protectedData, &keysToSignMac);
     if (!status.isOk()) {
         std::cerr << "Bundle extraction failed for '" << fullName
                   << "'. Error code: " << status.getServiceSpecificError() << "." << std::endl;
@@ -179,7 +187,7 @@ void getCsrForInstance(const char* name, void* /*context*/) {
     }
     auto request =
         composeCertificateRequest(protectedData, verifiedDeviceInfo, challenge, keysToSignMac);
-    writeOutput(request);
+    writeOutput(std::string(name), request);
 }
 
 }  // namespace
