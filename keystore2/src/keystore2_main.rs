@@ -44,7 +44,10 @@ static LEGACY_KEYSTORE_SERVICE_NAME: &str = "android.security.legacykeystore";
 fn main() {
     // Initialize android logging.
     android_logger::init_once(
-        android_logger::Config::default().with_tag("keystore2").with_min_level(log::Level::Debug),
+        android_logger::Config::default()
+            .with_tag("keystore2")
+            .with_min_level(log::Level::Debug)
+            .with_log_id(android_logger::LogId::System),
     );
     // Redirect panic messages to logcat.
     panic::set_hook(Box::new(|panic_info| {
@@ -152,17 +155,20 @@ fn main() {
     // Even if the IRemotelyProvisionedComponent HAL is implemented, it doesn't mean that the keys
     // may be fetched via the key pool. The HAL must be a new version that exports a unique id. If
     // none of the HALs support this, then the key pool service is not published.
-    if let Ok(key_pool_service) = RemotelyProvisionedKeyPoolService::new_native_binder() {
-        binder::add_service(
-            REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME,
-            key_pool_service.as_binder(),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to register service {} because of {:?}.",
-                REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME, e
-            );
-        });
+    match RemotelyProvisionedKeyPoolService::new_native_binder() {
+        Ok(key_pool_service) => {
+            binder::add_service(
+                REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME,
+                key_pool_service.as_binder(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to register service {} because of {:?}.",
+                    REMOTELY_PROVISIONED_KEY_POOL_SERVICE_NAME, e
+                );
+            });
+        }
+        Err(e) => log::info!("Not publishing IRemotelyProvisionedKeyPool service: {:?}", e),
     }
 
     binder::add_service(LEGACY_KEYSTORE_SERVICE_NAME, legacykeystore.as_binder()).unwrap_or_else(
