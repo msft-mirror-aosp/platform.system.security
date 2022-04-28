@@ -15,15 +15,17 @@
 //! This module implements utility functions used by the Keystore 2.0 service
 //! implementation.
 
-use crate::error::{map_binder_status, Error, ErrorCode};
+use crate::error::{map_binder_status, map_km_error, Error, ErrorCode};
+use crate::key_parameter::KeyParameter;
 use crate::permission;
 use crate::permission::{KeyPerm, KeyPermSet, KeystorePerm};
 use crate::{
     database::{KeyType, KeystoreDB},
-    globals::LEGACY_MIGRATOR,
+    globals::LEGACY_IMPORTER,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    KeyCharacteristics::KeyCharacteristics, Tag::Tag,
+    IKeyMintDevice::IKeyMintDevice, KeyCharacteristics::KeyCharacteristics,
+    KeyParameter::KeyParameter as KmKeyParameter, Tag::Tag,
 };
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_security_apc::aidl::android::security::apc::{
@@ -40,6 +42,8 @@ use keystore2_apc_compat::{
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
+use keystore2_crypto::{aes_gcm_decrypt, aes_gcm_encrypt, ZVec};
+use std::iter::IntoIterator;
 
 /// This function uses its namesake in the permission module and in
 /// combination with with_calling_sid from the binder crate to check
@@ -103,9 +107,20 @@ pub fn is_device_id_attestation_tag(tag: Tag) -> bool {
 }
 
 /// This function checks whether the calling app has the Android permissions needed to attest device
-/// identifiers. It throws an error if the permissions cannot be verified, or if the caller doesn't
-/// have the right permissions, and returns silently otherwise.
+/// identifiers. It throws an error if the permissions cannot be verified or if the caller doesn't
+/// have the right permissions. Otherwise it returns silently.
 pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
+    check_android_permission("android.permission.READ_PRIVILEGED_PHONE_STATE")
+}
+
+/// This function checks whether the calling app has the Android permissions needed to attest the
+/// device-unique identifier. It throws an error if the permissions cannot be verified or if the
+/// caller doesn't have the right permissions. Otherwise it returns silently.
+pub fn check_unique_id_attestation_permissions() -> anyhow::Result<()> {
+    check_android_permission("android.permission.REQUEST_UNIQUE_ID_ATTESTATION")
+}
+
+fn check_android_permission(permission: &str) -> anyhow::Result<()> {
     let permission_controller: Strong<dyn IPermissionController::IPermissionController> =
         binder::get_interface("permission")?;
 
@@ -115,7 +130,7 @@ pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
             500,
         );
         permission_controller.checkPermission(
-            "android.permission.READ_PRIVILEGED_PHONE_STATE",
+            permission,
             ThreadState::get_calling_pid(),
             ThreadState::get_calling_uid() as i32,
         )
@@ -135,16 +150,58 @@ pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
 /// representation of the keystore service.
 pub fn key_characteristics_to_internal(
     key_characteristics: Vec<KeyCharacteristics>,
-) -> Vec<crate::key_parameter::KeyParameter> {
+) -> Vec<KeyParameter> {
     key_characteristics
         .into_iter()
         .flat_map(|aidl_key_char| {
             let sec_level = aidl_key_char.securityLevel;
-            aidl_key_char.authorizations.into_iter().map(move |aidl_kp| {
-                crate::key_parameter::KeyParameter::new(aidl_kp.into(), sec_level)
-            })
+            aidl_key_char
+                .authorizations
+                .into_iter()
+                .map(move |aidl_kp| KeyParameter::new(aidl_kp.into(), sec_level))
         })
         .collect()
+}
+
+/// This function can be used to upgrade key blobs on demand. The return value of
+/// `km_op` is inspected and if ErrorCode::KEY_REQUIRES_UPGRADE is encountered,
+/// an attempt is made to upgrade the key blob. On success `new_blob_handler` is called
+/// with the upgraded blob as argument. Then `km_op` is called a second time with the
+/// upgraded blob as argument. On success a tuple of the `km_op`s result and the
+/// optional upgraded blob is returned.
+pub fn upgrade_keyblob_if_required_with<T, KmOp, NewBlobHandler>(
+    km_dev: &dyn IKeyMintDevice,
+    key_blob: &[u8],
+    upgrade_params: &[KmKeyParameter],
+    km_op: KmOp,
+    new_blob_handler: NewBlobHandler,
+) -> Result<(T, Option<Vec<u8>>)>
+where
+    KmOp: Fn(&[u8]) -> Result<T, Error>,
+    NewBlobHandler: FnOnce(&[u8]) -> Result<()>,
+{
+    match km_op(key_blob) {
+        Err(Error::Km(ErrorCode::KEY_REQUIRES_UPGRADE)) => {
+            let upgraded_blob = {
+                let _wp = watchdog::watch_millis(
+                    "In utils::upgrade_keyblob_if_required_with: calling upgradeKey.",
+                    500,
+                );
+                map_km_error(km_dev.upgradeKey(key_blob, upgrade_params))
+            }
+            .context("In utils::upgrade_keyblob_if_required_with: Upgrade failed.")?;
+
+            new_blob_handler(&upgraded_blob)
+                .context("In utils::upgrade_keyblob_if_required_with: calling new_blob_handler.")?;
+
+            km_op(&upgraded_blob)
+                .map(|v| (v, Some(upgraded_blob)))
+                .context("In utils::upgrade_keyblob_if_required_with: Calling km_op after upgrade.")
+        }
+        r => r
+            .map(|v| (v, None))
+            .context("In utils::upgrade_keyblob_if_required_with: Calling km_op."),
+    }
 }
 
 /// Converts a set of key characteristics from the internal representation into a set of
@@ -211,7 +268,7 @@ pub fn list_key_entries(
 ) -> Result<Vec<KeyDescriptor>> {
     let mut result = Vec::new();
     result.append(
-        &mut LEGACY_MIGRATOR
+        &mut LEGACY_IMPORTER
             .list_uid(domain, namespace)
             .context("In list_key_entries: Trying to list legacy keys.")?,
     );
@@ -252,6 +309,36 @@ pub mod watchdog {
         callback: impl Fn() -> String + Send + 'static,
     ) -> Option<WatchPoint> {
         Watchdog::watch_with(&WD, id, Duration::from_millis(millis), callback)
+    }
+}
+
+/// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
+pub trait AesGcm {
+    /// Deciphers `data` using the initialization vector `iv` and AEAD tag `tag`
+    /// and AES-GCM. The implementation provides the key material and selects
+    /// the implementation variant, e.g., AES128 or AES265.
+    fn decrypt(&self, data: &[u8], iv: &[u8], tag: &[u8]) -> Result<ZVec>;
+
+    /// Encrypts `data` and returns the ciphertext, the initialization vector `iv`
+    /// and AEAD tag `tag`. The implementation provides the key material and selects
+    /// the implementation variant, e.g., AES128 or AES265.
+    fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)>;
+}
+
+/// Marks an object as AES-GCM key.
+pub trait AesGcmKey {
+    /// Provides access to the raw key material.
+    fn key(&self) -> &[u8];
+}
+
+impl<T: AesGcmKey> AesGcm for T {
+    fn decrypt(&self, data: &[u8], iv: &[u8], tag: &[u8]) -> Result<ZVec> {
+        aes_gcm_decrypt(data, iv, tag, self.key())
+            .context("In AesGcm<T>::decrypt: Decryption failed")
+    }
+
+    fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        aes_gcm_encrypt(plaintext, self.key()).context("In AesGcm<T>::encrypt: Encryption failed.")
     }
 }
 

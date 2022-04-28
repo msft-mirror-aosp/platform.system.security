@@ -22,11 +22,11 @@ use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
     check_grant_permission, check_key_permission, check_keystore_permission,
-    key_parameters_to_authorizations, list_key_entries, watchdog as wd,
+    key_parameters_to_authorizations, list_key_entries, uid_to_android_user, watchdog as wd,
 };
 use crate::{
     database::Uuid,
-    globals::{create_thread_local_db, DB, LEGACY_BLOB_LOADER, LEGACY_MIGRATOR},
+    globals::{create_thread_local_db, DB, LEGACY_BLOB_LOADER, LEGACY_IMPORTER, SUPER_KEY},
 };
 use crate::{database::KEYSTORE_UUID, permission};
 use crate::{
@@ -81,7 +81,7 @@ impl KeystoreService {
         }
 
         let uuid_by_sec_level = result.uuid_by_sec_level.clone();
-        LEGACY_MIGRATOR
+        LEGACY_IMPORTER
             .set_init(move || {
                 (create_thread_local_db(), uuid_by_sec_level, LEGACY_BLOB_LOADER.clone())
             })
@@ -130,9 +130,13 @@ impl KeystoreService {
 
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
         let caller_uid = ThreadState::get_calling_uid();
+
+        let super_key =
+            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
-                LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
+                LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
                     db.borrow_mut().load_key_entry(
                         key,
                         KeyType::Client,
@@ -182,8 +186,11 @@ impl KeystoreService {
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
+        let super_key =
+            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+
         DB.with::<_, Result<()>>(|db| {
-            let entry = match LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
+            let entry = match LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
                 db.borrow_mut().load_key_entry(
                     key,
                     KeyType::Client,
@@ -269,30 +276,30 @@ impl KeystoreService {
         // If the first check fails we check if the caller has the list permission allowing to list
         // any namespace. In that case we also adjust the queried namespace if a specific uid was
         // selected.
-        match check_key_permission(KeyPerm::GetInfo, &k, &None) {
-            Err(e) => {
-                if let Some(selinux::Error::PermissionDenied) =
-                    e.root_cause().downcast_ref::<selinux::Error>()
-                {
-                    check_keystore_permission(KeystorePerm::List)
-                        .context("In list_entries: While checking keystore permission.")?;
-                    if namespace != -1 {
-                        k.nspace = namespace;
-                    }
-                } else {
-                    return Err(e).context("In list_entries: While checking key permission.")?;
+        if let Err(e) = check_key_permission(KeyPerm::GetInfo, &k, &None) {
+            if let Some(selinux::Error::PermissionDenied) =
+                e.root_cause().downcast_ref::<selinux::Error>() {
+
+                check_keystore_permission(KeystorePerm::List)
+                    .context("In list_entries: While checking keystore permission.")?;
+                if namespace != -1 {
+                    k.nspace = namespace;
                 }
+            } else {
+                return Err(e).context("In list_entries: While checking key permission.")?;
             }
-            Ok(()) => {}
-        };
+        }
 
         DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace))
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
+        let super_key =
+            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+
         DB.with(|db| {
-            LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
+            LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
                 db.borrow_mut().unbind_key(key, KeyType::Client, caller_uid, |k, av| {
                     check_key_permission(KeyPerm::Delete, k, &av).context("During delete_key.")
                 })
@@ -309,8 +316,11 @@ impl KeystoreService {
         access_vector: permission::KeyPermSet,
     ) -> Result<KeyDescriptor> {
         let caller_uid = ThreadState::get_calling_uid();
+        let super_key =
+            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+
         DB.with(|db| {
-            LEGACY_MIGRATOR.with_try_migrate(key, caller_uid, || {
+            LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
                 db.borrow_mut().grant(
                     key,
                     caller_uid,
