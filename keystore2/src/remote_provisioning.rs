@@ -45,7 +45,7 @@ use serde_cbor::Value;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::database::{CertificateChain, KeystoreDB, Uuid};
+use crate::database::{CertificateChain, KeyIdGuard, KeystoreDB, Uuid};
 use crate::error::{self, map_or_log_err, map_rem_prov_error, Error};
 use crate::globals::{get_keymint_device, get_remotely_provisioned_component, DB};
 use crate::metrics_store::log_rkp_error_stats;
@@ -73,11 +73,32 @@ impl RemProvState {
         Self { security_level, km_uuid, is_hal_present: AtomicBool::new(true) }
     }
 
+    /// Returns the uuid for the KM instance attached to this RemProvState struct.
+    pub fn get_uuid(&self) -> Uuid {
+        self.km_uuid
+    }
+
+    fn is_rkp_only(&self) -> bool {
+        let default_value = false;
+
+        let property_name = match self.security_level {
+            SecurityLevel::STRONGBOX => "remote_provisioning.strongbox.rkp_only",
+            SecurityLevel::TRUSTED_ENVIRONMENT => "remote_provisioning.tee.rkp_only",
+            _ => return default_value,
+        };
+
+        rustutils::system_properties::read_bool(property_name, default_value)
+            .unwrap_or(default_value)
+    }
+
     /// Checks if remote provisioning is enabled and partially caches the result. On a hybrid system
     /// remote provisioning can flip from being disabled to enabled depending on responses from the
     /// server, so unfortunately caching the presence or absence of the HAL is not enough to fully
     /// make decisions about the state of remote provisioning during runtime.
     fn check_rem_prov_enabled(&self, db: &mut KeystoreDB) -> Result<bool> {
+        if self.is_rkp_only() {
+            return Ok(true);
+        }
         if !self.is_hal_present.load(Ordering::Relaxed)
             || get_remotely_provisioned_component(&self.security_level).is_err()
         {
@@ -121,7 +142,7 @@ impl RemProvState {
         caller_uid: u32,
         params: &[KeyParameter],
         db: &mut KeystoreDB,
-    ) -> Result<Option<(AttestationKey, Certificate)>> {
+    ) -> Result<Option<(KeyIdGuard, AttestationKey, Certificate)>> {
         if !self.is_asymmetric_key(params) || !self.check_rem_prov_enabled(db)? {
             // There is no remote provisioning component for this security level on the
             // device. Return None so the underlying KM instance knows to use its
@@ -132,17 +153,18 @@ impl RemProvState {
             match get_rem_prov_attest_key(key.domain, caller_uid, db, &self.km_uuid) {
                 Err(e) => {
                     log::error!(
-                        concat!(
-                            "In get_remote_provisioning_key_and_certs: Failed to get ",
-                            "attestation key. {:?}"
-                        ),
+                        "In get_remote_provisioning_key_and_certs: Error occurred: {:?}",
                         e
                     );
+                    if self.is_rkp_only() {
+                        return Err(e);
+                    }
                     log_rkp_error_stats(MetricsRkpError::FALL_BACK_DURING_HYBRID);
                     Ok(None)
                 }
                 Ok(v) => match v {
-                    Some(cert_chain) => Ok(Some((
+                    Some((guard, cert_chain)) => Ok(Some((
+                        guard,
                         AttestationKey {
                             keyBlob: cert_chain.private_key.to_vec(),
                             attestKeyParams: vec![],
@@ -433,7 +455,7 @@ fn get_rem_prov_attest_key(
     caller_uid: u32,
     db: &mut KeystoreDB,
     km_uuid: &Uuid,
-) -> Result<Option<CertificateChain>> {
+) -> Result<Option<(KeyIdGuard, CertificateChain)>> {
     match domain {
         Domain::APP => {
             // Attempt to get an Attestation Key once. If it fails, then the app doesn't
@@ -458,7 +480,7 @@ fn get_rem_prov_attest_key(
                             "key and failed silently. Something is very wrong."
                         ))
                     },
-                    |cert_chain| Ok(Some(cert_chain)),
+                    |(guard, cert_chain)| Ok(Some((guard, cert_chain))),
                 )
         }
         _ => Ok(None),
@@ -471,12 +493,12 @@ fn get_rem_prov_attest_key_helper(
     caller_uid: u32,
     db: &mut KeystoreDB,
     km_uuid: &Uuid,
-) -> Result<Option<CertificateChain>> {
-    let cert_chain = db
+) -> Result<Option<(KeyIdGuard, CertificateChain)>> {
+    let guard_and_chain = db
         .retrieve_attestation_key_and_cert_chain(domain, caller_uid as i64, km_uuid)
         .context("In get_rem_prov_attest_key_helper: Failed to retrieve a key + cert chain")?;
-    match cert_chain {
-        Some(cert_chain) => Ok(Some(cert_chain)),
+    match guard_and_chain {
+        Some((guard, cert_chain)) => Ok(Some((guard, cert_chain))),
         // Either this app needs to be assigned a key, or the pool is empty. An error will
         // be thrown if there is no key available to assign. This will indicate that the app
         // should be nudged to provision more keys so keystore can retry.
@@ -598,10 +620,11 @@ impl RemotelyProvisionedKeyPoolService {
             .context(format!("In get_attestation_key: unknown irpc id '{}'", irpc_id))?;
         let (_, _, km_uuid) = get_keymint_device(sec_level)?;
 
-        let cert_chain = get_rem_prov_attest_key(Domain::APP, caller_uid as u32, db, &km_uuid)
-            .context("In get_attestation_key")?;
-        match cert_chain {
-            Some(chain) => Ok(RemotelyProvisionedKey {
+        let guard_and_cert_chain =
+            get_rem_prov_attest_key(Domain::APP, caller_uid as u32, db, &km_uuid)
+                .context("In get_attestation_key")?;
+        match guard_and_cert_chain {
+            Some((_, chain)) => Ok(RemotelyProvisionedKey {
                 keyBlob: chain.private_key.to_vec(),
                 encodedCertChain: chain.cert_chain,
             }),
