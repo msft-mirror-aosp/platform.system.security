@@ -80,7 +80,6 @@ bool isAttestationParameter(const KMV1::KeyParameter& param) {
     case Tag::CERTIFICATE_SUBJECT:
     case Tag::CERTIFICATE_NOT_BEFORE:
     case Tag::CERTIFICATE_NOT_AFTER:
-    case Tag::INCLUDE_UNIQUE_ID:
     case Tag::DEVICE_UNIQUE_ATTESTATION:
         return true;
     default:
@@ -127,7 +126,7 @@ bool isKeyCreationParameter(const KMV1::KeyParameter& param) {
     case Tag::TRUSTED_CONFIRMATION_REQUIRED:
     case Tag::UNLOCKED_DEVICE_REQUIRED:
     case Tag::CREATION_DATETIME:
-    case Tag::UNIQUE_ID:
+    case Tag::INCLUDE_UNIQUE_ID:
     case Tag::IDENTITY_CREDENTIAL_KEY:
     case Tag::STORAGE_KEY:
     case Tag::MAC_LENGTH:
@@ -506,16 +505,15 @@ ScopedAStatus KeyMintDevice::importKey(const std::vector<KeyParameter>& inKeyPar
     auto legacyKeyGENParams = convertKeyParametersToLegacy(extractGenerationParams(inKeyParams));
     auto legacyKeyFormat = convertKeyFormatToLegacy(in_inKeyFormat);
     KMV1::ErrorCode errorCode;
-    auto result = mDevice->importKey(legacyKeyGENParams, legacyKeyFormat, in_inKeyData,
-                                     [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& keyBlob,
-                                         const V4_0_KeyCharacteristics& keyCharacteristics) {
-                                         errorCode = convert(error);
-                                         out_creationResult->keyBlob =
-                                             keyBlobPrefix(keyBlob, false);
-                                         out_creationResult->keyCharacteristics =
-                                             processLegacyCharacteristics(
-                                                 securityLevel_, inKeyParams, keyCharacteristics);
-                                     });
+    auto result = mDevice->importKey(
+        legacyKeyGENParams, legacyKeyFormat, in_inKeyData,
+        [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& keyBlob,
+            const V4_0_KeyCharacteristics& keyCharacteristics) {
+            errorCode = convert(error);
+            out_creationResult->keyBlob = keyBlobPrefix(keyBlob, false);
+            out_creationResult->keyCharacteristics =
+                processLegacyCharacteristics(securityLevel_, inKeyParams, keyCharacteristics);
+        });
     if (!result.isOk()) {
         LOG(ERROR) << __func__ << " transaction failed. " << result.description();
         return convertErrorCode(KMV1::ErrorCode::UNKNOWN_ERROR);
@@ -769,6 +767,19 @@ ScopedAStatus KeyMintDevice::getKeyCharacteristics(
 
         return convertErrorCode(km_error);
     }
+}
+
+ScopedAStatus KeyMintDevice::getRootOfTrustChallenge(std::array<uint8_t, 16>* /* challenge */) {
+    return convertErrorCode(KMV1::ErrorCode::UNIMPLEMENTED);
+}
+
+ScopedAStatus KeyMintDevice::getRootOfTrust(const std::array<uint8_t, 16>& /* challenge */,
+                                            std::vector<uint8_t>* /* rootOfTrust */) {
+    return convertErrorCode(KMV1::ErrorCode::UNIMPLEMENTED);
+}
+
+ScopedAStatus KeyMintDevice::sendRootOfTrust(const std::vector<uint8_t>& /* rootOfTrust */) {
+    return convertErrorCode(KMV1::ErrorCode::UNIMPLEMENTED);
 }
 
 ScopedAStatus KeyMintOperation::updateAad(const std::vector<uint8_t>& input,
@@ -1408,7 +1419,7 @@ KeyMintDevice::KeyMintDevice(sp<Keymaster> device, KeyMintSecurityLevel security
         setNumFreeSlots(15);
     }
 
-    softKeyMintDevice_.reset(CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE));
+    softKeyMintDevice_ = CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE);
 }
 
 sp<Keymaster> getDevice(KeyMintSecurityLevel securityLevel) {
@@ -1436,7 +1447,7 @@ std::shared_ptr<IKeyMintDevice> getSoftwareKeymintDevice() {
     static std::shared_ptr<IKeyMintDevice> swDevice;
     std::lock_guard<std::mutex> lock(mutex);
     if (!swDevice) {
-        swDevice.reset(CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE));
+        swDevice = CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE);
     }
     return swDevice;
 }
