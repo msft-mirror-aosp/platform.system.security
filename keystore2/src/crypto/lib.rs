@@ -16,11 +16,11 @@
 //! Keystore 2.0.
 
 mod error;
-mod zvec;
+pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
-    extractSubjectFromCertificate, generateKeyFromPassword, randomBytes, AES_gcm_decrypt,
-    AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey,
+    extractSubjectFromCertificate, generateKeyFromPassword, hmacSha256, randomBytes,
+    AES_gcm_decrypt, AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey,
     ECKEYParsePrivateKey, ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key,
     EC_POINT_free, HKDFExpand, HKDFExtract, EC_KEY, EC_MAX_BYTES, EC_POINT, EVP_MAX_MD_SIZE,
 };
@@ -39,6 +39,8 @@ pub const AES_256_KEY_LENGTH: usize = 32;
 pub const AES_128_KEY_LENGTH: usize = 16;
 /// Length of the expected salt for key from password generation.
 pub const SALT_LENGTH: usize = 16;
+/// Length of an HMAC-SHA256 tag in bytes.
+pub const HMAC_SHA256_LEN: usize = 32;
 
 /// Older versions of keystore produced IVs with four extra
 /// ignored zero bytes at the end; recognise and trim those.
@@ -69,6 +71,21 @@ pub fn generate_random_data(size: usize) -> Result<Vec<u8>, Error> {
         Ok(data)
     } else {
         Err(Error::RandomNumberGenerationFailed)
+    }
+}
+
+/// Perform HMAC-SHA256.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut tag = vec![0; HMAC_SHA256_LEN];
+    // Safety: The first two pairs of arguments must point to const buffers with
+    // size given by the second arg of the pair.  The final pair of arguments
+    // must point to an output buffer with size given by the second arg of the
+    // pair.
+    match unsafe {
+        hmacSha256(key.as_ptr(), key.len(), msg.as_ptr(), msg.len(), tag.as_mut_ptr(), tag.len())
+    } {
+        true => Ok(tag),
+        false => Err(Error::HmacSha256Failed),
     }
 }
 
@@ -346,7 +363,7 @@ pub fn ec_key_generate_key() -> Result<ECKey, Error> {
 
 /// Calls the boringssl EC_KEY_marshal_private_key function.
 pub fn ec_key_marshal_private_key(key: &ECKey) -> Result<ZVec, Error> {
-    let len = 39; // Empirically observed length of private key
+    let len = 73; // Empirically observed length of private key
     let mut buf = ZVec::new(len)?;
     // Safety: the key is valid.
     // This will not write past the specified length of the buffer; if the
@@ -381,8 +398,8 @@ pub fn ec_key_get0_public_key(key: &ECKey) -> BorrowedECPoint {
 
 /// Calls the boringssl EC_POINT_point2oct.
 pub fn ec_point_point_to_oct(point: &EC_POINT) -> Result<Vec<u8>, Error> {
-    // We fix the length to 65 (1 + 2 * field_elem_size), as we get an error if it's too small.
-    let len = 65;
+    // We fix the length to 133 (1 + 2 * field_elem_size), as we get an error if it's too small.
+    let len = 133;
     let mut buf = vec![0; len];
     // Safety: EC_POINT_point2oct writes at most len bytes. The point is valid.
     let result = unsafe { ECPOINTPoint2Oct(point, buf.as_mut_ptr(), len) };
@@ -564,5 +581,19 @@ mod tests {
 
         assert_eq!(left_key, right_key);
         Ok(())
+    }
+
+    #[test]
+    fn test_hmac_sha256() {
+        let key = b"This is the key";
+        let msg1 = b"This is a message";
+        let msg2 = b"This is another message";
+        let tag1a = hmac_sha256(key, msg1).unwrap();
+        assert_eq!(tag1a.len(), HMAC_SHA256_LEN);
+        let tag1b = hmac_sha256(key, msg1).unwrap();
+        assert_eq!(tag1a, tag1b);
+        let tag2 = hmac_sha256(key, msg2).unwrap();
+        assert_eq!(tag2.len(), HMAC_SHA256_LEN);
+        assert_ne!(tag1a, tag2);
     }
 }

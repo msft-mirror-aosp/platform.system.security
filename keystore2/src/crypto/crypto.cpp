@@ -25,6 +25,7 @@
 #include <openssl/ecdh.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
 
@@ -64,6 +65,14 @@ const EVP_CIPHER* getAesCipherForKey(size_t key_size) {
         cipher = EVP_aes_128_gcm();
     }
     return cipher;
+}
+
+bool hmacSha256(const uint8_t* key, size_t key_size, const uint8_t* msg, size_t msg_size,
+                uint8_t* out, size_t out_size) {
+    const EVP_MD* digest = EVP_sha256();
+    unsigned int actual_out_size = out_size;
+    uint8_t* p = HMAC(digest, key, key_size, msg, msg_size, out, &actual_out_size);
+    return (p != nullptr);
 }
 
 bool randomBytes(uint8_t* out, size_t len) {
@@ -225,7 +234,7 @@ int ECDHComputeKey(void* out, const EC_POINT* pub_key, const EC_KEY* priv_key) {
 
 EC_KEY* ECKEYGenerateKey() {
     EC_KEY* key = EC_KEY_new();
-    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp521r1);
     EC_KEY_set_group(key, group);
     auto result = EC_KEY_generate_key(key);
     if (result == 0) {
@@ -251,7 +260,7 @@ size_t ECKEYMarshalPrivateKey(const EC_KEY* priv_key, uint8_t* buf, size_t len) 
 EC_KEY* ECKEYParsePrivateKey(const uint8_t* buf, size_t len) {
     CBS cbs;
     CBS_init(&cbs, buf, len);
-    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp521r1);
     auto result = EC_KEY_parse_private_key(&cbs, group);
     EC_GROUP_free(group);
     if (result != nullptr && CBS_len(&cbs) != 0) {
@@ -262,7 +271,7 @@ EC_KEY* ECKEYParsePrivateKey(const uint8_t* buf, size_t len) {
 }
 
 size_t ECPOINTPoint2Oct(const EC_POINT* point, uint8_t* buf, size_t len) {
-    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp521r1);
     point_conversion_form_t form = POINT_CONVERSION_UNCOMPRESSED;
     auto result = EC_POINT_point2oct(group, point, form, buf, len, nullptr);
     EC_GROUP_free(group);
@@ -270,7 +279,7 @@ size_t ECPOINTPoint2Oct(const EC_POINT* point, uint8_t* buf, size_t len) {
 }
 
 EC_POINT* ECPOINTOct2Point(const uint8_t* buf, size_t len) {
-    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp521r1);
     EC_POINT* point = EC_POINT_new(group);
     auto result = EC_POINT_oct2point(group, point, buf, len, nullptr);
     EC_GROUP_free(group);

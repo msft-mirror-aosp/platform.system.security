@@ -22,7 +22,7 @@ use crate::permission::KeyPerm;
 use crate::remote_provisioning::RemProvState;
 use crate::utils::check_key_permission;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    AttestationKey::AttestationKey, Certificate::Certificate, KeyParameter::KeyParameter,
+    AttestationKey::AttestationKey, Certificate::Certificate, KeyParameter::KeyParameter, Tag::Tag,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, KeyDescriptor::KeyDescriptor,
@@ -35,6 +35,7 @@ use keystore2_crypto::parse_subject_from_certificate;
 /// handled quite differently, thus the different representations.
 pub enum AttestationKeyInfo {
     RemoteProvisioned {
+        key_id_guard: KeyIdGuard,
         attestation_key: AttestationKey,
         attestation_certs: Certificate,
     },
@@ -47,8 +48,8 @@ pub enum AttestationKeyInfo {
 }
 
 /// This function loads and, optionally, assigns the caller's remote provisioned
-/// attestation key or, if `attest_key_descriptor` is given, it loads the user
-/// generated attestation key from the database.
+/// attestation key if a challenge is present. Alternatively, if `attest_key_descriptor` is given,
+/// it loads the user generated attestation key from the database.
 pub fn get_attest_key_info(
     key: &KeyDescriptor,
     caller_uid: u32,
@@ -57,19 +58,25 @@ pub fn get_attest_key_info(
     rem_prov_state: &RemProvState,
     db: &mut KeystoreDB,
 ) -> Result<Option<AttestationKeyInfo>> {
+    let challenge_present = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
     match attest_key_descriptor {
-        None => rem_prov_state
-            .get_remotely_provisioned_attestation_key_and_certs(&key, caller_uid, params, db)
+        None if challenge_present => rem_prov_state
+            .get_remotely_provisioned_attestation_key_and_certs(key, caller_uid, params, db)
             .context(concat!(
                 "In get_attest_key_and_cert_chain: ",
                 "Trying to get remotely provisioned attestation key."
             ))
             .map(|result| {
-                result.map(|(attestation_key, attestation_certs)| {
-                    AttestationKeyInfo::RemoteProvisioned { attestation_key, attestation_certs }
+                result.map(|(key_id_guard, attestation_key, attestation_certs)| {
+                    AttestationKeyInfo::RemoteProvisioned {
+                        key_id_guard,
+                        attestation_key,
+                        attestation_certs,
+                    }
                 })
             }),
-        Some(attest_key) => get_user_generated_attestation_key(&attest_key, caller_uid, db)
+        None => Ok(None),
+        Some(attest_key) => get_user_generated_attestation_key(attest_key, caller_uid, db)
             .context("In get_attest_key_and_cert_chain: Trying to load attest key")
             .map(Some),
     }
@@ -81,7 +88,7 @@ fn get_user_generated_attestation_key(
     db: &mut KeystoreDB,
 ) -> Result<AttestationKeyInfo> {
     let (key_id_guard, blob, cert, blob_metadata) =
-        load_attest_key_blob_and_cert(&key, caller_uid, db)
+        load_attest_key_blob_and_cert(key, caller_uid, db)
             .context("In get_user_generated_attestation_key: Failed to load blob and cert")?;
 
     let issuer_subject: Vec<u8> = parse_subject_from_certificate(&cert).context(
@@ -103,11 +110,11 @@ fn load_attest_key_blob_and_cert(
         _ => {
             let (key_id_guard, mut key_entry) = db
                 .load_key_entry(
-                    &key,
+                    key,
                     KeyType::Client,
                     KeyEntryLoadBits::BOTH,
                     caller_uid,
-                    |k, av| check_key_permission(KeyPerm::use_(), k, &av),
+                    |k, av| check_key_permission(KeyPerm::Use, k, &av),
                 )
                 .context("In load_attest_key_blob_and_cert: Failed to load key.")?;
 
