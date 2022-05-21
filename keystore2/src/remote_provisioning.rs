@@ -78,11 +78,27 @@ impl RemProvState {
         self.km_uuid
     }
 
+    fn is_rkp_only(&self) -> bool {
+        let default_value = false;
+
+        let property_name = match self.security_level {
+            SecurityLevel::STRONGBOX => "remote_provisioning.strongbox.rkp_only",
+            SecurityLevel::TRUSTED_ENVIRONMENT => "remote_provisioning.tee.rkp_only",
+            _ => return default_value,
+        };
+
+        rustutils::system_properties::read_bool(property_name, default_value)
+            .unwrap_or(default_value)
+    }
+
     /// Checks if remote provisioning is enabled and partially caches the result. On a hybrid system
     /// remote provisioning can flip from being disabled to enabled depending on responses from the
     /// server, so unfortunately caching the presence or absence of the HAL is not enough to fully
     /// make decisions about the state of remote provisioning during runtime.
     fn check_rem_prov_enabled(&self, db: &mut KeystoreDB) -> Result<bool> {
+        if self.is_rkp_only() {
+            return Ok(true);
+        }
         if !self.is_hal_present.load(Ordering::Relaxed)
             || get_remotely_provisioned_component(&self.security_level).is_err()
         {
@@ -137,13 +153,14 @@ impl RemProvState {
             match get_rem_prov_attest_key(key.domain, caller_uid, db, &self.km_uuid) {
                 Err(e) => {
                     log::error!(
-                        concat!(
-                            "In get_remote_provisioning_key_and_certs: Failed to get ",
-                            "attestation key. {:?}"
-                        ),
+                        "In get_remote_provisioning_key_and_certs: Error occurred: {:?}",
                         e
                     );
-                    log_rkp_error_stats(MetricsRkpError::FALL_BACK_DURING_HYBRID);
+                    if self.is_rkp_only() {
+                        return Err(e);
+                    }
+                    log_rkp_error_stats(MetricsRkpError::FALL_BACK_DURING_HYBRID,
+                            &self.security_level);
                     Ok(None)
                 }
                 Ok(v) => match v {
