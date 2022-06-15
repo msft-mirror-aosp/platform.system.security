@@ -1,4 +1,4 @@
-// Copyright 2020, The Android Open Source Project
+// Copyright 2021, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,45 +21,33 @@ package {
     default_applicable_licenses: ["system_security_license"],
 }
 
-rust_library {
-    name: "libkeystore2_selinux",
-    crate_name: "keystore2_selinux",
-    srcs: [
-        "src/lib.rs",
-    ],
+rust_bindgen {
+    name: "libkeystore2_system_property_bindgen",
+    wrapper_src: "system_property_bindgen.hpp",
+    crate_name: "keystore2_system_property_bindgen",
+    source_stem: "bindings",
 
-    shared_libs: [
-        "libselinux",
-    ],
-
-    rustlibs: [
-        "libanyhow",
-        "liblazy_static",
-        "liblog_rust",
-        "libselinux_bindgen",
-        "libthiserror",
+    bindgen_flags: [
+        "--size_t-is-usize",
+        "--allowlist-function=__system_property_find",
+        "--allowlist-function=__system_property_read_callback",
+        "--allowlist-function=__system_property_set",
+        "--allowlist-function=__system_property_wait",
     ],
 }
 
-rust_test {
-    name: "keystore2_selinux_test",
+rust_library {
+    name: "libkeystore2_system_property-rust",
+    crate_name: "keystore2_system_property",
     srcs: [
-        "src/lib.rs",
+        "lib.rs",
     ],
-    crate_name: "keystore2_selinux_test",
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-
-    shared_libs: [
-        "libselinux",
-    ],
-
     rustlibs: [
-        "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
-        "liblog_rust",
-        "libselinux_bindgen",
+        "libkeystore2_system_property_bindgen",
         "libthiserror",
+    ],
+    shared_libs: [
+        "libbase",
     ],
 }

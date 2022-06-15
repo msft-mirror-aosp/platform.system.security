@@ -17,7 +17,7 @@
 //!    stores them in an in-memory store.
 //! 2. Returns the collected metrics when requested by the statsd proxy.
 
-use crate::error::{get_error_code, Error};
+use crate::error::get_error_code;
 use crate::globals::DB;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
 use crate::operation::Outcome;
@@ -44,10 +44,9 @@ use android_security_metrics::aidl::android::security::metrics::{
     RkpPoolStats::RkpPoolStats, SecurityLevel::SecurityLevel as MetricsSecurityLevel,
     Storage::Storage as MetricsStorage,
 };
-use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
 use anyhow::{Context, Result};
+use keystore2_system_property::{write, PropertyWatcher, PropertyWatcherError};
 use lazy_static::lazy_static;
-use rustutils::system_properties::PropertyWatcherError;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -288,7 +287,6 @@ fn process_key_creation_event_stats<U>(
                     EcCurve::P_256 => MetricsEcCurve::P_256,
                     EcCurve::P_384 => MetricsEcCurve::P_384,
                     EcCurve::P_521 => MetricsEcCurve::P_521,
-                    EcCurve::CURVE_25519 => MetricsEcCurve::CURVE_25519,
                     _ => MetricsEcCurve::EC_CURVE_UNSPECIFIED,
                 }
             }
@@ -562,14 +560,10 @@ fn pull_storage_stats() -> Result<Vec<KeystoreAtom>> {
 fn pull_attestation_pool_stats() -> Result<Vec<KeystoreAtom>> {
     let mut atoms = Vec::<KeystoreAtom>::new();
     for sec_level in &[SecurityLevel::TRUSTED_ENVIRONMENT, SecurityLevel::STRONGBOX] {
-        // set the expired_by date to be three days from now
         let expired_by = SystemTime::now()
-            .checked_add(Duration::from_secs(60 * 60 * 24 * 3))
-            .ok_or(Error::Rc(ResponseCode::SYSTEM_ERROR))
-            .context("In pull_attestation_pool_stats: Failed to compute expired by system time.")?
             .duration_since(UNIX_EPOCH)
-            .context("In pull_attestation_pool_stats: Failed to compute expired by duration.")?
-            .as_millis() as i64;
+            .unwrap_or_else(|_| Duration::new(0, 0))
+            .as_secs() as i64;
 
         let result = get_pool_status(expired_by, *sec_level);
 
@@ -599,9 +593,8 @@ fn pull_attestation_pool_stats() -> Result<Vec<KeystoreAtom>> {
 }
 
 /// Log error events related to Remote Key Provisioning (RKP).
-pub fn log_rkp_error_stats(rkp_error: MetricsRkpError, sec_level: &SecurityLevel) {
-    let rkp_error_stats = KeystoreAtomPayload::RkpErrorStats(
-        RkpErrorStats { rkpError: rkp_error, security_level: process_security_level(*sec_level) });
+pub fn log_rkp_error_stats(rkp_error: MetricsRkpError) {
+    let rkp_error_stats = KeystoreAtomPayload::RkpErrorStats(RkpErrorStats { rkpError: rkp_error });
     METRICS_STORE.insert_atom(AtomID::RKP_ERROR_STATS, rkp_error_stats);
 }
 
@@ -633,9 +626,7 @@ pub fn update_keystore_crash_sysprop() {
         }
     };
 
-    if let Err(e) =
-        rustutils::system_properties::write(KEYSTORE_CRASH_COUNT_PROPERTY, &new_count.to_string())
-    {
+    if let Err(e) = write(KEYSTORE_CRASH_COUNT_PROPERTY, &new_count.to_string()) {
         log::error!(
             concat!(
                 "In update_keystore_crash_sysprop:: ",
@@ -648,11 +639,12 @@ pub fn update_keystore_crash_sysprop() {
 
 /// Read the system property: keystore.crash_count.
 pub fn read_keystore_crash_count() -> Result<i32> {
-    rustutils::system_properties::read("keystore.crash_count")
-        .context("In read_keystore_crash_count: Failed read property.")?
-        .context("In read_keystore_crash_count: Property not set.")?
-        .parse::<i32>()
-        .map_err(std::convert::Into::into)
+    let mut prop_reader = PropertyWatcher::new("keystore.crash_count").context(concat!(
+        "In read_keystore_crash_count: Failed to create reader a PropertyWatcher."
+    ))?;
+    prop_reader
+        .read(|_n, v| v.parse::<i32>().map_err(std::convert::Into::into))
+        .context("In read_keystore_crash_count: Failed to read the existing system property.")
 }
 
 /// Enum defining the bit position for each padding mode. Since padding mode can be repeatable, it

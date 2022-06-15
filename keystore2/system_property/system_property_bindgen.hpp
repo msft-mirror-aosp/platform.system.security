@@ -13,21 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 
-#ifndef __VINTF_H__
-#define __VINTF_H__
-
-#include <stddef.h>
-
-extern "C" {
-
-char** getHalNames(size_t* len);
-char** getHalNamesAndVersions(size_t* len);
-char** getHidlInstances(size_t* len, const char* package, size_t major_version,
-                        size_t minor_version, const char* interfaceName);
-char** getAidlInstances(size_t* len, const char* package, size_t version,
-                        const char* interfaceName);
-void freeNames(char** names, size_t len);
-}
-
-#endif  //  __VINTF_H__
+#include "sys/system_properties.h"

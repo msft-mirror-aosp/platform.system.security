@@ -14,35 +14,96 @@
 
 //! Bindings for getting the list of HALs.
 
-#[cxx::bridge]
-mod ffi {
-    unsafe extern "C++" {
-        include!("vintf.hpp");
+use keystore2_vintf_bindgen::{
+    freeNames, getAidlInstances, getHalNames, getHalNamesAndVersions, getHidlInstances,
+};
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::str::Utf8Error;
 
-        /// Gets all HAL names.
-        /// Note that this is not a zero-cost shim: it will make copies of the strings.
-        fn get_hal_names() -> Vec<String>;
+/// A struct that contains a list of HALs (optionally with version numbers).
+/// To use it, call as_vec to get a Vec view of the data it contains.
+pub struct HalNames {
+    data: *mut *mut c_char,
+    len: usize,
+}
 
-        /// Gets all HAL names and versions.
-        /// Note that this is not a zero-cost shim: it will make copies of the strings.
-        fn get_hal_names_and_versions() -> Vec<String>;
-
-        /// Gets the instances of the given package, version, and interface tuple.
-        /// Note that this is not a zero-cost shim: it will make copies of the strings.
-        fn get_hidl_instances(
-            package: &str,
-            major_version: usize,
-            minor_version: usize,
-            interface_name: &str,
-        ) -> Vec<String>;
-
-        /// Gets the instances of the given package, version, and interface tuple.
-        /// Note that this is not a zero-cost shim: it will make copies of the strings.
-        fn get_aidl_instances(package: &str, version: usize, interface_name: &str) -> Vec<String>;
+impl Drop for HalNames {
+    fn drop(&mut self) {
+        // Safety: The memory is allocated by our C shim so it must free it as well.
+        unsafe { freeNames(self.data, self.len) }
     }
 }
 
-pub use ffi::*;
+impl<'a> HalNames {
+    /// Get a Vec view of the list of HALs.
+    pub fn as_vec(&'a self) -> Result<Vec<&'a str>, Utf8Error> {
+        // Safety: self.data contains self.len C strings.
+        // The lifetimes ensure that the HalNames (and hence the strings) live
+        // at least as long as the returned vector.
+        unsafe { (0..self.len).map(|i| CStr::from_ptr(*self.data.add(i)).to_str()) }.collect()
+    }
+}
+
+/// Gets all HAL names.
+/// Note that this is not a zero-cost shim: it will make copies of the strings.
+pub fn get_hal_names() -> HalNames {
+    let mut len: usize = 0;
+    // Safety: We'll wrap this in HalNames to free the memory it allocates.
+    // It stores the size of the array it returns in len.
+    let raw_strs = unsafe { getHalNames(&mut len) };
+    HalNames { data: raw_strs, len }
+}
+
+/// Gets all HAL names and versions.
+/// Note that this is not a zero-cost shim: it will make copies of the strings.
+pub fn get_hal_names_and_versions() -> HalNames {
+    let mut len: usize = 0;
+    // Safety: We'll wrap this in HalNames to free the memory it allocates.
+    // It stores the size of the array it returns in len.
+    let raw_strs = unsafe { getHalNamesAndVersions(&mut len) };
+    HalNames { data: raw_strs, len }
+}
+
+/// Gets the instances of the given package, version, and interface tuple.
+/// Note that this is not a zero-cost shim: it will make copies of the strings.
+pub fn get_hidl_instances(
+    package: &str,
+    major_version: usize,
+    minor_version: usize,
+    interface_name: &str,
+) -> HalNames {
+    let mut len: usize = 0;
+    let packages = CString::new(package).expect("Failed to make CString from package.");
+    let interface_name =
+        CString::new(interface_name).expect("Failed to make CString from interface_name.");
+    // Safety: We'll wrap this in HalNames to free the memory it allocates.
+    // It stores the size of the array it returns in len.
+    let raw_strs = unsafe {
+        getHidlInstances(
+            &mut len,
+            packages.as_ptr(),
+            major_version,
+            minor_version,
+            interface_name.as_ptr(),
+        )
+    };
+    HalNames { data: raw_strs, len }
+}
+
+/// Gets the instances of the given package, version, and interface tuple.
+/// Note that this is not a zero-cost shim: it will make copies of the strings.
+pub fn get_aidl_instances(package: &str, version: usize, interface_name: &str) -> HalNames {
+    let mut len: usize = 0;
+    let packages = CString::new(package).expect("Failed to make CString from package.");
+    let interface_name =
+        CString::new(interface_name).expect("Failed to make CString from interface_name.");
+    // Safety: We'll wrap this in HalNames to free the memory it allocates.
+    // It stores the size of the array it returns in len.
+    let raw_strs =
+        unsafe { getAidlInstances(&mut len, packages.as_ptr(), version, interface_name.as_ptr()) };
+    HalNames { data: raw_strs, len }
+}
 
 #[cfg(test)]
 mod tests {
@@ -50,13 +111,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test() {
-        let names = get_hal_names();
+    fn test() -> Result<(), Utf8Error> {
+        let result = get_hal_names();
+        let names = result.as_vec()?;
         assert_ne!(names.len(), 0);
 
-        let names_and_versions = get_hal_names_and_versions();
+        let result = get_hal_names_and_versions();
+        let names_and_versions = result.as_vec()?;
         assert_ne!(names_and_versions.len(), 0);
 
         assert!(names_and_versions.len() >= names.len());
+
+        Ok(())
     }
 }
