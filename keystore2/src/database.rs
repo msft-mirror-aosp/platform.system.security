@@ -46,6 +46,7 @@ pub(crate) mod utils;
 mod versioning;
 
 use crate::gc::Gc;
+use crate::globals::get_keymint_dev_by_uuid;
 use crate::impl_metadata; // This is in db_utils.rs
 use crate::key_parameter::{KeyParameter, Tag};
 use crate::metrics_store::log_rkp_error_stats;
@@ -1863,7 +1864,9 @@ impl KeystoreDB {
                 )
                 .context("Failed to assign attestation key")?;
             if result == 0 {
-                log_rkp_error_stats(MetricsRkpError::OUT_OF_KEYS);
+                let (_, hw_info) = get_keymint_dev_by_uuid(km_uuid)
+                    .context("Error in retrieving keymint device by UUID.")?;
+                log_rkp_error_stats(MetricsRkpError::OUT_OF_KEYS, &hw_info.securityLevel);
                 return Err(KsError::Rc(ResponseCode::OUT_OF_KEYS)).context("Out of keys.");
             } else if result > 1 {
                 return Err(KsError::sys())
@@ -2114,11 +2117,12 @@ impl KeystoreDB {
         let tx = self.conn.unchecked_transaction().context(
             "In retrieve_attestation_key_and_cert_chain: Failed to initialize transaction.",
         )?;
-        let key_id: i64;
-        match self.query_kid_for_attestation_key_and_cert_chain(&tx, domain, namespace, km_uuid)? {
+        let key_id: i64 = match self
+            .query_kid_for_attestation_key_and_cert_chain(&tx, domain, namespace, km_uuid)?
+        {
             None => return Ok(None),
-            Some(kid) => key_id = kid,
-        }
+            Some(kid) => kid,
+        };
         tx.commit()
             .context("In retrieve_attestation_key_and_cert_chain: Failed to commit keyid query")?;
         let key_id_guard = KEY_ID_LOCK.get(key_id);
@@ -2889,33 +2893,33 @@ impl KeystoreDB {
                 "DELETE FROM persistent.keymetadata
                 WHERE keyentryid IN (
                     SELECT id FROM persistent.keyentry
-                    WHERE domain = ? AND namespace = ? AND key_type = ?
+                    WHERE domain = ? AND namespace = ? AND (key_type = ? OR key_type = ?)
                 );",
-                params![domain.0, namespace, KeyType::Client],
+                params![domain.0, namespace, KeyType::Client, KeyType::Attestation],
             )
             .context("Trying to delete keymetadata.")?;
             tx.execute(
                 "DELETE FROM persistent.keyparameter
                 WHERE keyentryid IN (
                     SELECT id FROM persistent.keyentry
-                    WHERE domain = ? AND namespace = ? AND key_type = ?
+                    WHERE domain = ? AND namespace = ? AND (key_type = ? OR key_type = ?)
                 );",
-                params![domain.0, namespace, KeyType::Client],
+                params![domain.0, namespace, KeyType::Client, KeyType::Attestation],
             )
             .context("Trying to delete keyparameters.")?;
             tx.execute(
                 "DELETE FROM persistent.grant
                 WHERE keyentryid IN (
                     SELECT id FROM persistent.keyentry
-                    WHERE domain = ? AND namespace = ? AND key_type = ?
+                    WHERE domain = ? AND namespace = ? AND (key_type = ? OR key_type = ?)
                 );",
-                params![domain.0, namespace, KeyType::Client],
+                params![domain.0, namespace, KeyType::Client, KeyType::Attestation],
             )
             .context("Trying to delete grants.")?;
             tx.execute(
                 "DELETE FROM persistent.keyentry
-                 WHERE domain = ? AND namespace = ? AND key_type = ?;",
-                params![domain.0, namespace, KeyType::Client],
+                 WHERE domain = ? AND namespace = ? AND (key_type = ? OR key_type = ?);",
+                params![domain.0, namespace, KeyType::Client, KeyType::Attestation],
             )
             .context("Trying to delete keyentry.")?;
             Ok(()).need_gc()
@@ -3667,13 +3671,13 @@ pub mod tests {
             namespace_del1,
             &KEYSTORE_UUID,
         )?;
-        assert!(!cert_chain.is_some());
+        assert!(cert_chain.is_none());
         cert_chain = db.retrieve_attestation_key_and_cert_chain(
             Domain::APP,
             namespace_del2,
             &KEYSTORE_UUID,
         )?;
-        assert!(!cert_chain.is_some());
+        assert!(cert_chain.is_none());
 
         // Give the garbage collector half a second to catch up.
         std::thread::sleep(Duration::from_millis(500));

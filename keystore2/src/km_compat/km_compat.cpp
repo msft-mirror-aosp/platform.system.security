@@ -80,7 +80,6 @@ bool isAttestationParameter(const KMV1::KeyParameter& param) {
     case Tag::CERTIFICATE_SUBJECT:
     case Tag::CERTIFICATE_NOT_BEFORE:
     case Tag::CERTIFICATE_NOT_AFTER:
-    case Tag::INCLUDE_UNIQUE_ID:
     case Tag::DEVICE_UNIQUE_ATTESTATION:
         return true;
     default:
@@ -127,7 +126,7 @@ bool isKeyCreationParameter(const KMV1::KeyParameter& param) {
     case Tag::TRUSTED_CONFIRMATION_REQUIRED:
     case Tag::UNLOCKED_DEVICE_REQUIRED:
     case Tag::CREATION_DATETIME:
-    case Tag::UNIQUE_ID:
+    case Tag::INCLUDE_UNIQUE_ID:
     case Tag::IDENTITY_CREDENTIAL_KEY:
     case Tag::STORAGE_KEY:
     case Tag::MAC_LENGTH:
@@ -1420,7 +1419,7 @@ KeyMintDevice::KeyMintDevice(sp<Keymaster> device, KeyMintSecurityLevel security
         setNumFreeSlots(15);
     }
 
-    softKeyMintDevice_.reset(CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE));
+    softKeyMintDevice_ = CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE);
 }
 
 sp<Keymaster> getDevice(KeyMintSecurityLevel securityLevel) {
@@ -1448,7 +1447,7 @@ std::shared_ptr<IKeyMintDevice> getSoftwareKeymintDevice() {
     static std::shared_ptr<IKeyMintDevice> swDevice;
     std::lock_guard<std::mutex> lock(mutex);
     if (!swDevice) {
-        swDevice.reset(CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE));
+        swDevice = CreateKeyMintDevice(KeyMintSecurityLevel::SOFTWARE);
     }
     return swDevice;
 }
