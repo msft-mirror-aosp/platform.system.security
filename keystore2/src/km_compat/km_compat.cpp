@@ -126,7 +126,7 @@ bool isKeyCreationParameter(const KMV1::KeyParameter& param) {
     case Tag::TRUSTED_CONFIRMATION_REQUIRED:
     case Tag::UNLOCKED_DEVICE_REQUIRED:
     case Tag::CREATION_DATETIME:
-    case Tag::UNIQUE_ID:
+    case Tag::INCLUDE_UNIQUE_ID:
     case Tag::IDENTITY_CREDENTIAL_KEY:
     case Tag::STORAGE_KEY:
     case Tag::MAC_LENGTH:
@@ -573,6 +573,17 @@ ScopedAStatus KeyMintDevice::upgradeKey(const std::vector<uint8_t>& in_inKeyBlob
                                         std::vector<uint8_t>* _aidl_return) {
     auto legacyUpgradeParams = convertKeyParametersToLegacy(in_inUpgradeParams);
     V4_0_ErrorCode errorCode;
+
+    if (prefixedKeyBlobIsSoftKeyMint(in_inKeyBlobToUpgrade)) {
+        auto status = softKeyMintDevice_->upgradeKey(
+            prefixedKeyBlobRemovePrefix(in_inKeyBlobToUpgrade), in_inUpgradeParams, _aidl_return);
+        if (!status.isOk()) {
+            LOG(ERROR) << __func__ << " transaction failed. " << status.getDescription();
+        } else {
+            *_aidl_return = keyBlobPrefix(*_aidl_return, true);
+        }
+        return status;
+    }
 
     auto result =
         mDevice->upgradeKey(prefixedKeyBlobRemovePrefix(in_inKeyBlobToUpgrade), legacyUpgradeParams,

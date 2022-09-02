@@ -19,6 +19,7 @@
 //! defined by keystore2 and keystore2_key respectively.
 
 use crate::error::Error as KsError;
+use crate::error::ResponseCode;
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, KeyDescriptor::KeyDescriptor, KeyPermission::KeyPermission,
 };
@@ -53,7 +54,7 @@ implement_class!(
     /// the SELinux permissions.
     #[repr(i32)]
     #[selinux(class_name = keystore2_key)]
-    #[derive(Clone, Copy, Debug, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KeyPerm {
         /// Checked when convert_storage_key_to_ephemeral is called.
         #[selinux(name = convert_storage_key_to_ephemeral)]
@@ -87,7 +88,9 @@ implement_class!(
         /// Checked when the caller attempts to use a private or public key.
         #[selinux(name = use)]
         Use = KeyPermission::USE.0,
-        /// Checked when the caller attempts to use device ids for attestation.
+        /// Does nothing, and is not checked. For use of device identifiers,
+        /// the caller must hold the READ_PRIVILEGED_PHONE_STATE Android
+        /// permission.
         #[selinux(name = use_dev_id)]
         UseDevId = KeyPermission::USE_DEV_ID.0,
     }
@@ -97,7 +100,7 @@ implement_class!(
     /// KeystorePerm provides a convenient abstraction from the SELinux class `keystore2`.
     /// Using the implement_permission macro we get the same features as `KeyPerm`.
     #[selinux(class_name = keystore2)]
-    #[derive(Clone, Copy, Debug, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KeystorePerm {
         /// Checked when a new auth token is installed.
         #[selinux(name = add_auth)]
@@ -388,7 +391,7 @@ pub fn check_key_permission(
             tctx
         }
         _ => {
-            return Err(KsError::sys())
+            return Err(KsError::Rc(ResponseCode::INVALID_ARGUMENT))
                 .context(format!("Unknown domain value: \"{:?}\".", key.domain))
         }
     };
