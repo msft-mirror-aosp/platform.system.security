@@ -266,7 +266,7 @@ impl KeystoreService {
                 ..Default::default()
             },
             Domain::SELINUX => KeyDescriptor{domain, nspace: namespace, ..Default::default()},
-            _ => return Err(Error::perm()).context(
+            _ => return Err(Error::Rc(ResponseCode::INVALID_ARGUMENT)).context(
                 "In list_entries: List entries is only supported for Domain::APP and Domain::SELINUX."
             ),
         };
@@ -276,22 +276,19 @@ impl KeystoreService {
         // If the first check fails we check if the caller has the list permission allowing to list
         // any namespace. In that case we also adjust the queried namespace if a specific uid was
         // selected.
-        match check_key_permission(KeyPerm::GetInfo, &k, &None) {
-            Err(e) => {
-                if let Some(selinux::Error::PermissionDenied) =
-                    e.root_cause().downcast_ref::<selinux::Error>()
-                {
-                    check_keystore_permission(KeystorePerm::List)
-                        .context("In list_entries: While checking keystore permission.")?;
-                    if namespace != -1 {
-                        k.nspace = namespace;
-                    }
-                } else {
-                    return Err(e).context("In list_entries: While checking key permission.")?;
+        if let Err(e) = check_key_permission(KeyPerm::GetInfo, &k, &None) {
+            if let Some(selinux::Error::PermissionDenied) =
+                e.root_cause().downcast_ref::<selinux::Error>()
+            {
+                check_keystore_permission(KeystorePerm::List)
+                    .context("In list_entries: While checking keystore permission.")?;
+                if namespace != -1 {
+                    k.nspace = namespace;
                 }
+            } else {
+                return Err(e).context("In list_entries: While checking key permission.")?;
             }
-            Ok(()) => {}
-        };
+        }
 
         DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace))
     }

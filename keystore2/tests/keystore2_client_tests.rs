@@ -1,4 +1,4 @@
-// Copyright 2021, The Android Open Source Project
+// Copyright 2022, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(missing_docs)]
-#![no_main]
-#[macro_use]
-extern crate libfuzzer_sys;
-use keystore2::legacy_blob::LegacyBlobLoader;
-
-fuzz_target!(|data: &[u8]| {
-    if !data.is_empty() {
-        let string = data.iter().filter_map(|c| std::char::from_u32(*c as u32)).collect::<String>();
-        let _res = LegacyBlobLoader::decode_alias(&string);
-    }
-});
+pub mod keystore2_client_3des_key_tests;
+pub mod keystore2_client_aes_key_tests;
+pub mod keystore2_client_ec_key_tests;
+pub mod keystore2_client_grant_key_tests;
+pub mod keystore2_client_hmac_key_tests;
+pub mod keystore2_client_key_id_domain_tests;
+pub mod keystore2_client_list_entries_tests;
+pub mod keystore2_client_operation_tests;
+pub mod keystore2_client_rsa_key_tests;
+pub mod keystore2_client_test_utils;

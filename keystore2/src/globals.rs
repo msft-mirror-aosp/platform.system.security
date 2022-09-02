@@ -186,7 +186,7 @@ lazy_static! {
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
                 let _wp = wd::watch_millis("In invalidate key closure: calling deleteKey", 500);
-                map_km_error(km_dev.deleteKey(&*blob))
+                map_km_error(km_dev.deleteKey(blob))
                     .context("In invalidate key closure: Trying to invalidate key blob.")
             }),
             KeystoreDB::new(&DB_PATH.read().expect("Could not get the database directory."), None)
@@ -465,12 +465,10 @@ fn connect_remotely_provisioned_component(
     .context("In connect_remotely_provisioned_component.")?;
 
     let rem_prov_hal: Strong<dyn IRemotelyProvisionedComponent> =
-        map_binder_status_code(binder::get_interface(&service_name))
-            .context(concat!(
-                "In connect_remotely_provisioned_component: Trying to connect to",
-                " RemotelyProvisionedComponent service."
-            ))
-            .map_err(|e| e)?;
+        map_binder_status_code(binder::get_interface(&service_name)).context(concat!(
+            "In connect_remotely_provisioned_component: Trying to connect to",
+            " RemotelyProvisionedComponent service."
+        ))?;
     Ok(rem_prov_hal)
 }
 
