@@ -47,7 +47,16 @@ fn main() {
         android_logger::Config::default()
             .with_tag("keystore2")
             .with_min_level(log::Level::Debug)
-            .with_log_id(android_logger::LogId::System),
+            .with_log_id(android_logger::LogId::System)
+            .format(|buf, record| {
+                writeln!(
+                    buf,
+                    "{}:{} - {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    record.args()
+                )
+            }),
     );
     // Redirect panic messages to logcat.
     panic::set_hook(Box::new(|panic_info| {
@@ -139,17 +148,20 @@ fn main() {
 
     // Devices with KS2 and KM 1.0 may not have any IRemotelyProvisionedComponent HALs at all. Do
     // not panic if new_native_binder returns failure because it could not find the TEE HAL.
-    if let Ok(remote_provisioning_service) = RemoteProvisioningService::new_native_binder() {
-        binder::add_service(
-            REMOTE_PROVISIONING_SERVICE_NAME,
-            remote_provisioning_service.as_binder(),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to register service {} because of {:?}.",
-                REMOTE_PROVISIONING_SERVICE_NAME, e
-            );
-        });
+    match RemoteProvisioningService::new_native_binder() {
+        Ok(remote_provisioning_service) => {
+            binder::add_service(
+                REMOTE_PROVISIONING_SERVICE_NAME,
+                remote_provisioning_service.as_binder(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to register service {} because of {:?}.",
+                    REMOTE_PROVISIONING_SERVICE_NAME, e
+                );
+            });
+        }
+        Err(e) => log::info!("Not publishing {}: {:?}", REMOTE_PROVISIONING_SERVICE_NAME, e),
     }
 
     // Even if the IRemotelyProvisionedComponent HAL is implemented, it doesn't mean that the keys
