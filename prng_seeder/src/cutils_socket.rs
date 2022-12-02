@@ -1,4 +1,4 @@
-// Copyright 2022, The Android Open Source Project
+// Copyright (C) 2022 The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod keystore2_client_3des_key_tests;
-pub mod keystore2_client_aes_key_tests;
-pub mod keystore2_client_attest_key_tests;
-pub mod keystore2_client_ec_key_tests;
-pub mod keystore2_client_grant_key_tests;
-pub mod keystore2_client_hmac_key_tests;
-pub mod keystore2_client_import_keys_tests;
-pub mod keystore2_client_key_id_domain_tests;
-pub mod keystore2_client_list_entries_tests;
-pub mod keystore2_client_operation_tests;
-pub mod keystore2_client_rsa_key_tests;
-pub mod keystore2_client_test_utils;
+use std::ffi::CString;
+use std::os::unix::{net::UnixListener, prelude::FromRawFd};
+
+use anyhow::{ensure, Result};
+
+pub fn android_get_control_socket(name: &str) -> Result<UnixListener> {
+    let name = CString::new(name)?;
+    let fd = unsafe { cutils_socket_bindgen::android_get_control_socket(name.as_ptr()) };
+    ensure!(fd >= 0, "android_get_control_socket failed");
+    Ok(unsafe { UnixListener::from_raw_fd(fd) })
+}
