@@ -41,7 +41,7 @@ use std::ffi::CString;
 
 /// This is the main Keystore error type. It wraps the Keystore `ResponseCode` generated
 /// from AIDL in the `Rc` variant and Keymint `ErrorCode` in the Km variant.
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {
     /// Wraps a Keystore `ResponseCode` as defined by the Keystore AIDL interface specification.
     #[error("Error::Rc({0:?})")]
@@ -72,9 +72,9 @@ impl Error {
         Error::Rc(ResponseCode::PERMISSION_DENIED)
     }
 
-    /// Short hand for `Error::Rc(ResponseCode::OUT_OF_KEYS)`
+    /// Short hand for `Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)`
     pub fn out_of_keys() -> Self {
-        Error::Rc(ResponseCode::OUT_OF_KEYS)
+        Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
     }
 }
 

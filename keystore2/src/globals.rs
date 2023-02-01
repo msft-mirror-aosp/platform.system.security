@@ -16,6 +16,7 @@
 //! database connections and connections to services that Keystore needs
 //! to talk to.
 
+use crate::ks_err;
 use crate::gc::Gc;
 use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_importer::LegacyImporter;
@@ -30,9 +31,10 @@ use crate::{
 use crate::km_compat::{KeyMintV1, BacklevelKeyMintWrapper};
 use crate::{enforcements::Enforcements, error::map_km_error};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    IKeyMintDevice::IKeyMintDevice, IRemotelyProvisionedComponent::IRemotelyProvisionedComponent,
-    KeyMintHardwareInfo::KeyMintHardwareInfo, SecurityLevel::SecurityLevel,
+    IKeyMintDevice::IKeyMintDevice, KeyMintHardwareInfo::KeyMintHardwareInfo,
+    SecurityLevel::SecurityLevel,
 };
+use android_hardware_security_rkp::aidl::android::hardware::security::keymint::IRemotelyProvisionedComponent::IRemotelyProvisionedComponent;
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
     ISecureClock::ISecureClock,
 };
@@ -186,8 +188,8 @@ lazy_static! {
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
                 let _wp = wd::watch_millis("In invalidate key closure: calling deleteKey", 500);
-                map_km_error(km_dev.deleteKey(&*blob))
-                    .context("In invalidate key closure: Trying to invalidate key blob.")
+                map_km_error(km_dev.deleteKey(blob))
+                    .context(ks_err!("Trying to invalidate key blob."))
             }),
             KeystoreDB::new(&DB_PATH.read().expect("Could not get the database directory."), None)
                 .expect("Failed to open database."),
@@ -224,9 +226,10 @@ fn keymint_service_name_by_version(
             }
         }
         _ => {
-            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(format!(
-                "In keymint_service_name_by_version: Trying to find keymint V{} for security level: {:?}",
-                version, security_level
+            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(ks_err!(
+                "Trying to find keymint V{} for security level: {:?}",
+                version,
+                security_level
             ));
         }
     };
@@ -251,12 +254,12 @@ fn connect_keymint(
                 Ok(sl)
             }
         })
-        .context("In connect_keymint.")?;
+        .context(ks_err!())?;
 
     let (keymint, hal_version) = if let Some((version, service_name)) = service_name {
         let km: Strong<dyn IKeyMintDevice> =
             map_binder_status_code(binder::get_interface(&service_name))
-                .context("In connect_keymint: Trying to connect to genuine KeyMint service.")?;
+                .context(ks_err!("Trying to connect to genuine KeyMint service."))?;
         // Map the HAL version code for KeyMint to be <AIDL version> * 100, so
         // - V1 is 100
         // - V2 is 200
@@ -268,7 +271,7 @@ fn connect_keymint(
 
         let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
             map_binder_status_code(binder::get_interface("android.security.compat"))
-                .context("In connect_keymint: Trying to connect to compat service.")?;
+                .context(ks_err!("Trying to connect to compat service."))?;
         (
             map_binder_status(keystore_compat_service.getKeyMintDevice(*security_level))
                 .map_err(|e| match e {
@@ -277,7 +280,7 @@ fn connect_keymint(
                     }
                     e => e,
                 })
-                .context("In connect_keymint: Trying to get Legacy wrapper.")?,
+                .context(ks_err!("Trying to get Legacy wrapper."))?,
             None,
         )
     };
@@ -302,7 +305,7 @@ fn connect_keymint(
                 security_level
             );
             BacklevelKeyMintWrapper::wrap(KeyMintV1::new(*security_level), keymint)
-                .context("In connect_keymint: Trying to create V1 compatibility wrapper.")?
+                .context(ks_err!("Trying to create V1 compatibility wrapper."))?
         }
         None => {
             // Compatibility wrapper around a KeyMaster device: this roughly
@@ -312,21 +315,21 @@ fn connect_keymint(
                 "Add emulation wrapper around Keymaster device for security level: {:?}",
                 security_level
             );
-            BacklevelKeyMintWrapper::wrap(KeyMintV1::new(*security_level), keymint).context(
-                "In connect_keymint: Trying to create km_compat V1 compatibility wrapper .",
-            )?
+            BacklevelKeyMintWrapper::wrap(KeyMintV1::new(*security_level), keymint)
+                .context(ks_err!("Trying to create km_compat V1 compatibility wrapper ."))?
         }
         _ => {
-            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(format!(
-                "In connect_keymint: unexpected hal_version {:?} for security level: {:?}",
-                hal_version, security_level
-            ))
+            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(ks_err!(
+                "unexpected hal_version {:?} for security level: {:?}",
+                hal_version,
+                security_level
+            ));
         }
     };
 
     let wp = wd::watch_millis("In connect_keymint: calling getHardwareInfo()", 500);
-    let mut hw_info = map_km_error(keymint.getHardwareInfo())
-        .context("In connect_keymint: Failed to get hardware info.")?;
+    let mut hw_info =
+        map_km_error(keymint.getHardwareInfo()).context(ks_err!("Failed to get hardware info."))?;
     drop(wp);
 
     // The legacy wrapper sets hw_info.versionNumber to the underlying HAL version like so:
@@ -356,7 +359,7 @@ pub fn get_keymint_device(
     if let Some((dev, hw_info, uuid)) = devices_map.dev_by_sec_level(security_level) {
         Ok((dev, hw_info, uuid))
     } else {
-        let (dev, hw_info) = connect_keymint(security_level).context("In get_keymint_device.")?;
+        let (dev, hw_info) = connect_keymint(security_level).context(ks_err!())?;
         devices_map.insert(*security_level, dev, hw_info);
         // Unwrap must succeed because we just inserted it.
         Ok(devices_map.dev_by_sec_level(security_level).unwrap())
@@ -374,7 +377,7 @@ pub fn get_keymint_dev_by_uuid(
     if let Some((dev, hw_info, _)) = devices_map.dev_by_uuid(uuid) {
         Ok((dev, hw_info))
     } else {
-        Err(Error::sys()).context("In get_keymint_dev_by_uuid: No KeyMint instance found.")
+        Err(Error::sys()).context(ks_err!("No KeyMint instance found."))
     }
 }
 
@@ -399,14 +402,14 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
 
     let secureclock = if secure_clock_available {
         map_binder_status_code(binder::get_interface(&default_time_stamp_service_name))
-            .context("In connect_secureclock: Trying to connect to genuine secure clock service.")
+            .context(ks_err!("Trying to connect to genuine secure clock service."))
     } else {
         // This is a no-op if it was called before.
         keystore2_km_compat::add_keymint_device_service();
 
         let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
             map_binder_status_code(binder::get_interface("android.security.compat"))
-                .context("In connect_secureclock: Trying to connect to compat service.")?;
+                .context(ks_err!("Trying to connect to compat service."))?;
 
         // Legacy secure clock services were only implemented by TEE.
         map_binder_status(keystore_compat_service.getSecureClock())
@@ -416,7 +419,7 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
                 }
                 e => e,
             })
-            .context("In connect_secureclock: Trying to get Legacy wrapper.")
+            .context(ks_err!("Trying to get Legacy wrapper."))
     }?;
 
     Ok(secureclock)
@@ -429,7 +432,7 @@ pub fn get_timestamp_service() -> Result<Strong<dyn ISecureClock>> {
     if let Some(dev) = &*ts_device {
         Ok(dev.clone())
     } else {
-        let dev = connect_secureclock().context("In get_timestamp_service.")?;
+        let dev = connect_secureclock().context(ks_err!())?;
         *ts_device = Some(dev.clone());
         Ok(dev)
     }
@@ -438,13 +441,12 @@ pub fn get_timestamp_service() -> Result<Strong<dyn ISecureClock>> {
 static REMOTE_PROVISIONING_HAL_SERVICE_NAME: &str =
     "android.hardware.security.keymint.IRemotelyProvisionedComponent";
 
-fn connect_remotely_provisioned_component(
-    security_level: &SecurityLevel,
-) -> Result<Strong<dyn IRemotelyProvisionedComponent>> {
+/// Get the service name of a remotely provisioned component corresponding to given security level.
+pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -> Result<String> {
     let remotely_prov_instances =
         get_aidl_instances("android.hardware.security.keymint", 1, "IRemotelyProvisionedComponent");
 
-    let service_name = match *security_level {
+    match *security_level {
         SecurityLevel::TRUSTED_ENVIRONMENT => {
             if remotely_prov_instances.iter().any(|instance| *instance == "default") {
                 Some(format!("{}/default", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
@@ -462,15 +464,16 @@ fn connect_remotely_provisioned_component(
         _ => None,
     }
     .ok_or(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-    .context("In connect_remotely_provisioned_component.")?;
+    .context(ks_err!())
+}
 
+fn connect_remotely_provisioned_component(
+    security_level: &SecurityLevel,
+) -> Result<Strong<dyn IRemotelyProvisionedComponent>> {
+    let service_name = get_remotely_provisioned_component_name(security_level)?;
     let rem_prov_hal: Strong<dyn IRemotelyProvisionedComponent> =
         map_binder_status_code(binder::get_interface(&service_name))
-            .context(concat!(
-                "In connect_remotely_provisioned_component: Trying to connect to",
-                " RemotelyProvisionedComponent service."
-            ))
-            .map_err(|e| e)?;
+            .context(ks_err!("Trying to connect to RemotelyProvisionedComponent service."))?;
     Ok(rem_prov_hal)
 }
 
@@ -483,8 +486,7 @@ pub fn get_remotely_provisioned_component(
     if let Some(dev) = devices_map.dev_by_sec_level(security_level) {
         Ok(dev)
     } else {
-        let dev = connect_remotely_provisioned_component(security_level)
-            .context("In get_remotely_provisioned_component.")?;
+        let dev = connect_remotely_provisioned_component(security_level).context(ks_err!())?;
         devices_map.insert(*security_level, dev);
         // Unwrap must succeed because we just inserted it.
         Ok(devices_map.dev_by_sec_level(security_level).unwrap())
