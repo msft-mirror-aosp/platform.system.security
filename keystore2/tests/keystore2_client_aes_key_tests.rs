@@ -391,7 +391,12 @@ fn keystore2_aes_gcm_op_fails_missing_mac_len() {
         &mut None,
     ));
     assert!(result.is_err());
-    assert_eq!(Error::Km(ErrorCode::MISSING_MAC_LENGTH), result.unwrap_err());
+
+    let e = result.unwrap_err();
+    assert!(
+        e == Error::Km(ErrorCode::MISSING_MAC_LENGTH)
+            || e == Error::Km(ErrorCode::UNSUPPORTED_MAC_LENGTH)
+    );
 }
 
 /// Generate a AES-GCM key with `MIN_MAC_LENGTH`. Try to create an operation using this

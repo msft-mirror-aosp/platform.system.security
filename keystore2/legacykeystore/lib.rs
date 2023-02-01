@@ -393,7 +393,7 @@ impl LegacyKeystore {
         let uid = Self::get_effective_uid(uid).context("In list.")?;
         let mut result = self.list_legacy(uid).context("In list.")?;
         result.append(&mut db.list(uid).context("In list: Trying to get list of entries.")?);
-        result = result.into_iter().filter(|s| s.starts_with(prefix)).collect();
+        result.retain(|s| s.starts_with(prefix));
         result.sort_unstable();
         result.dedup();
         Ok(result)
@@ -502,10 +502,8 @@ impl LegacyKeystore {
     ) -> Result<bool> {
         let blob = legacy_loader
             .read_legacy_keystore_entry(uid, alias, |ciphertext, iv, tag, _salt, _key_size| {
-                if let Some(key) = SUPER_KEY
-                    .read()
-                    .unwrap()
-                    .get_per_boot_key_by_user_id(uid_to_android_user(uid as u32))
+                if let Some(key) =
+                    SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(uid))
                 {
                     key.decrypt(ciphertext, iv, tag)
                 } else {
