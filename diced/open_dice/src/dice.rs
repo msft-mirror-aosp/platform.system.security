@@ -15,11 +15,16 @@
 //! Structs and functions about the types used in DICE.
 //! This module mirrors the content in open-dice/include/dice/dice.h
 
+use crate::error::{check_result, Result};
+pub use open_dice_cbor_bindgen::DiceMode;
 use open_dice_cbor_bindgen::{
-    DiceConfigType, DiceInputValues, DiceMode, DICE_HASH_SIZE, DICE_HIDDEN_SIZE,
-    DICE_INLINE_CONFIG_SIZE,
+    DiceConfigType, DiceDeriveCdiCertificateId, DiceDeriveCdiPrivateKeySeed, DiceInputValues,
+    DiceMainFlow, DICE_CDI_SIZE, DICE_HASH_SIZE, DICE_HIDDEN_SIZE, DICE_ID_SIZE,
+    DICE_INLINE_CONFIG_SIZE, DICE_PRIVATE_KEY_SEED_SIZE, DICE_PRIVATE_KEY_SIZE,
+    DICE_PUBLIC_KEY_SIZE, DICE_SIGNATURE_SIZE,
 };
 use std::ptr;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The size of a DICE hash.
 pub const HASH_SIZE: usize = DICE_HASH_SIZE as usize;
@@ -27,6 +32,18 @@ pub const HASH_SIZE: usize = DICE_HASH_SIZE as usize;
 pub const HIDDEN_SIZE: usize = DICE_HIDDEN_SIZE as usize;
 /// The size of a DICE inline config.
 const INLINE_CONFIG_SIZE: usize = DICE_INLINE_CONFIG_SIZE as usize;
+/// The size of a CDI.
+pub const CDI_SIZE: usize = DICE_CDI_SIZE as usize;
+/// The size of a private key seed.
+pub const PRIVATE_KEY_SEED_SIZE: usize = DICE_PRIVATE_KEY_SEED_SIZE as usize;
+/// The size of a private key.
+pub const PRIVATE_KEY_SIZE: usize = DICE_PRIVATE_KEY_SIZE as usize;
+/// The size of a public key.
+pub const PUBLIC_KEY_SIZE: usize = DICE_PUBLIC_KEY_SIZE as usize;
+/// The size of a signature.
+pub const SIGNATURE_SIZE: usize = DICE_SIGNATURE_SIZE as usize;
+/// The size of an ID.
+pub const ID_SIZE: usize = DICE_ID_SIZE as usize;
 
 /// Array type of hashes used by DICE.
 pub type Hash = [u8; HASH_SIZE];
@@ -34,6 +51,25 @@ pub type Hash = [u8; HASH_SIZE];
 pub type Hidden = [u8; HIDDEN_SIZE];
 /// Array type of inline configuration values.
 pub type InlineConfig = [u8; INLINE_CONFIG_SIZE];
+/// Array type of CDIs.
+pub type Cdi = [u8; CDI_SIZE];
+/// Array type of private key seeds.
+pub type PrivateKeySeed = [u8; PRIVATE_KEY_SEED_SIZE];
+/// Array type of the public key.
+pub type PublicKey = [u8; PUBLIC_KEY_SIZE];
+/// Array type of the signature.
+pub type Signature = [u8; SIGNATURE_SIZE];
+/// Array type of DICE ID.
+pub type DiceId = [u8; ID_SIZE];
+
+/// CDI Values.
+#[derive(Debug, Zeroize, ZeroizeOnDrop, Default)]
+pub struct CdiValues {
+    /// Attestation CDI.
+    pub cdi_attest: Cdi,
+    /// Sealing CDI.
+    pub cdi_seal: Cdi,
+}
 
 /// Configuration descriptor for DICE input values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,27 +117,25 @@ pub struct InputValues(DiceInputValues);
 impl InputValues {
     /// Creates a new `InputValues`.
     pub fn new(
-        code_hash: &Hash,
-        code_descriptor: Option<&[u8]>,
+        code_hash: Hash,
         config: Config,
-        authority_hash: &Hash,
-        authority_descriptor: Option<&[u8]>,
+        authority_hash: Hash,
         mode: DiceMode,
-        hidden: Option<&Hidden>,
+        hidden: Hidden,
     ) -> Self {
         Self(DiceInputValues {
-            code_hash: *code_hash,
-            code_descriptor: code_descriptor.map_or(ptr::null(), |d| d.as_ptr()),
-            code_descriptor_size: code_descriptor.map_or(0, |d| d.len()),
+            code_hash,
+            code_descriptor: ptr::null(),
+            code_descriptor_size: 0,
             config_type: config.dice_config_type(),
             config_value: config.inline_config(),
             config_descriptor: config.descriptor_ptr(),
             config_descriptor_size: config.descriptor_size(),
-            authority_hash: *authority_hash,
-            authority_descriptor: authority_descriptor.map_or(ptr::null(), |d| d.as_ptr()),
-            authority_descriptor_size: authority_descriptor.map_or(0, |d| d.len()),
+            authority_hash,
+            authority_descriptor: ptr::null(),
+            authority_descriptor_size: 0,
             mode,
-            hidden: hidden.map_or([0; HIDDEN_SIZE], |h| *h),
+            hidden,
         })
     }
 
@@ -109,4 +143,67 @@ impl InputValues {
     pub fn as_ptr(&self) -> *const DiceInputValues {
         &self.0 as *const DiceInputValues
     }
+}
+
+/// Derives a CDI private key seed from a `cdi_attest` value.
+pub fn derive_cdi_private_key_seed(cdi_attest: &Cdi) -> Result<PrivateKeySeed> {
+    let mut seed = [0u8; PRIVATE_KEY_SEED_SIZE];
+    // SAFETY: The function writes to the buffer within the given bounds, and only reads the
+    // input values. The first argument context is not used in this function.
+    check_result(unsafe {
+        DiceDeriveCdiPrivateKeySeed(
+            ptr::null_mut(), // context
+            cdi_attest.as_ptr(),
+            seed.as_mut_ptr(),
+        )
+    })?;
+    Ok(seed)
+}
+
+/// Derives an ID from the given `cdi_public_key` value.
+pub fn derive_cdi_certificate_id(cdi_public_key: &[u8]) -> Result<DiceId> {
+    let mut id = [0u8; ID_SIZE];
+    // SAFETY: The function writes to the buffer within the given bounds, and only reads the
+    // input values. The first argument context is not used in this function.
+    check_result(unsafe {
+        DiceDeriveCdiCertificateId(
+            ptr::null_mut(), // context
+            cdi_public_key.as_ptr(),
+            cdi_public_key.len(),
+            id.as_mut_ptr(),
+        )
+    })?;
+    Ok(id)
+}
+
+/// Executes the main DICE flow.
+///
+/// Given a full set of input values and the current CDI values, computes the
+/// next CDI values and a matching certificate.
+/// Returns the actual size of the next CDI certificate.
+pub fn dice_main_flow(
+    current_cdi_attest: &Cdi,
+    current_cdi_seal: &Cdi,
+    input_values: &InputValues,
+    next_cdi_certificate: &mut [u8],
+    next_cdi_values: &mut CdiValues,
+) -> Result<usize> {
+    let mut next_cdi_certificate_actual_size = 0;
+    // SAFETY: The function only reads the current CDI values and inputs and writes
+    // to `next_cdi_certificate` and next CDI values within its bounds.
+    // The first argument can be null and is not used in the current implementation.
+    check_result(unsafe {
+        DiceMainFlow(
+            ptr::null_mut(), // context
+            current_cdi_attest.as_ptr(),
+            current_cdi_seal.as_ptr(),
+            input_values.as_ptr(),
+            next_cdi_certificate.len(),
+            next_cdi_certificate.as_mut_ptr(),
+            &mut next_cdi_certificate_actual_size,
+            next_cdi_values.cdi_attest.as_mut_ptr(),
+            next_cdi_values.cdi_seal.as_mut_ptr(),
+        )
+    })?;
+    Ok(next_cdi_certificate_actual_size)
 }

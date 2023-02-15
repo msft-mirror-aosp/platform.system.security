@@ -21,10 +21,9 @@ use android_hardware_security_dice::aidl::android::hardware::security::dice::{
 use anyhow::{Context, Result};
 use dice::ContextImpl;
 use diced_open_dice_cbor as dice;
-use diced_utils::cbor;
-use diced_utils::InputValues;
-use keystore2_crypto::ZVec;
+use diced_utils::{cbor, to_dice_input_values};
 use std::convert::TryInto;
+use std::ffi::CStr;
 use std::io::Write;
 
 /// Sample UDS used to perform the root dice flow by `make_sample_bcc_and_cdis`.
@@ -66,10 +65,9 @@ fn encode_pub_key_ed25519(pub_key: &[u8], stream: &mut dyn Write) -> Result<()> 
 
 /// Derives a tuple of (CDI_ATTEST, CDI_SEAL, BCC) derived of the vector of input values returned
 /// by `get_input_values_vector`.
-pub fn make_sample_bcc_and_cdis() -> Result<(ZVec, ZVec, Vec<u8>)> {
+pub fn make_sample_bcc_and_cdis() -> Result<dice::OwnedDiceArtifacts> {
     let mut dice_ctx = dice::OpenDiceCborContext::new();
-    let private_key_seed = dice_ctx
-        .derive_cdi_private_key_seed(UDS)
+    let private_key_seed = dice::derive_cdi_private_key_seed(UDS)
         .context("In make_sample_bcc_and_cdis: Trying to derive private key seed.")?;
 
     let (public_key, _) =
@@ -81,9 +79,9 @@ pub fn make_sample_bcc_and_cdis() -> Result<(ZVec, ZVec, Vec<u8>)> {
 
     let input_values_vector = get_input_values_vector();
 
-    let (cdi_attest, cdi_seal, mut cert) = dice_ctx
-        .main_flow(UDS, UDS, &InputValues::from(&input_values_vector[0]))
-        .context("In make_sample_bcc_and_cdis: Trying to run first main flow.")?;
+    let (cdi_values, mut cert) =
+        dice::retry_dice_main_flow(UDS, UDS, &to_dice_input_values(&input_values_vector[0]))
+            .context("In make_sample_bcc_and_cdis: Trying to run first main flow.")?;
 
     let mut bcc: Vec<u8> = vec![];
 
@@ -94,36 +92,26 @@ pub fn make_sample_bcc_and_cdis() -> Result<(ZVec, ZVec, Vec<u8>)> {
 
     bcc.append(&mut cert);
 
-    let (cdi_attest, cdi_seal, bcc) = dice_ctx
-        .bcc_main_flow(
-            &cdi_attest[..].try_into().context(
-                "In make_sample_bcc_and_cdis: Failed to convert cdi_attest to array reference. (1)",
-            )?,
-            &cdi_seal[..].try_into().context(
-                "In make_sample_bcc_and_cdis: Failed to convert cdi_seal to array reference. (1)",
-            )?,
-            &bcc,
-            &InputValues::from(&input_values_vector[1]),
-        )
-        .context("In make_sample_bcc_and_cdis: Trying to run first bcc main flow.")?;
-    dice_ctx
-        .bcc_main_flow(
-            &cdi_attest[..].try_into().context(
-                "In make_sample_bcc_and_cdis: Failed to convert cdi_attest to array reference. (2)",
-            )?,
-            &cdi_seal[..].try_into().context(
-                "In make_sample_bcc_and_cdis: Failed to convert cdi_seal to array reference. (2)",
-            )?,
-            &bcc,
-            &InputValues::from(&input_values_vector[2]),
-        )
-        .context("In make_sample_bcc_and_cdis: Trying to run second bcc main flow.")
+    let dice_artifacts = dice::retry_bcc_main_flow(
+        &cdi_values.cdi_attest,
+        &cdi_values.cdi_seal,
+        &bcc,
+        &to_dice_input_values(&input_values_vector[1]),
+    )
+    .context("In make_sample_bcc_and_cdis: Trying to run first bcc main flow.")?;
+    dice::retry_bcc_main_flow(
+        &dice_artifacts.cdi_values.cdi_attest,
+        &dice_artifacts.cdi_values.cdi_seal,
+        &dice_artifacts.bcc,
+        &to_dice_input_values(&input_values_vector[2]),
+    )
+    .context("In make_sample_bcc_and_cdis: Trying to run second bcc main flow.")
 }
 
 fn make_input_values(
     code_hash: dice::Hash,
     authority_hash: dice::Hash,
-    config_name: &str,
+    config_name: &CStr,
     config_version: u64,
     config_resettable: bool,
     mode: Mode,
@@ -132,7 +120,7 @@ fn make_input_values(
     Ok(BinderInputValues {
         codeHash: code_hash,
         config: BinderConfig {
-            desc: dice::bcc::format_config_descriptor(
+            desc: dice::retry_bcc_format_config_descriptor(
                 Some(config_name),
                 Some(config_version),
                 config_resettable,
@@ -202,9 +190,9 @@ pub fn get_input_values_vector() -> Vec<BinderInputValues> {
         make_input_values(
             CODE_HASH1,
             AUTHORITY_HASH1,
-            "ABL", // config name
-            1,     // config version
-            true,  // resettable
+            CStr::from_bytes_with_nul(b"ABL\0").unwrap(), // config name
+            1,                                            // config version
+            true,                                         // resettable
             Mode::NORMAL,
             HIDDEN1,
         )
@@ -212,9 +200,9 @@ pub fn get_input_values_vector() -> Vec<BinderInputValues> {
         make_input_values(
             CODE_HASH2,
             AUTHORITY_HASH2,
-            "AVB", // config name
-            1,     // config version
-            true,  // resettable
+            CStr::from_bytes_with_nul(b"AVB\0").unwrap(), // config name
+            1,                                            // config version
+            true,                                         // resettable
             Mode::NORMAL,
             HIDDEN2,
         )
@@ -222,9 +210,9 @@ pub fn get_input_values_vector() -> Vec<BinderInputValues> {
         make_input_values(
             [0; dice::HASH_SIZE], // code hash
             AUTHORITY_HASH3,
-            "Android", // config name
-            12,        // config version
-            true,      // resettable
+            CStr::from_bytes_with_nul(b"Android\0").unwrap(), // config name
+            12,                                               // config version
+            true,                                             // resettable
             Mode::NORMAL,
             [0; dice::HIDDEN_SIZE], // hidden,
         )
