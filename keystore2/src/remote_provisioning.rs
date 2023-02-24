@@ -53,6 +53,7 @@ use crate::globals::{get_keymint_device, get_remotely_provisioned_component, DB}
 use crate::ks_err;
 use crate::metrics_store::log_rkp_error_stats;
 use crate::permission::KeystorePerm;
+use crate::rkpd_client::get_rkpd_attestation_key;
 use crate::utils::{check_keystore_permission, watchdog as wd};
 use android_security_metrics::aidl::android::security::metrics::RkpError::RkpError as MetricsRkpError;
 
@@ -137,8 +138,8 @@ impl RemProvState {
     /// (2) if remote provisioning is present and enabled on the system. If these conditions are
     /// met, it makes an attempt to fetch the attestation key assigned to the `caller_uid`.
     ///
-    /// It returns the ResponseCode `OUT_OF_KEYS` if there is not one key currently assigned to the
-    /// `caller_uid` and there are none available to assign.
+    /// It returns the ResponseCode `OUT_OF_KEYS_TRANSIENT_ERROR` if there is not one key currently
+    /// assigned to the `caller_uid` and there are none available to assign.
     pub fn get_remotely_provisioned_attestation_key_and_certs(
         &self,
         key: &KeyDescriptor,
@@ -184,7 +185,47 @@ impl RemProvState {
             }
         }
     }
+
+    /// Fetches attestation key and corresponding certificates from RKPD.
+    pub fn get_rkpd_attestation_key_and_certs(
+        &self,
+        key: &KeyDescriptor,
+        caller_uid: u32,
+        params: &[KeyParameter],
+    ) -> Result<Option<(AttestationKey, Certificate)>> {
+        if !self.is_asymmetric_key(params) || key.domain != Domain::APP {
+            Ok(None)
+        } else {
+            match get_rkpd_attestation_key(&self.security_level, caller_uid) {
+                Err(e) => {
+                    if self.is_rkp_only() {
+                        log::error!("Error occurred: {:?}", e);
+                        return Err(e);
+                    }
+                    log::warn!("Error occurred: {:?}", e);
+                    log_rkp_error_stats(
+                        MetricsRkpError::FALL_BACK_DURING_HYBRID,
+                        &self.security_level,
+                    );
+                    Ok(None)
+                }
+                Ok(rkpd_key) => Ok(Some((
+                    AttestationKey {
+                        keyBlob: rkpd_key.keyBlob,
+                        attestKeyParams: vec![],
+                        // Batch certificate is at the beginning of the certificate chain.
+                        issuerSubjectName: parse_subject_from_certificate(
+                            &rkpd_key.encodedCertChain,
+                        )
+                        .context(ks_err!("Failed to parse subject."))?,
+                    },
+                    Certificate { encodedCertificate: rkpd_key.encodedCertChain },
+                ))),
+            }
+        }
+    }
 }
+
 /// Implementation of the IRemoteProvisioning service.
 #[derive(Default)]
 pub struct RemoteProvisioningService {
@@ -449,7 +490,7 @@ pub fn get_pool_status(expired_by: i64, sec_level: SecurityLevel) -> Result<Atte
 /// Fetches a remote provisioning attestation key and certificate chain inside of the
 /// returned `CertificateChain` struct if one exists for the given caller_uid. If one has not
 /// been assigned, this function will assign it. If there are no signed attestation keys
-/// available to be assigned, it will return the ResponseCode `OUT_OF_KEYS`
+/// available to be assigned, it will return the ResponseCode `OUT_OF_KEYS_TRANSIENT_ERROR`
 fn get_rem_prov_attest_key(
     domain: Domain,
     caller_uid: u32,
@@ -604,7 +645,7 @@ impl RemotelyProvisionedKeyPoolService {
     /// Fetches a remotely provisioned certificate chain and key for the given client uid that
     /// was provisioned using the IRemotelyProvisionedComponent with the given id. The same key
     /// will be returned for a given caller_uid on every request. If there are no attestation keys
-    /// available, `OUT_OF_KEYS` is returned.
+    /// available, `OUT_OF_KEYS_TRANSIENT_ERROR` is returned.
     fn get_attestation_key(
         &self,
         db: &mut KeystoreDB,
@@ -630,7 +671,7 @@ impl RemotelyProvisionedKeyPoolService {
             }),
             // It should be impossible to get `None`, but handle it just in case as a
             // precaution against future behavioral changes in `get_rem_prov_attest_key`.
-            None => Err(error::Error::Rc(ResponseCode::OUT_OF_KEYS))
+            None => Err(error::Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR))
                 .context(ks_err!("No available attestation keys")),
         }
     }
@@ -917,7 +958,7 @@ mod tests {
                 .unwrap_err()
                 .downcast::<error::Error>()
                 .unwrap(),
-            error::Error::Rc(ResponseCode::OUT_OF_KEYS)
+            error::Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 
@@ -982,7 +1023,7 @@ mod tests {
                 .unwrap_err()
                 .downcast::<error::Error>()
                 .unwrap(),
-            error::Error::Rc(ResponseCode::OUT_OF_KEYS)
+            error::Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 

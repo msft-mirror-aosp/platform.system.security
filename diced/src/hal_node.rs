@@ -34,8 +34,8 @@ use android_hardware_security_dice::aidl::android::hardware::security::dice::{
 };
 use anyhow::{Context, Result};
 use binder::{BinderFeatures, Result as BinderResult, Strong};
-use dice::{ContextImpl, OpenDiceCborContext};
-use diced_open_dice_cbor as dice;
+use diced_open_dice as dice;
+pub use diced_open_dice::DiceArtifacts;
 use diced_utils as utils;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
@@ -47,7 +47,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, RwLock};
 use utils::ResidentArtifacts;
-pub use utils::{DiceArtifacts, UpdatableDiceArtifacts};
+pub use utils::UpdatableDiceArtifacts;
 
 /// PipeReader is a simple wrapper around raw pipe file descriptors.
 /// It takes ownership of the file descriptor and closes it on drop. It provides `read_all`, which
@@ -187,10 +187,8 @@ impl<T: UpdatableDiceArtifacts + Serialize + DeserializeOwned + Clone + Send> Re
         // `ResidentHal::new`
         run_forked(move || {
             let artifacts = artifacts.with_artifacts(|a| ResidentArtifacts::new_from(a))?;
-            let input_values: Vec<utils::InputValues> =
-                input_values.iter().map(|v| v.into()).collect();
             let artifacts = artifacts
-                .execute_steps(input_values.iter().map(|v| v as &dyn dice::InputValues))
+                .execute_steps(input_values)
                 .context("In ResidentHal::get_effective_artifacts:")?;
             f(artifacts)
         })
@@ -204,33 +202,20 @@ impl<T: UpdatableDiceArtifacts + Serialize + DeserializeOwned + Clone + Send> Di
         let signature: Vec<u8> = self
             .with_effective_artifacts(input_values, |artifacts| {
                 let (cdi_attest, _, _) = artifacts.into_tuple();
-                let mut dice = OpenDiceCborContext::new();
-                let seed = dice
-                    .derive_cdi_private_key_seed(cdi_attest[..].try_into().with_context(|| {
+                let seed = dice::derive_cdi_private_key_seed(
+                    cdi_attest[..].try_into().with_context(|| {
                         format!(
                             "In ResidentHal::sign: Failed to convert cdi_attest (length: {}).",
                             cdi_attest.len()
                         )
-                    })?)
-                    .context("In ResidentHal::sign: Failed to derive seed from cdi_attest.")?;
-                let (_public_key, private_key) = dice
-                    .keypair_from_seed(seed[..].try_into().with_context(|| {
-                        format!(
-                            "In ResidentHal::sign: Failed to convert seed (length: {}).",
-                            seed.len()
-                        )
-                    })?)
-                    .context("In ResidentHal::sign: Failed to derive keypair from seed.")?;
-                dice.sign(
-                    message,
-                    private_key[..].try_into().with_context(|| {
-                        format!(
-                            "In ResidentHal::sign: Failed to convert private_key (length: {}).",
-                            private_key.len()
-                        )
                     })?,
                 )
-                .context("In ResidentHal::sign: Failed to sign.")
+                .context("In ResidentHal::sign: Failed to derive seed from cdi_attest.")?;
+                let (_public_key, private_key) = dice::keypair_from_seed(seed.as_array())
+                    .context("In ResidentHal::sign: Failed to derive keypair from seed.")?;
+                let signature = dice::sign(message, private_key.as_array())
+                    .context("In ResidentHal::sign: Failed to sign.")?;
+                Ok(signature.to_vec())
             })
             .context("In ResidentHal::sign:")?;
         Ok(Signature { data: signature })
@@ -279,11 +264,8 @@ impl<T: UpdatableDiceArtifacts + Serialize + DeserializeOwned + Clone + Send> Di
         *artifacts = run_forked(|| {
             let new_artifacts =
                 artifacts_clone.with_artifacts(|a| ResidentArtifacts::new_from(a))?;
-            let input_values: Vec<utils::InputValues> =
-                input_values.iter().map(|v| v.into()).collect();
-
             let new_artifacts = new_artifacts
-                .execute_steps(input_values.iter().map(|v| v as &dyn dice::InputValues))
+                .execute_steps(input_values)
                 .context("In ResidentHal::get_effective_artifacts:")?;
             artifacts_clone.update(&new_artifacts)
         })?;
@@ -334,16 +316,27 @@ mod test {
         BccHandover::BccHandover, Config::Config as BinderConfig,
         InputValues::InputValues as BinderInputValues, Mode::Mode as BinderMode,
     };
-    use anyhow::{Context, Result};
-    use diced_open_dice_cbor as dice;
+    use anyhow::{anyhow, Context, Result};
+    use diced_open_dice as dice;
     use diced_sample_inputs;
     use diced_utils as utils;
+    use std::ffi::CStr;
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     struct InsecureSerializableArtifacts {
         cdi_attest: [u8; dice::CDI_SIZE],
         cdi_seal: [u8; dice::CDI_SIZE],
         bcc: Vec<u8>,
+    }
+
+    impl From<dice::OwnedDiceArtifacts> for InsecureSerializableArtifacts {
+        fn from(dice_artifacts: dice::OwnedDiceArtifacts) -> Self {
+            let mut cdi_attest = [0u8; dice::CDI_SIZE];
+            cdi_attest.copy_from_slice(dice_artifacts.cdi_attest());
+            let mut cdi_seal = [0u8; dice::CDI_SIZE];
+            cdi_seal.copy_from_slice(dice_artifacts.cdi_seal());
+            Self { cdi_attest, cdi_seal, bcc: dice_artifacts.bcc().expect("bcc is none").to_vec() }
+        }
     }
 
     impl DiceArtifacts for InsecureSerializableArtifacts {
@@ -353,8 +346,8 @@ mod test {
         fn cdi_seal(&self) -> &[u8; dice::CDI_SIZE] {
             &self.cdi_seal
         }
-        fn bcc(&self) -> Vec<u8> {
-            self.bcc.clone()
+        fn bcc(&self) -> Option<&[u8]> {
+            Some(&self.bcc)
         }
     }
 
@@ -369,32 +362,25 @@ mod test {
             Ok(Self {
                 cdi_attest: *new_artifacts.cdi_attest(),
                 cdi_seal: *new_artifacts.cdi_seal(),
-                bcc: new_artifacts.bcc(),
+                bcc: new_artifacts.bcc().ok_or_else(|| anyhow!("bcc is none"))?.to_vec(),
             })
         }
     }
 
     fn make_input_values(
         code: &str,
-        config_name: &str,
+        config_name: &CStr,
         authority: &str,
     ) -> Result<BinderInputValues> {
-        let mut dice_ctx = dice::OpenDiceCborContext::new();
         Ok(BinderInputValues {
-            codeHash: dice_ctx
-                .hash(code.as_bytes())
-                .context("In make_input_values: code hash failed.")?
-                .as_slice()
-                .try_into()?,
+            codeHash: dice::hash(code.as_bytes())
+                .context("In make_input_values: code hash failed.")?,
             config: BinderConfig {
-                desc: dice::bcc::format_config_descriptor(Some(config_name), None, true)
+                desc: dice::retry_bcc_format_config_descriptor(Some(config_name), None, true)
                     .context("In make_input_values: Failed to format config descriptor.")?,
             },
-            authorityHash: dice_ctx
-                .hash(authority.as_bytes())
-                .context("In make_input_values: authority hash failed.")?
-                .as_slice()
-                .try_into()?,
+            authorityHash: dice::hash(authority.as_bytes())
+                .context("In make_input_values: authority hash failed.")?,
             authorityDescriptor: None,
             mode: BinderMode::NORMAL,
             hidden: [0; dice::HIDDEN_SIZE],
@@ -404,26 +390,32 @@ mod test {
     /// Test the resident artifact batched derivation in process.
     #[test]
     fn derive_with_resident_artifacts() -> Result<()> {
-        let (cdi_attest, cdi_seal, bcc) = diced_sample_inputs::make_sample_bcc_and_cdis()?;
-
-        let artifacts =
-            ResidentArtifacts::new(cdi_attest[..].try_into()?, cdi_seal[..].try_into()?, &bcc)?;
+        let artifacts: ResidentArtifacts =
+            diced_sample_inputs::make_sample_bcc_and_cdis()?.try_into()?;
 
         let input_values = &[
-            make_input_values("component 1 code", "component 1", "component 1 authority")?,
-            make_input_values("component 2 code", "component 2", "component 2 authority")?,
-            make_input_values("component 3 code", "component 3", "component 3 authority")?,
+            make_input_values(
+                "component 1 code",
+                CStr::from_bytes_with_nul(b"component 1\0").unwrap(),
+                "component 1 authority",
+            )?,
+            make_input_values(
+                "component 2 code",
+                CStr::from_bytes_with_nul(b"component 2\0").unwrap(),
+                "component 2 authority",
+            )?,
+            make_input_values(
+                "component 3 code",
+                CStr::from_bytes_with_nul(b"component 3\0").unwrap(),
+                "component 3 authority",
+            )?,
         ];
-
-        let input_values: Vec<utils::InputValues> = input_values.iter().map(|v| v.into()).collect();
-
-        let new_artifacts =
-            artifacts.execute_steps(input_values.iter().map(|v| v as &dyn dice::InputValues))?;
+        let new_artifacts = artifacts.execute_steps(input_values)?;
 
         let result = utils::make_bcc_handover(
             new_artifacts.cdi_attest(),
             new_artifacts.cdi_seal(),
-            &new_artifacts.bcc(),
+            new_artifacts.bcc().unwrap(),
         )?;
 
         assert_eq!(result, make_derive_test_vector());
@@ -435,24 +427,31 @@ mod test {
     /// the same test vector as the in process test above.
     #[test]
     fn derive_with_insecure_artifacts() -> Result<()> {
-        let (cdi_attest, cdi_seal, bcc) = diced_sample_inputs::make_sample_bcc_and_cdis()?;
+        let dice_artifacts = diced_sample_inputs::make_sample_bcc_and_cdis()?;
 
         // Safety: ResidentHal can only be used in single threaded environments.
         // On-device Rust tests run each test in a separate process.
-        let hal_impl = unsafe {
-            ResidentHal::new(InsecureSerializableArtifacts {
-                cdi_attest: cdi_attest[..].try_into()?,
-                cdi_seal: cdi_seal[..].try_into()?,
-                bcc,
-            })
-        }
-        .expect("Failed to create ResidentHal.");
+        let hal_impl =
+            unsafe { ResidentHal::new(InsecureSerializableArtifacts::from(dice_artifacts)) }
+                .expect("Failed to create ResidentHal.");
 
         let bcc_handover = hal_impl
             .derive(&[
-                make_input_values("component 1 code", "component 1", "component 1 authority")?,
-                make_input_values("component 2 code", "component 2", "component 2 authority")?,
-                make_input_values("component 3 code", "component 3", "component 3 authority")?,
+                make_input_values(
+                    "component 1 code",
+                    CStr::from_bytes_with_nul(b"component 1\0").unwrap(),
+                    "component 1 authority",
+                )?,
+                make_input_values(
+                    "component 2 code",
+                    CStr::from_bytes_with_nul(b"component 2\0").unwrap(),
+                    "component 2 authority",
+                )?,
+                make_input_values(
+                    "component 3 code",
+                    CStr::from_bytes_with_nul(b"component 3\0").unwrap(),
+                    "component 3 authority",
+                )?,
             ])
             .expect("Failed to derive artifacts.");
 
@@ -464,30 +463,33 @@ mod test {
     /// must yield the same outcome as three derivations with the same input values.
     #[test]
     fn demote() -> Result<()> {
-        let (cdi_attest, cdi_seal, bcc) = diced_sample_inputs::make_sample_bcc_and_cdis()?;
+        let dice_artifacts = diced_sample_inputs::make_sample_bcc_and_cdis()?;
 
         // Safety: ResidentHal can only be used in single threaded environments.
         // On-device Rust tests run each test in a separate process.
-        let hal_impl = unsafe {
-            ResidentHal::new(InsecureSerializableArtifacts {
-                cdi_attest: cdi_attest[..].try_into()?,
-                cdi_seal: cdi_seal[..].try_into()?,
-                bcc,
-            })
-        }
-        .expect("Failed to create ResidentHal.");
+        let hal_impl =
+            unsafe { ResidentHal::new(InsecureSerializableArtifacts::from(dice_artifacts)) }
+                .expect("Failed to create ResidentHal.");
 
         hal_impl
             .demote(&[
-                make_input_values("component 1 code", "component 1", "component 1 authority")?,
-                make_input_values("component 2 code", "component 2", "component 2 authority")?,
+                make_input_values(
+                    "component 1 code",
+                    CStr::from_bytes_with_nul(b"component 1\0").unwrap(),
+                    "component 1 authority",
+                )?,
+                make_input_values(
+                    "component 2 code",
+                    CStr::from_bytes_with_nul(b"component 2\0").unwrap(),
+                    "component 2 authority",
+                )?,
             ])
             .expect("Failed to demote implementation.");
 
         let bcc_handover = hal_impl
             .derive(&[make_input_values(
                 "component 3 code",
-                "component 3",
+                CStr::from_bytes_with_nul(b"component 3\0").unwrap(),
                 "component 3 authority",
             )?])
             .expect("Failed to derive artifacts.");
