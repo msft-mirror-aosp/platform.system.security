@@ -20,10 +20,26 @@
 #[cfg(not(feature = "std"))]
 extern crate core as std;
 
+mod bcc;
 mod dice;
 mod error;
+mod ops;
+#[cfg(feature = "std")]
+mod retry;
 
+pub use bcc::{
+    bcc_format_config_descriptor, bcc_handover_main_flow, bcc_handover_parse, bcc_main_flow,
+    BccHandover,
+};
 pub use dice::{
-    Cdi, Config, Hash, Hidden, InlineConfig, InputValues, CDI_SIZE, HASH_SIZE, HIDDEN_SIZE,
+    derive_cdi_certificate_id, derive_cdi_private_key_seed, dice_main_flow, Cdi, CdiValues, Config,
+    DiceArtifacts, DiceMode, Hash, Hidden, InlineConfig, InputValues, PrivateKey, PrivateKeySeed,
+    PublicKey, Signature, CDI_SIZE, HASH_SIZE, HIDDEN_SIZE, ID_SIZE, PRIVATE_KEY_SEED_SIZE,
 };
 pub use error::{check_result, DiceError, Result};
+pub use ops::{generate_certificate, hash, kdf, keypair_from_seed, sign, verify};
+#[cfg(feature = "std")]
+pub use retry::{
+    retry_bcc_format_config_descriptor, retry_bcc_main_flow, retry_dice_main_flow,
+    retry_generate_certificate, OwnedDiceArtifacts,
+};
