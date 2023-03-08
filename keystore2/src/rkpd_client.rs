@@ -13,16 +13,15 @@
 // limitations under the License.
 
 //! Helper wrapper around RKPD interface.
-// TODO(b/264891956): Return RKP specific errors.
 
-use crate::error::{map_binder_status_code, Error};
+use crate::error::{map_binder_status_code, Error, ResponseCode};
 use crate::globals::get_remotely_provisioned_component_name;
 use crate::ks_err;
 use crate::utils::watchdog as wd;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::SecurityLevel::SecurityLevel;
 use android_security_rkp_aidl::aidl::android::security::rkp::{
-    IGetKeyCallback::BnGetKeyCallback, IGetKeyCallback::IGetKeyCallback,
-    IGetRegistrationCallback::BnGetRegistrationCallback,
+    IGetKeyCallback::BnGetKeyCallback, IGetKeyCallback::ErrorCode::ErrorCode as GetKeyErrorCode,
+    IGetKeyCallback::IGetKeyCallback, IGetRegistrationCallback::BnGetRegistrationCallback,
     IGetRegistrationCallback::IGetRegistrationCallback, IRegistration::IRegistration,
     IRemoteProvisioning::IRemoteProvisioning,
     IStoreUpgradedKeyCallback::BnStoreUpgradedKeyCallback,
@@ -30,7 +29,6 @@ use android_security_rkp_aidl::aidl::android::security::rkp::{
     RemotelyProvisionedKey::RemotelyProvisionedKey,
 };
 use android_security_rkp_aidl::binder::{BinderFeatures, Interface, Strong};
-use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
 use anyhow::{Context, Result};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -59,8 +57,11 @@ impl<T> SafeSender<T> {
 
     fn send(&self, value: T) {
         if let Some(inner) = self.inner.lock().unwrap().take() {
-            // assert instead of unwrap, because on failure send returns Err(value)
-            assert!(inner.send(value).is_ok(), "thread state is terminally broken");
+            // It's possible for the corresponding receiver to time out and be dropped. In this
+            // case send() will fail. This error is not actionable though, so only log the error.
+            if inner.send(value).is_err() {
+                log::error!("SafeSender::send() failed");
+            }
         }
     }
 }
@@ -91,17 +92,17 @@ impl IGetRegistrationCallback for GetRegistrationCallback {
         let _wp = wd::watch_millis("IGetRegistrationCallback::onCancel", 500);
         log::warn!("IGetRegistrationCallback cancelled");
         self.registration_tx.send(
-            Err(Error::Rc(ResponseCode::OUT_OF_KEYS))
+            Err(Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR))
                 .context(ks_err!("GetRegistrationCallback cancelled.")),
         );
         Ok(())
     }
-    fn onError(&self, error: &str) -> binder::Result<()> {
+    fn onError(&self, description: &str) -> binder::Result<()> {
         let _wp = wd::watch_millis("IGetRegistrationCallback::onError", 500);
-        log::error!("IGetRegistrationCallback failed: '{error}'");
+        log::error!("IGetRegistrationCallback failed: '{description}'");
         self.registration_tx.send(
-            Err(Error::Rc(ResponseCode::OUT_OF_KEYS))
-                .context(ks_err!("GetRegistrationCallback failed: {:?}", error)),
+            Err(Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR))
+                .context(ks_err!("GetRegistrationCallback failed: {:?}", description)),
         );
         Ok(())
     }
@@ -161,17 +162,33 @@ impl IGetKeyCallback for GetKeyCallback {
         let _wp = wd::watch_millis("IGetKeyCallback::onCancel", 500);
         log::warn!("IGetKeyCallback cancelled");
         self.key_tx.send(
-            Err(Error::Rc(ResponseCode::OUT_OF_KEYS)).context(ks_err!("GetKeyCallback cancelled.")),
+            Err(Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR))
+                .context(ks_err!("GetKeyCallback cancelled.")),
         );
         Ok(())
     }
-    fn onError(&self, error: &str) -> binder::Result<()> {
+    fn onError(&self, error: GetKeyErrorCode, description: &str) -> binder::Result<()> {
         let _wp = wd::watch_millis("IGetKeyCallback::onError", 500);
-        log::error!("IGetKeyCallback failed: {error}");
-        self.key_tx.send(
-            Err(Error::Rc(ResponseCode::OUT_OF_KEYS))
-                .context(ks_err!("GetKeyCallback failed: {:?}", error)),
-        );
+        log::error!("IGetKeyCallback failed: {description}");
+        let rc = match error {
+            GetKeyErrorCode::ERROR_UNKNOWN => ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR,
+            GetKeyErrorCode::ERROR_PERMANENT => ResponseCode::OUT_OF_KEYS_PERMANENT_ERROR,
+            GetKeyErrorCode::ERROR_PENDING_INTERNET_CONNECTIVITY => {
+                ResponseCode::OUT_OF_KEYS_PENDING_INTERNET_CONNECTIVITY
+            }
+            GetKeyErrorCode::ERROR_REQUIRES_SECURITY_PATCH => {
+                ResponseCode::OUT_OF_KEYS_REQUIRES_SYSTEM_UPGRADE
+            }
+            _ => {
+                log::error!("Unexpected error from rkpd: {error:?}");
+                ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR
+            }
+        };
+        self.key_tx.send(Err(Error::Rc(rc)).context(ks_err!(
+            "GetKeyCallback failed: {:?} {:?}",
+            error,
+            description
+        )));
         Ok(())
     }
 }
@@ -188,8 +205,14 @@ async fn get_rkpd_attestation_key_from_registration_async(
         .context(ks_err!("Trying to get key."))?;
 
     match timeout(RKPD_TIMEOUT, rx).await {
-        Err(e) => Err(Error::Rc(ResponseCode::OUT_OF_KEYS))
-            .context(ks_err!("Waiting for RKPD key timed out: {:?}", e)),
+        Err(e) => {
+            // Make a best effort attempt to cancel the timed out request.
+            if let Err(e) = registration.cancelGetKey(&cb) {
+                log::error!("IRegistration::cancelGetKey failed: {:?}", e);
+            }
+            Err(Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR))
+                .context(ks_err!("Waiting for RKPD key timed out: {:?}", e))
+        }
         Ok(v) => v.unwrap(),
     }
 }
@@ -298,27 +321,42 @@ mod tests {
     };
     use android_security_rkp_aidl::aidl::android::security::rkp::IRegistration::BnRegistration;
     use keystore2_crypto::parse_subject_from_certificate;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Default)]
-    struct MockRegistration {
+    struct MockRegistrationValues {
         key: RemotelyProvisionedKey,
         latency: Option<Duration>,
+        thread_join_handles: Vec<Option<std::thread::JoinHandle<()>>>,
     }
+
+    struct MockRegistration(Arc<Mutex<MockRegistrationValues>>);
 
     impl MockRegistration {
         pub fn new_native_binder(
             key: &RemotelyProvisionedKey,
             latency: Option<Duration>,
         ) -> Strong<dyn IRegistration> {
-            let result = Self {
+            let result = Self(Arc::new(Mutex::new(MockRegistrationValues {
                 key: RemotelyProvisionedKey {
                     keyBlob: key.keyBlob.clone(),
                     encodedCertChain: key.encodedCertChain.clone(),
                 },
                 latency,
-            };
+                thread_join_handles: Vec::new(),
+            })));
             BnRegistration::new_binder(result, BinderFeatures::default())
+        }
+    }
+
+    impl Drop for MockRegistration {
+        fn drop(&mut self) {
+            let mut values = self.0.lock().unwrap();
+            for handle in values.thread_join_handles.iter_mut() {
+                // These are test threads. So, no need to worry too much about error handling.
+                handle.take().unwrap().join().unwrap();
+            }
         }
     }
 
@@ -326,25 +364,27 @@ mod tests {
 
     impl IRegistration for MockRegistration {
         fn getKey(&self, _: i32, cb: &Strong<dyn IGetKeyCallback>) -> binder::Result<()> {
+            let mut values = self.0.lock().unwrap();
             let key = RemotelyProvisionedKey {
-                keyBlob: self.key.keyBlob.clone(),
-                encodedCertChain: self.key.encodedCertChain.clone(),
+                keyBlob: values.key.keyBlob.clone(),
+                encodedCertChain: values.key.encodedCertChain.clone(),
             };
-            let latency = self.latency;
+            let latency = values.latency;
             let get_key_cb = cb.clone();
 
             // Need a separate thread to trigger timeout in the caller.
-            std::thread::spawn(move || {
+            let join_handle = std::thread::spawn(move || {
                 if let Some(duration) = latency {
                     std::thread::sleep(duration);
                 }
                 get_key_cb.onSuccess(&key).unwrap();
             });
+            values.thread_join_handles.push(Some(join_handle));
             Ok(())
         }
 
         fn cancelGetKey(&self, _: &Strong<dyn IGetKeyCallback>) -> binder::Result<()> {
-            todo!()
+            Ok(())
         }
 
         fn storeUpgradedKeyAsync(
@@ -355,8 +395,9 @@ mod tests {
         ) -> binder::Result<()> {
             // We are primarily concerned with timing out correctly. Storing the key in this mock
             // registration isn't particularly interesting, so skip that part.
+            let values = self.0.lock().unwrap();
             let store_cb = cb.clone();
-            let latency = self.latency;
+            let latency = values.latency;
 
             std::thread::spawn(move || {
                 if let Some(duration) = latency {
@@ -403,7 +444,7 @@ mod tests {
         let result = tokio_rt().block_on(rx).unwrap();
         assert_eq!(
             result.unwrap_err().downcast::<Error>().unwrap(),
-            Error::Rc(ResponseCode::OUT_OF_KEYS)
+            Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 
@@ -416,7 +457,7 @@ mod tests {
         let result = tokio_rt().block_on(rx).unwrap();
         assert_eq!(
             result.unwrap_err().downcast::<Error>().unwrap(),
-            Error::Rc(ResponseCode::OUT_OF_KEYS)
+            Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 
@@ -441,21 +482,38 @@ mod tests {
         let result = tokio_rt().block_on(rx).unwrap();
         assert_eq!(
             result.unwrap_err().downcast::<Error>().unwrap(),
-            Error::Rc(ResponseCode::OUT_OF_KEYS)
+            Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 
     #[test]
     fn test_get_key_cb_error() {
-        let (tx, rx) = oneshot::channel();
-        let cb = GetKeyCallback::new_native_binder(tx);
-        assert!(cb.onError("error").is_ok());
+        let error_mapping = HashMap::from([
+            (GetKeyErrorCode::ERROR_UNKNOWN, ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR),
+            (GetKeyErrorCode::ERROR_PERMANENT, ResponseCode::OUT_OF_KEYS_PERMANENT_ERROR),
+            (
+                GetKeyErrorCode::ERROR_PENDING_INTERNET_CONNECTIVITY,
+                ResponseCode::OUT_OF_KEYS_PENDING_INTERNET_CONNECTIVITY,
+            ),
+            (
+                GetKeyErrorCode::ERROR_REQUIRES_SECURITY_PATCH,
+                ResponseCode::OUT_OF_KEYS_REQUIRES_SYSTEM_UPGRADE,
+            ),
+        ]);
 
-        let result = tokio_rt().block_on(rx).unwrap();
-        assert_eq!(
-            result.unwrap_err().downcast::<Error>().unwrap(),
-            Error::Rc(ResponseCode::OUT_OF_KEYS)
-        );
+        // Loop over the generated list of enum values to better ensure this test stays in
+        // sync with the AIDL.
+        for get_key_error in GetKeyErrorCode::enum_values() {
+            let (tx, rx) = oneshot::channel();
+            let cb = GetKeyCallback::new_native_binder(tx);
+            assert!(cb.onError(get_key_error, "error").is_ok());
+
+            let result = tokio_rt().block_on(rx).unwrap();
+            assert_eq!(
+                result.unwrap_err().downcast::<Error>().unwrap(),
+                Error::Rc(error_mapping[&get_key_error]),
+            );
+        }
     }
 
     #[test]
@@ -496,14 +554,14 @@ mod tests {
     fn test_get_mock_key_timeout() {
         let mock_key =
             RemotelyProvisionedKey { keyBlob: vec![1, 2, 3], encodedCertChain: vec![4, 5, 6] };
-        let latency = RKPD_TIMEOUT + Duration::from_secs(10);
+        let latency = RKPD_TIMEOUT + Duration::from_secs(1);
         let registration = get_mock_registration(&mock_key, Some(latency)).unwrap();
 
         let result =
             tokio_rt().block_on(get_rkpd_attestation_key_from_registration_async(&registration, 0));
         assert_eq!(
             result.unwrap_err().downcast::<Error>().unwrap(),
-            Error::Rc(ResponseCode::OUT_OF_KEYS)
+            Error::Rc(ResponseCode::OUT_OF_KEYS_TRANSIENT_ERROR)
         );
     }
 
@@ -521,7 +579,7 @@ mod tests {
     fn test_store_mock_key_timeout() {
         let mock_key =
             RemotelyProvisionedKey { keyBlob: vec![1, 2, 3], encodedCertChain: vec![4, 5, 6] };
-        let latency = RKPD_TIMEOUT + Duration::from_secs(10);
+        let latency = RKPD_TIMEOUT + Duration::from_secs(1);
         let registration = get_mock_registration(&mock_key, Some(latency)).unwrap();
 
         let result = tokio_rt().block_on(store_rkpd_attestation_key_with_registration_async(
@@ -590,6 +648,9 @@ mod tests {
 
         let new_key =
             get_rkpd_attestation_key(&SecurityLevel::TRUSTED_ENVIRONMENT, key_id).unwrap();
+
+        // Restore original key so that we don't leave RKPD with invalid blobs.
+        assert!(store_rkpd_attestation_key(&sec_level, &new_blob, &key.keyBlob).is_ok());
         assert_eq!(new_key.keyBlob, new_blob);
     }
 
@@ -653,7 +714,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // b/266607003
     fn test_stress_get_rkpd_attestation_key() {
         binder::ProcessState::start_thread_pool();
         let key_id = get_next_key_id();
