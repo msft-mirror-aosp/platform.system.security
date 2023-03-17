@@ -267,8 +267,27 @@ Status KeyStoreService::list(const String16& prefix, int32_t targetUid,
         return Status::fromServiceSpecificError(static_cast<int32_t>(rc));
     }
 
+    const size_t RESPONSE_SIZE_LIMIT = 358400;
+    size_t returned_bytes = 0;
+    size_t items_to_return = 0;
+
+    // Estimate the transaction size to avoid returning more items than what
+    // could fit in a binder transaction.
     for (LockedKeyBlobEntry& entry : internal_matches) {
-        matches->push_back(String16(entry->alias().substr(prefix8.size()).c_str()));
+        ::android::String16 alias = String16(entry->alias().substr(prefix8.size()).c_str());
+        returned_bytes += alias.size();
+        // The binder transaction size limit is 1M. Empirical measurements show
+        // that the binder overhead is 60% (to be confirmed). So break after
+        // 350KB and return a partial list.
+        if (returned_bytes > RESPONSE_SIZE_LIMIT) {
+            ALOGW("Key aliases list (%lu items) may exceed binder size, returning %lu items est "
+                  "%lu bytes.",
+                  (unsigned long)internal_matches.size(), (unsigned long)items_to_return,
+                  (unsigned long)returned_bytes);
+            break;
+        }
+        items_to_return++;
+        matches->push_back(alias);
     }
     return Status::ok();
 }
