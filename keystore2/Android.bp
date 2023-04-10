@@ -31,7 +31,6 @@ rust_defaults {
     ],
 
     rustlibs: [
-        "android.hardware.security.rkp-V3-rust",
         "android.hardware.security.secureclock-V1-rust",
         "android.hardware.security.sharedsecret-V1-rust",
         "android.os.permissions_aidl-rust",
@@ -40,11 +39,9 @@ rust_defaults {
         "android.security.compat-rust",
         "android.security.maintenance-rust",
         "android.security.metrics-rust",
-        "android.security.remoteprovisioning-rust",
         "android.security.rkp_aidl-rust",
         "libanyhow",
         "libbinder_rs",
-        "libfutures",
         "libkeystore2_aaid-rust",
         "libkeystore2_apc_compat-rust",
         "libkeystore2_crypto_rust",
@@ -60,6 +57,7 @@ rust_defaults {
         "libserde",
         "libserde_cbor",
         "libthiserror",
+        "libtokio",
     ],
     shared_libs: [
         "libcutils",
@@ -87,7 +85,6 @@ rust_library {
         "keystore2_use_latest_aidl_rust",
     ],
     rustlibs: [
-        "android.hardware.security.rkp-V3-rust",
         "libbinder_rs",
         "libkeystore2_selinux",
         "liblog_rust",
@@ -125,7 +122,6 @@ rust_test {
     auto_gen_config: true,
     compile_multilib: "first",
     rustlibs: [
-        "android.hardware.security.rkp-V3-rust",
         "libbinder_rs",
         "libkeystore2_selinux",
         "liblog_rust",
@@ -158,6 +154,7 @@ rust_test {
         "watchdog",
         "keystore2_blob_test_utils",
     ],
+    require_root: true,
 }
 
 rust_defaults {
