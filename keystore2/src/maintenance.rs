@@ -309,6 +309,12 @@ impl Maintenance {
         }
         writeln!(f)?;
 
+        // Display accumulated metrics.
+        writeln!(f, "Metrics information:")?;
+        writeln!(f)?;
+        write!(f, "{:?}", *crate::metrics_store::METRICS_STORE)?;
+        writeln!(f)?;
+
         // Reminder: any additional information added to the `dump_state()` output needs to be
         // careful not to include confidential information (e.g. key material).
 
