@@ -837,6 +837,11 @@ pub enum KeyParameterValue {
     #[serde(serialize_with = "serialize_primitive")]
     #[key_param(tag = DIGEST, field = Digest)]
     Digest(Digest),
+    /// Digest algorithms that can be used for MGF in RSA-OAEP.
+    #[serde(deserialize_with = "deserialize_primitive")]
+    #[serde(serialize_with = "serialize_primitive")]
+    #[key_param(tag = RSA_OAEP_MGF_DIGEST, field = Digest)]
+    RsaOaepMgfDigest(Digest),
     /// Padding modes that may be used with the key.  Relevant to RSA, AES and 3DES keys.
     #[serde(deserialize_with = "deserialize_primitive")]
     #[serde(serialize_with = "serialize_primitive")]
@@ -1098,6 +1103,7 @@ mod generated_key_parameter_tests {
             Tag::BLOCK_MODE => return KmKeyParameterValue::BlockMode(Default::default()),
             Tag::PADDING => return KmKeyParameterValue::PaddingMode(Default::default()),
             Tag::DIGEST => return KmKeyParameterValue::Digest(Default::default()),
+            Tag::RSA_OAEP_MGF_DIGEST => return KmKeyParameterValue::Digest(Default::default()),
             Tag::EC_CURVE => return KmKeyParameterValue::EcCurve(Default::default()),
             Tag::ORIGIN => return KmKeyParameterValue::Origin(Default::default()),
             Tag::PURPOSE => return KmKeyParameterValue::KeyPurpose(Default::default()),
@@ -1210,7 +1216,7 @@ mod storage_tests {
     use crate::key_parameter::*;
     use anyhow::Result;
     use rusqlite::types::ToSql;
-    use rusqlite::{params, Connection, NO_PARAMS};
+    use rusqlite::{params, Connection};
 
     /// Test initializing a KeyParameter (with key parameter value corresponding to an enum of i32)
     /// from a database table row.
@@ -1417,7 +1423,7 @@ mod storage_tests {
                                 tag INTEGER,
                                 data ANY,
                                 security_level INTEGER);",
-            NO_PARAMS,
+            [],
         )
         .context("Failed to initialize \"keyparameter\" table.")?;
         Ok(db)
@@ -1453,7 +1459,7 @@ mod storage_tests {
     fn query_from_keyparameter(db: &Connection) -> Result<KeyParameter> {
         let mut stmt =
             db.prepare("SELECT tag, data, security_level FROM persistent.keyparameter")?;
-        let mut rows = stmt.query(NO_PARAMS)?;
+        let mut rows = stmt.query([])?;
         let row = rows.next()?.unwrap();
         KeyParameter::new_from_sql(
             Tag(row.get(0)?),
