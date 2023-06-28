@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use android_hardware_security_keymint::aidl::android::hardware::security::keymint::Tag::Tag;
 use keystore2_test_utils::key_generations::Error;
 
 #[cxx::bridge]
@@ -31,6 +32,8 @@ mod ffi {
             tag: Vec<u8>,
         ) -> CxxResult;
         fn buildAsn1DerEncodedWrappedKeyDescription() -> CxxResult;
+        fn performCryptoOpUsingKeystoreEngine(grant_id: i64) -> bool;
+        fn getValueFromAttestRecord(cert_buf: Vec<u8>, tag: i32) -> CxxResult;
     }
 }
 
@@ -77,4 +80,20 @@ pub fn create_wrapped_key(
 ///     Purpose: Encrypt, Decrypt
 pub fn create_wrapped_key_additional_auth_data() -> Result<Vec<u8>, Error> {
     get_result(ffi::buildAsn1DerEncodedWrappedKeyDescription())
+}
+
+pub fn perform_crypto_op_using_keystore_engine(grant_id: i64) -> Result<bool, Error> {
+    if ffi::performCryptoOpUsingKeystoreEngine(grant_id) {
+        return Ok(true);
+    }
+
+    Err(Error::Keystore2EngineOpFailed)
+}
+
+pub fn get_value_from_attest_record(cert_buf: &[u8], tag: Tag) -> Result<Vec<u8>, Error> {
+    let result = ffi::getValueFromAttestRecord(cert_buf.to_vec(), tag.0);
+    if result.error == 0 && !result.data.is_empty() {
+        return Ok(result.data);
+    }
+    Err(Error::AttestRecordGetValueFailed)
 }
