@@ -22,6 +22,7 @@
 #include <aidl/android/hardware/security/keymint/IRemotelyProvisionedComponent.h>
 #include <aidl/android/hardware/security/keymint/MacedPublicKey.h>
 #include <aidl/android/hardware/security/keymint/RpcHardwareInfo.h>
+#include <android-base/properties.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -179,7 +180,8 @@ TEST(LibRkpFactoryExtractionTests, GetCsrWithV2Hal) {
                         SetArgPointee<6>(kFakeMac),             //
                         Return(ByMove(ScopedAStatus::ok()))));  //
 
-    auto [csr, csrErrMsg] = getCsr("mock component name", mockRpc.get());
+    auto [csr, csrErrMsg] = getCsr("mock component name", mockRpc.get(),
+                                   /*selfTest=*/false);
     ASSERT_THAT(csr, NotNull()) << csrErrMsg;
     ASSERT_THAT(csr->asArray(), Pointee(Property(&Array::size, Eq(4))));
 
@@ -248,12 +250,19 @@ TEST(LibRkpFactoryExtractionTests, GetCsrWithV3Hal) {
         .WillOnce(DoAll(SaveArg<1>(&challenge), SetArgPointee<2>(kCsr),
                         Return(ByMove(ScopedAStatus::ok()))));
 
-    auto [csr, csrErrMsg] = getCsr("mock component name", mockRpc.get());
+    auto [csr, csrErrMsg] = getCsr("mock component name", mockRpc.get(),
+                                   /*selfTest=*/false);
     ASSERT_THAT(csr, NotNull()) << csrErrMsg;
-    ASSERT_THAT(csr, Pointee(Property(&Array::size, Eq(4))));
+    ASSERT_THAT(csr, Pointee(Property(&Array::size, Eq(5))));
 
     EXPECT_THAT(csr->get(0 /* version */), Pointee(Eq(Uint(3))));
     EXPECT_THAT(csr->get(1)->asMap(), NotNull());
     EXPECT_THAT(csr->get(2)->asArray(), NotNull());
     EXPECT_THAT(csr->get(3)->asArray(), NotNull());
+
+    const Map* unverifedDeviceInfo = csr->get(4)->asMap();
+    ASSERT_THAT(unverifedDeviceInfo, NotNull());
+    EXPECT_THAT(unverifedDeviceInfo->get("fingerprint"), NotNull());
+    const Tstr fingerprint(android::base::GetProperty("ro.build.fingerprint", ""));
+    EXPECT_THAT(*unverifedDeviceInfo->get("fingerprint")->asTstr(), Eq(fingerprint));
 }
