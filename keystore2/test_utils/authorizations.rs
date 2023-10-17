@@ -269,6 +269,60 @@ impl AuthSetBuilder {
         });
         self
     }
+
+    /// Set boot loader only.
+    pub fn boot_loader_only(mut self) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::BOOTLOADER_ONLY,
+            value: KeyParameterValue::BoolValue(true),
+        });
+        self
+    }
+
+    /// Set early boot only.
+    pub fn early_boot_only(mut self) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::EARLY_BOOT_ONLY,
+            value: KeyParameterValue::BoolValue(true),
+        });
+        self
+    }
+
+    /// Set max uses per boot.
+    pub fn max_uses_per_boot(mut self, max_uses: i32) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::MAX_USES_PER_BOOT,
+            value: KeyParameterValue::Integer(max_uses),
+        });
+        self
+    }
+
+    /// Set max usage count.
+    pub fn usage_count_limit(mut self, usage_count: i32) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::USAGE_COUNT_LIMIT,
+            value: KeyParameterValue::Integer(usage_count),
+        });
+        self
+    }
+
+    /// Set creation date-time.
+    pub fn creation_date_time(mut self, date: i64) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::CREATION_DATETIME,
+            value: KeyParameterValue::DateTime(date),
+        });
+        self
+    }
+
+    /// Set include unique id.
+    pub fn include_unique_id(mut self) -> Self {
+        self.0.push(KeyParameter {
+            tag: Tag::INCLUDE_UNIQUE_ID,
+            value: KeyParameterValue::BoolValue(true),
+        });
+        self
+    }
 }
 
 impl Deref for AuthSetBuilder {
