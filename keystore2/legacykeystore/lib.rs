@@ -121,6 +121,7 @@ impl DB {
     }
 
     fn put(&mut self, caller_uid: u32, alias: &str, entry: &[u8]) -> Result<()> {
+        ensure_keystore_put_is_enabled()?;
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             tx.execute(
                 "INSERT OR REPLACE INTO profiles (owner, alias, profile) values (?, ?, ?)",
@@ -201,6 +202,11 @@ impl Error {
     pub fn perm() -> Self {
         Error::Error(ERROR_PERMISSION_DENIED)
     }
+
+    /// Short hand for `Error::Error(ERROR_SYSTEM_ERROR)`
+    pub fn deprecated() -> Self {
+        Error::Error(ERROR_SYSTEM_ERROR)
+    }
 }
 
 /// This function should be used by legacykeystore service calls to translate error conditions
@@ -238,6 +244,17 @@ where
         },
         handle_ok,
     )
+}
+
+fn ensure_keystore_put_is_enabled() -> Result<()> {
+    if keystore2_flags::disable_legacy_keystore_put_v2() {
+        Err(Error::deprecated()).context(concat!(
+            "Storing into Keystore's legacy database is ",
+            "no longer supported, store in an app-specific database instead"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 struct LegacyKeystoreDeleteListener {
@@ -332,6 +349,7 @@ impl LegacyKeystore {
     }
 
     fn put(&self, alias: &str, uid: i32, entry: &[u8]) -> Result<()> {
+        ensure_keystore_put_is_enabled()?;
         let uid = Self::get_effective_uid(uid).context("In put.")?;
         let mut db = self.open_db().context("In put.")?;
         db.put(uid, alias, entry).context("In put: Trying to insert entry into DB.")?;
