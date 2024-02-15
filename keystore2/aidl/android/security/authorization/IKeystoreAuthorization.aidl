@@ -15,7 +15,7 @@
 package android.security.authorization;
 
 import android.hardware.security.keymint.HardwareAuthToken;
-import android.security.authorization.LockScreenEvent;
+import android.hardware.security.keymint.HardwareAuthenticatorType;
 import android.security.authorization.AuthorizationTokens;
 
 // TODO: mark the interface with @SensitiveData when the annotation is ready (b/176110256).
@@ -40,41 +40,102 @@ interface IKeystoreAuthorization {
     void addAuthToken(in HardwareAuthToken authToken);
 
     /**
-     * Unlocks the keystore for the given user id.
+     * Tells Keystore that the device is now unlocked for a user.  Requires the 'Unlock' permission.
      *
-     * Callers require 'Unlock' permission.
+     * This method makes Keystore start allowing the use of the given user's keys that require an
+     * unlocked device, following the device boot or an earlier call to onDeviceLocked() which
+     * disabled the use of such keys.  In addition, once per boot, this method must be called with a
+     * password before keys that require user authentication can be used.
      *
-     * Super-Encryption Key:
-     * When the device is unlocked (and password is non-null), Keystore stores in memory
-     * a super-encryption key derived from the password that protects UNLOCKED_DEVICE_REQUIRED
-     * keys; this key is wiped from memory when the device is locked.
+     * This method does two things to restore access to UnlockedDeviceRequired keys.  First, it sets
+     * a flag that indicates the user is unlocked.  This is always done, and it makes Keystore's
+     * logical enforcement of UnlockedDeviceRequired start passing.  Second, it recovers and caches
+     * the user's UnlockedDeviceRequired super keys.  This succeeds only in the following cases:
      *
-     * If unlockingSids is non-empty on lock, then before the super-encryption key is wiped from
-     * memory, a copy of it is stored in memory encrypted with a fresh AES key. This key is then
-     * imported into KM, tagged such that it can be used given a valid, recent auth token for any
-     * of the unlockingSids.
+     *  - The (correct) password is provided, proving that the user has authenticated using LSKF or
+     *    equivalent.  This is the most powerful type of unlock.  Keystore uses the password to
+     *    decrypt the user's UnlockedDeviceRequired super keys from disk.  It also uses the password
+     *    to decrypt the user's AfterFirstUnlock super key from disk, if not already done.
      *
-     * Options for unlock:
-     *  - If the password is non-null, the super-encryption key is re-derived as above.
-     *  - If the password is null, then if a suitable auth token to access the encrypted
-     *    Super-encryption key stored in KM has been sent to keystore (via addAuthToken), the
-     *    encrypted super-encryption key is recovered so that UNLOCKED_DEVICE_REQUIRED keys can
-     *    be used once again.
-     *  - If neither of these are met, then the operation fails.
+     *  - The user's UnlockedDeviceRequired super keys are cached in biometric-encrypted form, and a
+     *    matching valid HardwareAuthToken has been added to Keystore.  I.e., class 3 biometric
+     *    unlock is enabled and the user recently authenticated using a class 3 biometric.  The keys
+     *    are cached in biometric-encrypted form if onDeviceLocked() was called with a nonempty list
+     *    of unlockingSids, and onNonLskfUnlockMethodsExpired() was not called later.
+     *
+     *  - The user's UnlockedDeviceRequired super keys are already cached in plaintext.  This is the
+     *    case if onDeviceLocked() was called with weakUnlockEnabled=true, and
+     *    onWeakUnlockMethodsExpired() was not called later.  This case provides only
+     *    Keystore-enforced logical security for UnlockedDeviceRequired.
      *
      * ## Error conditions:
-     * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'Unlock' permission.
-     * `ResponseCode::SYSTEM_ERROR` - if failed to perform lock/unlock operations due to various
-     * `ResponseCode::VALUE_CORRUPTED` - if the super key can not be decrypted.
-     * `ResponseCode::KEY_NOT_FOUND` - if the super key is not found.
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the 'Unlock' permission.
+     * `ResponseCode::VALUE_CORRUPTED` - if a super key can not be decrypted.
+     * `ResponseCode::KEY_NOT_FOUND` - if a super key is not found.
+     * `ResponseCode::SYSTEM_ERROR` - if another error occurred.
      *
-     * @param lockScreenEvent whether the lock screen locked or unlocked
-     * @param userId android user id
-     * @param password synthetic password derived from the user's LSKF, must be null on lock
-     * @param unlockingSids list of biometric SIDs for this user, ignored on unlock
+     * @param userId The Android user ID of the user for which the device is now unlocked
+     * @param password If available, a secret derived from the user's synthetic password
      */
-    void onLockScreenEvent(in LockScreenEvent lockScreenEvent, in int userId,
-                           in @nullable byte[] password, in @nullable long[] unlockingSids);
+    void onDeviceUnlocked(in int userId, in @nullable byte[] password);
+
+    /**
+     * Tells Keystore that the device is now locked for a user.  Requires the 'Lock' permission.
+     *
+     * This method makes Keystore stop allowing the use of the given user's keys that require an
+     * unlocked device.  This is enforced logically, and when possible it's also enforced
+     * cryptographically by wiping the UnlockedDeviceRequired super keys from memory.
+     *
+     * unlockingSids and weakUnlockEnabled specify the methods by which the device can become
+     * unlocked for the user, in addition to LSKF-equivalent authentication.
+     *
+     * unlockingSids is the list of SIDs of class 3 (strong) biometrics that can unlock.  If
+     * unlockingSids is non-empty, then this method saves a copy of the UnlockedDeviceRequired super
+     * keys in memory encrypted by a new AES key that is imported into KeyMint and configured to be
+     * usable only when user authentication has occurred using any of the SIDs.  This allows the
+     * keys to be recovered if the device is unlocked using a class 3 biometric.
+     *
+     * weakUnlockEnabled is true if the unlock can happen using a method that does not have an
+     * associated SID, such as a class 1 (convenience) biometric, class 2 (weak) biometric, or trust
+     * agent.  These methods don't count as "authentication" from Keystore's perspective.  In this
+     * case, Keystore keeps a copy of the UnlockedDeviceRequired super keys in memory in plaintext,
+     * providing only logical security for UnlockedDeviceRequired.
+     *
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the 'Lock' permission.
+     *
+     * @param userId The Android user ID of the user for which the device is now locked
+     * @param unlockingSids SIDs of class 3 biometrics that can unlock the device for the user
+     * @param weakUnlockEnabled Whether a weak unlock method can unlock the device for the user
+     */
+    void onDeviceLocked(in int userId, in long[] unlockingSids, in boolean weakUnlockEnabled);
+
+    /**
+     * Tells Keystore that weak unlock methods can no longer unlock the device for the given user.
+     * This is intended to be called after an earlier call to onDeviceLocked() with
+     * weakUnlockEnabled=true.  It upgrades the security level of UnlockedDeviceRequired keys to
+     * that which would have resulted from calling onDeviceLocked() with weakUnlockEnabled=false.
+     *
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the 'Lock' permission.
+     *
+     * @param userId The Android user ID of the user for which weak unlock methods have expired
+     */
+    void onWeakUnlockMethodsExpired(in int userId);
+
+    /**
+     * Tells Keystore that non-LSKF-equivalent unlock methods can no longer unlock the device for
+     * the given user.  This is intended to be called after an earlier call to onDeviceLocked() with
+     * nonempty unlockingSids.  It upgrades the security level of UnlockedDeviceRequired keys to
+     * that which would have resulted from calling onDeviceLocked() with unlockingSids=[] and
+     * weakUnlockEnabled=false.
+     *
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the 'Lock' permission.
+     *
+     * @param userId The Android user ID of the user for which non-LSKF unlock methods have expired
+     */
+    void onNonLskfUnlockMethodsExpired(in int userId);
 
     /**
      * Allows Credstore to retrieve a HardwareAuthToken and a TimestampToken.
@@ -108,4 +169,13 @@ interface IKeystoreAuthorization {
      */
     AuthorizationTokens getAuthTokensForCredStore(in long challenge, in long secureUserId,
      in long authTokenMaxAgeMillis);
+
+    /**
+     * Returns the last successful authentication time since boot for the given user with any of the
+     * given authenticator types. This is determined by inspecting the cached auth tokens.
+     *
+     * ## Error conditions:
+     * `ResponseCode::NO_AUTH_TOKEN_FOUND` - if there is no matching authentication token found
+     */
+    long getLastAuthTime(in long secureUserId, in HardwareAuthenticatorType[] authTypes);
 }
