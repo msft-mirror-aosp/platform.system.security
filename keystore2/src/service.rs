@@ -22,7 +22,7 @@ use crate::ks_err;
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
-    check_grant_permission, check_key_permission, check_keystore_permission,
+    check_grant_permission, check_key_permission, check_keystore_permission, count_key_entries,
     key_parameters_to_authorizations, list_key_entries, uid_to_android_user, watchdog as wd,
 };
 use crate::{
@@ -126,8 +126,10 @@ impl KeystoreService {
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
         let caller_uid = ThreadState::get_calling_uid();
 
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
@@ -181,8 +183,10 @@ impl KeystoreService {
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with::<_, Result<()>>(|db| {
             let entry = match LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -251,7 +255,11 @@ impl KeystoreService {
         .context(ks_err!())
     }
 
-    fn list_entries(&self, domain: Domain, namespace: i64) -> Result<Vec<KeyDescriptor>> {
+    fn get_key_descriptor_for_lookup(
+        &self,
+        domain: Domain,
+        namespace: i64,
+    ) -> Result<KeyDescriptor> {
         let mut k = match domain {
             Domain::APP => KeyDescriptor {
                 domain,
@@ -284,14 +292,37 @@ impl KeystoreService {
                 return Err(e).context(ks_err!("While checking key permission."))?;
             }
         }
+        Ok(k)
+    }
 
-        DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace))
+    fn list_entries(&self, domain: Domain, namespace: i64) -> Result<Vec<KeyDescriptor>> {
+        let k = self.get_key_descriptor_for_lookup(domain, namespace)?;
+
+        DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace, None))
+    }
+
+    fn count_num_entries(&self, domain: Domain, namespace: i64) -> Result<i32> {
+        let k = self.get_key_descriptor_for_lookup(domain, namespace)?;
+
+        DB.with(|db| count_key_entries(&mut db.borrow_mut(), k.domain, k.nspace))
+    }
+
+    fn list_entries_batched(
+        &self,
+        domain: Domain,
+        namespace: i64,
+        start_past_alias: Option<&str>,
+    ) -> Result<Vec<KeyDescriptor>> {
+        let k = self.get_key_descriptor_for_lookup(domain, namespace)?;
+        DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace, start_past_alias))
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with(|db| {
             LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -312,8 +343,10 @@ impl KeystoreService {
         access_vector: permission::KeyPermSet,
     ) -> Result<KeyDescriptor> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with(|db| {
             LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -388,5 +421,19 @@ impl IKeystoreService for KeystoreService {
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> binder::Result<()> {
         let _wp = wd::watch_millis("IKeystoreService::ungrant", 500);
         map_or_log_err(self.ungrant(key, grantee_uid), Ok)
+    }
+    fn listEntriesBatched(
+        &self,
+        domain: Domain,
+        namespace: i64,
+        start_past_alias: Option<&str>,
+    ) -> binder::Result<Vec<KeyDescriptor>> {
+        let _wp = wd::watch_millis("IKeystoreService::listEntriesBatched", 500);
+        map_or_log_err(self.list_entries_batched(domain, namespace, start_past_alias), Ok)
+    }
+
+    fn getNumberOfEntries(&self, domain: Domain, namespace: i64) -> binder::Result<i32> {
+        let _wp = wd::watch_millis("IKeystoreService::getNumberOfEntries", 500);
+        map_or_log_err(self.count_num_entries(domain, namespace), Ok)
     }
 }

@@ -16,33 +16,36 @@
 //! database connections and connections to services that Keystore needs
 //! to talk to.
 
-use crate::ks_err;
+use crate::async_task::AsyncTask;
 use crate::gc::Gc;
+use crate::km_compat::{BacklevelKeyMintWrapper, KeyMintV1};
+use crate::ks_err;
 use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_importer::LegacyImporter;
 use crate::super_key::SuperKeyManager;
 use crate::utils::watchdog as wd;
-use crate::{async_task::AsyncTask, database::MonotonicRawTime};
 use crate::{
     database::KeystoreDB,
     database::Uuid,
     error::{map_binder_status, map_binder_status_code, Error, ErrorCode},
 };
-use crate::km_compat::{KeyMintV1, BacklevelKeyMintWrapper};
 use crate::{enforcements::Enforcements, error::map_km_error};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    IKeyMintDevice::IKeyMintDevice, KeyMintHardwareInfo::KeyMintHardwareInfo,
-    SecurityLevel::SecurityLevel,
-};
-use android_hardware_security_rkp::aidl::android::hardware::security::keymint::IRemotelyProvisionedComponent::IRemotelyProvisionedComponent;
-use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
-    ISecureClock::ISecureClock,
+    IKeyMintDevice::BpKeyMintDevice, IKeyMintDevice::IKeyMintDevice,
+    KeyMintHardwareInfo::KeyMintHardwareInfo, SecurityLevel::SecurityLevel,
 };
 use android_hardware_security_keymint::binder::{StatusCode, Strong};
+use android_hardware_security_rkp::aidl::android::hardware::security::keymint::{
+    IRemotelyProvisionedComponent::BpRemotelyProvisionedComponent,
+    IRemotelyProvisionedComponent::IRemotelyProvisionedComponent,
+};
+use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
+    ISecureClock::BpSecureClock, ISecureClock::ISecureClock,
+};
 use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 use anyhow::{Context, Result};
+use binder::get_declared_instances;
 use binder::FromIBinder;
-use keystore2_vintf::get_aidl_instances;
 use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{cell::RefCell, sync::Once};
@@ -65,7 +68,6 @@ pub fn create_thread_local_db() -> KeystoreDB {
 
     DB_INIT.call_once(|| {
         log::info!("Touching Keystore 2.0 database for this first time since boot.");
-        db.insert_last_off_body(MonotonicRawTime::now());
         log::info!("Calling cleanup leftovers.");
         let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup.");
         if n != 0 {
@@ -134,26 +136,6 @@ impl<T: FromIBinder + ?Sized> Default for DevicesMap<T> {
     }
 }
 
-struct RemotelyProvisionedDevicesMap<T: FromIBinder + ?Sized> {
-    devices_by_sec_level: HashMap<SecurityLevel, Strong<T>>,
-}
-
-impl<T: FromIBinder + ?Sized> Default for RemotelyProvisionedDevicesMap<T> {
-    fn default() -> Self {
-        Self { devices_by_sec_level: HashMap::<SecurityLevel, Strong<T>>::new() }
-    }
-}
-
-impl<T: FromIBinder + ?Sized> RemotelyProvisionedDevicesMap<T> {
-    fn dev_by_sec_level(&self, sec_level: &SecurityLevel) -> Option<Strong<T>> {
-        self.devices_by_sec_level.get(sec_level).map(|dev| (*dev).clone())
-    }
-
-    fn insert(&mut self, sec_level: SecurityLevel, dev: Strong<T>) {
-        self.devices_by_sec_level.insert(sec_level, dev);
-    }
-}
-
 lazy_static! {
     /// The path where keystore stores all its keys.
     pub static ref DB_PATH: RwLock<PathBuf> = RwLock::new(
@@ -164,10 +146,6 @@ lazy_static! {
     static ref KEY_MINT_DEVICES: Mutex<DevicesMap<dyn IKeyMintDevice>> = Default::default();
     /// Timestamp service.
     static ref TIME_STAMP_DEVICE: Mutex<Option<Strong<dyn ISecureClock>>> = Default::default();
-    /// RemotelyProvisionedComponent HAL devices.
-    static ref REMOTELY_PROVISIONED_COMPONENT_DEVICES:
-            Mutex<RemotelyProvisionedDevicesMap<dyn IRemotelyProvisionedComponent>> =
-                    Default::default();
     /// A single on-demand worker thread that handles deferred tasks with two different
     /// priorities.
     pub static ref ASYNC_TASK: Arc<AsyncTask> = Default::default();
@@ -198,43 +176,37 @@ lazy_static! {
     }));
 }
 
-static KEYMINT_SERVICE_NAME: &str = "android.hardware.security.keymint.IKeyMintDevice";
-
 /// Determine the service name for a KeyMint device of the given security level
-/// which implements at least the specified version of the `IKeyMintDevice`
-/// interface.
-fn keymint_service_name_by_version(
-    security_level: &SecurityLevel,
-    version: i32,
-) -> Result<Option<(i32, String)>> {
-    let keymint_instances =
-        get_aidl_instances("android.hardware.security.keymint", version as usize, "IKeyMintDevice");
+/// gotten by binder service from the device and determining what services
+/// are available.
+fn keymint_service_name(security_level: &SecurityLevel) -> Result<Option<String>> {
+    let keymint_descriptor: &str = <BpKeyMintDevice as IKeyMintDevice>::get_descriptor();
+    let keymint_instances = get_declared_instances(keymint_descriptor).unwrap();
 
     let service_name = match *security_level {
         SecurityLevel::TRUSTED_ENVIRONMENT => {
             if keymint_instances.iter().any(|instance| *instance == "default") {
-                Some(format!("{}/default", KEYMINT_SERVICE_NAME))
+                Some(format!("{}/default", keymint_descriptor))
             } else {
                 None
             }
         }
         SecurityLevel::STRONGBOX => {
             if keymint_instances.iter().any(|instance| *instance == "strongbox") {
-                Some(format!("{}/strongbox", KEYMINT_SERVICE_NAME))
+                Some(format!("{}/strongbox", keymint_descriptor))
             } else {
                 None
             }
         }
         _ => {
             return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(ks_err!(
-                "Trying to find keymint V{} for security level: {:?}",
-                version,
+                "Trying to find keymint for security level: {:?}",
                 security_level
             ));
         }
     };
 
-    Ok(service_name.map(|service_name| (version, service_name)))
+    Ok(service_name)
 }
 
 /// Make a new connection to a KeyMint device of the given security level.
@@ -243,28 +215,22 @@ fn keymint_service_name_by_version(
 fn connect_keymint(
     security_level: &SecurityLevel,
 ) -> Result<(Strong<dyn IKeyMintDevice>, KeyMintHardwareInfo)> {
-    // Count down from the current interface version back to one in order to
-    // also find out the interface version -- an implementation of V2 will show
-    // up in the list of V1-capable devices, but not vice-versa.
-    let service_name = keymint_service_name_by_version(security_level, 2)
-        .and_then(|sl| {
-            if sl.is_none() {
-                keymint_service_name_by_version(security_level, 1)
-            } else {
-                Ok(sl)
-            }
-        })
-        .context(ks_err!())?;
+    // Show the keymint interface that is registered in the binder
+    // service and use the security level to get the service name.
+    let service_name = keymint_service_name(security_level)
+        .context(ks_err!("Get service name from binder service"))?;
 
-    let (keymint, hal_version) = if let Some((version, service_name)) = service_name {
+    let (keymint, hal_version) = if let Some(service_name) = service_name {
         let km: Strong<dyn IKeyMintDevice> =
             map_binder_status_code(binder::get_interface(&service_name))
                 .context(ks_err!("Trying to connect to genuine KeyMint service."))?;
         // Map the HAL version code for KeyMint to be <AIDL version> * 100, so
         // - V1 is 100
         // - V2 is 200
+        // - V3 is 300
         // etc.
-        (km, Some(version * 100))
+        let km_version = km.getInterfaceVersion()?;
+        (km, Some(km_version * 100))
     } else {
         // This is a no-op if it was called before.
         keystore2_km_compat::add_keymint_device_service();
@@ -280,7 +246,11 @@ fn connect_keymint(
                     }
                     e => e,
                 })
-                .context(ks_err!("Trying to get Legacy wrapper."))?,
+                .context(ks_err!(
+                    "Trying to get Legacy wrapper. Attempt to get keystore \
+                    compat service for security level {:?}",
+                    *security_level
+                ))?,
             None,
         )
     };
@@ -288,8 +258,17 @@ fn connect_keymint(
     // If the KeyMint device is back-level, use a wrapper that intercepts and
     // emulates things that are not supported by the hardware.
     let keymint = match hal_version {
+        Some(300) => {
+            // Current KeyMint version: use as-is as v3 Keymint is current version
+            log::info!(
+                "KeyMint device is current version ({:?}) for security level: {:?}",
+                hal_version,
+                security_level
+            );
+            keymint
+        }
         Some(200) => {
-            // Current KeyMint version: use as-is.
+            // Previous KeyMint version: use as-is as we don't have any software emulation of v3-specific KeyMint features.
             log::info!(
                 "KeyMint device is current version ({:?}) for security level: {:?}",
                 hal_version,
@@ -359,7 +338,8 @@ pub fn get_keymint_device(
     if let Some((dev, hw_info, uuid)) = devices_map.dev_by_sec_level(security_level) {
         Ok((dev, hw_info, uuid))
     } else {
-        let (dev, hw_info) = connect_keymint(security_level).context(ks_err!())?;
+        let (dev, hw_info) =
+            connect_keymint(security_level).context(ks_err!("Cannot connect to Keymint"))?;
         devices_map.insert(*security_level, dev, hw_info);
         // Unwrap must succeed because we just inserted it.
         Ok(devices_map.dev_by_sec_level(security_level).unwrap())
@@ -386,19 +366,17 @@ pub fn get_keymint_devices() -> Vec<Strong<dyn IKeyMintDevice>> {
     KEY_MINT_DEVICES.lock().unwrap().devices()
 }
 
-static TIME_STAMP_SERVICE_NAME: &str = "android.hardware.security.secureclock.ISecureClock";
-
 /// Make a new connection to a secure clock service.
 /// If no native SecureClock device can be found brings up the compatibility service and attempts
 /// to connect to the legacy wrapper.
 fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
-    let secureclock_instances =
-        get_aidl_instances("android.hardware.security.secureclock", 1, "ISecureClock");
+    let secure_clock_descriptor: &str = <BpSecureClock as ISecureClock>::get_descriptor();
+    let secureclock_instances = get_declared_instances(secure_clock_descriptor).unwrap();
 
     let secure_clock_available =
         secureclock_instances.iter().any(|instance| *instance == "default");
 
-    let default_time_stamp_service_name = format!("{}/default", TIME_STAMP_SERVICE_NAME);
+    let default_time_stamp_service_name = format!("{}/default", secure_clock_descriptor);
 
     let secureclock = if secure_clock_available {
         map_binder_status_code(binder::get_interface(&default_time_stamp_service_name))
@@ -419,7 +397,7 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
                 }
                 e => e,
             })
-            .context(ks_err!("Trying to get Legacy wrapper."))
+            .context(ks_err!("Failed attempt to get legacy secure clock."))
     }?;
 
     Ok(secureclock)
@@ -438,25 +416,23 @@ pub fn get_timestamp_service() -> Result<Strong<dyn ISecureClock>> {
     }
 }
 
-static REMOTE_PROVISIONING_HAL_SERVICE_NAME: &str =
-    "android.hardware.security.keymint.IRemotelyProvisionedComponent";
-
 /// Get the service name of a remotely provisioned component corresponding to given security level.
 pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -> Result<String> {
-    let remotely_prov_instances =
-        get_aidl_instances("android.hardware.security.keymint", 1, "IRemotelyProvisionedComponent");
+    let remote_prov_descriptor: &str =
+        <BpRemotelyProvisionedComponent as IRemotelyProvisionedComponent>::get_descriptor();
+    let remotely_prov_instances = get_declared_instances(remote_prov_descriptor).unwrap();
 
     match *security_level {
         SecurityLevel::TRUSTED_ENVIRONMENT => {
             if remotely_prov_instances.iter().any(|instance| *instance == "default") {
-                Some(format!("{}/default", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+                Some(format!("{}/default", remote_prov_descriptor))
             } else {
                 None
             }
         }
         SecurityLevel::STRONGBOX => {
             if remotely_prov_instances.iter().any(|instance| *instance == "strongbox") {
-                Some(format!("{}/strongbox", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+                Some(format!("{}/strongbox", remote_prov_descriptor))
             } else {
                 None
             }
@@ -464,31 +440,5 @@ pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -
         _ => None,
     }
     .ok_or(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-    .context(ks_err!())
-}
-
-fn connect_remotely_provisioned_component(
-    security_level: &SecurityLevel,
-) -> Result<Strong<dyn IRemotelyProvisionedComponent>> {
-    let service_name = get_remotely_provisioned_component_name(security_level)?;
-    let rem_prov_hal: Strong<dyn IRemotelyProvisionedComponent> =
-        map_binder_status_code(binder::get_interface(&service_name))
-            .context(ks_err!("Trying to connect to RemotelyProvisionedComponent service."))?;
-    Ok(rem_prov_hal)
-}
-
-/// Get a remote provisiong component device for the given security level either from the cache or
-/// by making a new connection. Returns the device.
-pub fn get_remotely_provisioned_component(
-    security_level: &SecurityLevel,
-) -> Result<Strong<dyn IRemotelyProvisionedComponent>> {
-    let mut devices_map = REMOTELY_PROVISIONED_COMPONENT_DEVICES.lock().unwrap();
-    if let Some(dev) = devices_map.dev_by_sec_level(security_level) {
-        Ok(dev)
-    } else {
-        let dev = connect_remotely_provisioned_component(security_level).context(ks_err!())?;
-        devices_map.insert(*security_level, dev);
-        // Unwrap must succeed because we just inserted it.
-        Ok(devices_map.dev_by_sec_level(security_level).unwrap())
-    }
+    .context(ks_err!("Failed to get rpc for sec level {:?}", *security_level))
 }

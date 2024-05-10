@@ -25,12 +25,10 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, KeyDescriptor::KeyDescriptor,
 };
 
-use android_security_maintenance::aidl::android::security::maintenance::{
-    IKeystoreMaintenance::IKeystoreMaintenance, UserState::UserState,
-};
+use android_security_maintenance::aidl::android::security::maintenance::IKeystoreMaintenance::IKeystoreMaintenance;
 
 use android_security_authorization::aidl::android::security::authorization::{
-    IKeystoreAuthorization::IKeystoreAuthorization, LockScreenEvent::LockScreenEvent,
+    IKeystoreAuthorization::IKeystoreAuthorization,
 };
 
 use keystore2::key_parameter::KeyParameter as KsKeyparameter;
@@ -47,6 +45,10 @@ use keystore2_test_utils::run_as;
 static USER_MANAGER_SERVICE_NAME: &str = "android.security.maintenance";
 static AUTH_SERVICE_NAME: &str = "android.security.authorization";
 const SELINUX_SHELL_NAMESPACE: i64 = 1;
+
+fn rkp_only() -> bool {
+    matches!(rustutils::system_properties::read("remote_provisioning.tee.rkp_only"), Ok(Some(v)) if v == "1")
+}
 
 fn get_maintenance() -> binder::Strong<dyn IKeystoreMaintenance> {
     binder::get_interface(USER_MANAGER_SERVICE_NAME).unwrap()
@@ -164,19 +166,19 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
                 .getSecurityLevel(SecurityLevel::SecurityLevel::TRUSTED_ENVIRONMENT)
                 .unwrap();
             // Generate Key BLOB and prepare legacy keystore blob files.
-            let att_challenge: &[u8] = b"foo";
+            let att_challenge: Option<&[u8]> = if rkp_only() { None } else { Some(b"foo") };
             let key_metadata = key_generations::generate_ec_p256_signing_key(
                 &sec_level,
                 Domain::BLOB,
                 SELINUX_SHELL_NAMESPACE,
                 None,
-                Some(att_challenge),
+                att_challenge,
             )
             .expect("Failed to generate key blob");
 
             // Create keystore file layout for user_99.
             let pw: Password = PASSWORD.into();
-            let pw_key = TestKey(pw.derive_key(SUPERKEY_SALT, 32).unwrap());
+            let pw_key = TestKey(pw.derive_key_pbkdf2(SUPERKEY_SALT, 32).unwrap());
             let super_key =
                 TestKey(pw_key.decrypt(SUPERKEY_PAYLOAD, SUPERKEY_IV, SUPERKEY_TAG).unwrap());
 
@@ -214,14 +216,12 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
                     .unwrap();
             }
 
-            let mut path_buf = PathBuf::from("/data/misc/keystore/user_99");
-            path_buf.push("9910001_CACERT_authbound");
-            if !path_buf.as_path().is_file() {
-                make_cert_blob_file(
-                    path_buf.as_path(),
-                    key_metadata.certificateChain.as_ref().unwrap(),
-                )
-                .unwrap();
+            if let Some(chain) = key_metadata.certificateChain.as_ref() {
+                let mut path_buf = PathBuf::from("/data/misc/keystore/user_99");
+                path_buf.push("9910001_CACERT_authbound");
+                if !path_buf.as_path().is_file() {
+                    make_cert_blob_file(path_buf.as_path(), chain).unwrap();
+                }
             }
 
             // Keystore2 disables the legacy importer when it finds the legacy database empty.
@@ -231,8 +231,7 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
             keystore2_restart_service();
 
             let auth_service = get_authorization();
-            match auth_service.onLockScreenEvent(LockScreenEvent::UNLOCK, 99, Some(PASSWORD), None)
-            {
+            match auth_service.onDeviceUnlocked(99, Some(PASSWORD)) {
                 Ok(result) => {
                     println!("Unlock Result: {:?}", result);
                 }
@@ -240,9 +239,6 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
                     panic!("Unlock should have succeeded: {:?}", e);
                 }
             }
-
-            let maint_service = get_maintenance();
-            assert_eq!(Ok(UserState(1)), maint_service.getState(99));
 
             let mut key_params: Vec<KsKeyparameter> = Vec::new();
             for param in key_metadata.authorizations {
@@ -252,7 +248,7 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
 
             KeygenResult {
                 cert: key_metadata.certificate.unwrap(),
-                cert_chain: key_metadata.certificateChain.unwrap(),
+                cert_chain: key_metadata.certificateChain.unwrap_or_default(),
                 key_parameters: key_params,
             }
         })
@@ -281,7 +277,7 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
                         gen_key_result.cert
                     );
                     assert_eq!(
-                        key_entry_response.metadata.certificateChain.unwrap(),
+                        key_entry_response.metadata.certificateChain.unwrap_or_default(),
                         gen_key_result.cert_chain
                     );
                     assert_eq!(key_entry_response.metadata.key.domain, Domain::KEY_ID);
@@ -421,19 +417,19 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
                 .getSecurityLevel(SecurityLevel::SecurityLevel::TRUSTED_ENVIRONMENT)
                 .unwrap();
             // Generate Key BLOB and prepare legacy keystore blob files.
-            let att_challenge: &[u8] = b"foo";
+            let att_challenge: Option<&[u8]> = if rkp_only() { None } else { Some(b"foo") };
             let key_metadata = key_generations::generate_ec_p256_signing_key(
                 &sec_level,
                 Domain::BLOB,
                 SELINUX_SHELL_NAMESPACE,
                 None,
-                Some(att_challenge),
+                att_challenge,
             )
             .expect("Failed to generate key blob");
 
             // Create keystore file layout for user_98.
             let pw: Password = PASSWORD.into();
-            let pw_key = TestKey(pw.derive_key(SUPERKEY_SALT, 32).unwrap());
+            let pw_key = TestKey(pw.derive_key_pbkdf2(SUPERKEY_SALT, 32).unwrap());
             let super_key =
                 TestKey(pw_key.decrypt(SUPERKEY_PAYLOAD, SUPERKEY_IV, SUPERKEY_TAG).unwrap());
 
@@ -474,15 +470,12 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
                 .unwrap();
             }
 
-            let mut path_buf = PathBuf::from("/data/misc/keystore/user_98");
-            path_buf.push("9810001_CACERT_authboundcertenc");
-            if !path_buf.as_path().is_file() {
-                make_encrypted_ca_cert_file(
-                    path_buf.as_path(),
-                    &super_key,
-                    key_metadata.certificateChain.as_ref().unwrap(),
-                )
-                .unwrap();
+            if let Some(chain) = key_metadata.certificateChain.as_ref() {
+                let mut path_buf = PathBuf::from("/data/misc/keystore/user_98");
+                path_buf.push("9810001_CACERT_authboundcertenc");
+                if !path_buf.as_path().is_file() {
+                    make_encrypted_ca_cert_file(path_buf.as_path(), &super_key, chain).unwrap();
+                }
             }
 
             // Keystore2 disables the legacy importer when it finds the legacy database empty.
@@ -492,8 +485,7 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
             keystore2_restart_service();
 
             let auth_service = get_authorization();
-            match auth_service.onLockScreenEvent(LockScreenEvent::UNLOCK, 98, Some(PASSWORD), None)
-            {
+            match auth_service.onDeviceUnlocked(98, Some(PASSWORD)) {
                 Ok(result) => {
                     println!("Unlock Result: {:?}", result);
                 }
@@ -501,9 +493,6 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
                     panic!("Unlock should have succeeded: {:?}", e);
                 }
             }
-
-            let maint_service = get_maintenance();
-            assert_eq!(Ok(UserState(1)), maint_service.getState(98));
 
             let mut key_params: Vec<KsKeyparameter> = Vec::new();
             for param in key_metadata.authorizations {
@@ -513,7 +502,7 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
 
             KeygenResult {
                 cert: key_metadata.certificate.unwrap(),
-                cert_chain: key_metadata.certificateChain.unwrap(),
+                cert_chain: key_metadata.certificateChain.unwrap_or_default(),
                 key_parameters: key_params,
             }
         })
@@ -542,7 +531,7 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
                         gen_key_result.cert
                     );
                     assert_eq!(
-                        key_entry_response.metadata.certificateChain.unwrap(),
+                        key_entry_response.metadata.certificateChain.unwrap_or_default(),
                         gen_key_result.cert_chain
                     );
 
