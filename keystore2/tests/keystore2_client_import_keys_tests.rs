@@ -32,10 +32,12 @@ use keystore2_test_utils::{
     authorizations, get_keystore_service, key_generations, key_generations::Error,
 };
 
-use crate::ffi_test_utils::{create_wrapped_key, create_wrapped_key_additional_auth_data};
+use keystore2_test_utils::ffi_test_utils::{
+    create_wrapped_key, create_wrapped_key_additional_auth_data,
+};
 
 use crate::keystore2_client_test_utils::{
-    encrypt_secure_key, encrypt_transport_key, has_default_keymint,
+    encrypt_secure_key, encrypt_transport_key, get_vsr_api_level,
     perform_sample_asym_sign_verify_op, perform_sample_hmac_sign_verify_op,
     perform_sample_sym_key_decrypt_op, perform_sample_sym_key_encrypt_op, SAMPLE_PLAIN_TEXT,
 };
@@ -286,7 +288,7 @@ fn keystore2_rsa_import_key_with_multipurpose_fails_incompt_purpose_error() {
         key_generations::RSA_2048_KEY,
     ));
 
-    if has_default_keymint() {
+    if key_generations::has_default_keymint() {
         assert!(result.is_err());
         assert_eq!(Error::Km(ErrorCode::INCOMPATIBLE_PURPOSE), result.unwrap_err());
     } else {
@@ -304,6 +306,13 @@ fn keystore2_import_ec_key_success() {
 
     let alias = format!("ks_ec_key_test_import_1_{}{}", getuid(), 256);
 
+    if get_vsr_api_level() < 35 {
+        // The KeyMint spec was previously not clear as to whether EC_CURVE was optional on import
+        // of EC keys. However, this was not checked at the time so we can only be strict about
+        // checking this for implementations at VSR-V or later.
+        println!("Skipping EC_CURVE on import only strict >= VSR-V");
+        return;
+    }
     // Don't specify ec-curve.
     let import_params = authorizations::AuthSetBuilder::new()
         .no_auth_required()

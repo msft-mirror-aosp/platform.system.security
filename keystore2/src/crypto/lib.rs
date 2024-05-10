@@ -19,10 +19,10 @@ mod error;
 pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
-    extractSubjectFromCertificate, generateKeyFromPassword, hmacSha256, randomBytes,
-    AES_gcm_decrypt, AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey,
-    ECKEYParsePrivateKey, ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key,
-    EC_POINT_free, HKDFExpand, HKDFExtract, EC_KEY, EC_MAX_BYTES, EC_POINT, EVP_MAX_MD_SIZE,
+    extractSubjectFromCertificate, hmacSha256, randomBytes, AES_gcm_decrypt, AES_gcm_encrypt,
+    ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey, ECKEYParsePrivateKey,
+    ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free,
+    HKDFExpand, HKDFExtract, EC_KEY, EC_MAX_BYTES, EC_POINT, EVP_MAX_MD_SIZE, PBKDF2,
 };
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -49,8 +49,8 @@ pub const LEGACY_IV_LENGTH: usize = 16;
 /// Generate an AES256 key, essentially 32 random bytes from the underlying
 /// boringssl library discretely stuffed into a ZVec.
 pub fn generate_aes256_key() -> Result<ZVec, Error> {
-    // Safety: key has the same length as the requested number of random bytes.
     let mut key = ZVec::new(AES_256_KEY_LENGTH)?;
+    // Safety: key has the same length as the requested number of random bytes.
     if unsafe { randomBytes(key.as_mut_ptr(), AES_256_KEY_LENGTH) } {
         Ok(key)
     } else {
@@ -65,8 +65,8 @@ pub fn generate_salt() -> Result<Vec<u8>, Error> {
 
 /// Generate random data of the given size.
 pub fn generate_random_data(size: usize) -> Result<Vec<u8>, Error> {
-    // Safety: data has the same length as the requested number of random bytes.
     let mut data = vec![0; size];
+    // Safety: data has the same length as the requested number of random bytes.
     if unsafe { randomBytes(data.as_mut_ptr(), size) } {
         Ok(data)
     } else {
@@ -172,7 +172,7 @@ pub fn aes_gcm_encrypt(plaintext: &[u8], key: &[u8]) -> Result<(Vec<u8>, Vec<u8>
     }
 }
 
-/// Represents a "password" that can be used to key the PBKDF2 algorithm.
+/// A high-entropy synthetic password from which an AES key may be derived.
 pub enum Password<'a> {
     /// Borrow an existing byte array
     Ref(&'a [u8]),
@@ -194,23 +194,28 @@ impl<'a> Password<'a> {
         }
     }
 
-    /// Generate a key from the given password and salt.
-    /// The salt must be exactly 16 bytes long.
-    /// Two key sizes are accepted: 16 and 32 bytes.
-    pub fn derive_key(&self, salt: &[u8], key_length: usize) -> Result<ZVec, Error> {
+    /// Derives a key from the given password and salt, using PBKDF2 with 8192 iterations.
+    ///
+    /// The salt length must be 16 bytes, and the output key length must be 16 or 32 bytes.
+    ///
+    /// This function exists only for backwards compatibility reasons.  Keystore now receives only
+    /// high-entropy synthetic passwords, which do not require key stretching.
+    pub fn derive_key_pbkdf2(&self, salt: &[u8], out_len: usize) -> Result<ZVec, Error> {
         if salt.len() != SALT_LENGTH {
             return Err(Error::InvalidSaltLength);
         }
-        match key_length {
+        match out_len {
             AES_128_KEY_LENGTH | AES_256_KEY_LENGTH => {}
             _ => return Err(Error::InvalidKeyLength),
         }
 
         let pw = self.get_key();
-        let mut result = ZVec::new(key_length)?;
+        let mut result = ZVec::new(out_len)?;
 
+        // Safety: We checked that the salt is exactly 16 bytes long. The other pointers are valid,
+        // and have matching lengths.
         unsafe {
-            generateKeyFromPassword(
+            PBKDF2(
                 result.as_mut_ptr(),
                 result.len(),
                 pw.as_ptr() as *const std::os::raw::c_char,
@@ -220,6 +225,13 @@ impl<'a> Password<'a> {
         };
 
         Ok(result)
+    }
+
+    /// Derives a key from the given high-entropy synthetic password and salt, using HKDF.
+    pub fn derive_key_hkdf(&self, salt: &[u8], out_len: usize) -> Result<ZVec, Error> {
+        let prk = hkdf_extract(self.get_key(), salt)?;
+        let info = [];
+        hkdf_expand(out_len, &prk, &info)
     }
 
     /// Try to make another Password object with the same data.
@@ -324,10 +336,10 @@ impl Drop for OwnedECPoint {
 /// Calls the boringssl ECDH_compute_key function.
 pub fn ecdh_compute_key(pub_key: &EC_POINT, priv_key: &ECKey) -> Result<ZVec, Error> {
     let mut buf = ZVec::new(EC_MAX_BYTES)?;
+    let result =
     // Safety: Our ECDHComputeKey wrapper passes EC_MAX_BYES to ECDH_compute_key, which
     // writes at most that many bytes to the output.
     // The two keys are valid objects.
-    let result =
         unsafe { ECDHComputeKey(buf.as_mut_ptr() as *mut std::ffi::c_void, pub_key, priv_key.0) };
     if result == -1 {
         return Err(Error::ECDHComputeKeyFailed);
@@ -469,9 +481,7 @@ pub fn parse_subject_from_certificate(cert_buf: &[u8]) -> Result<Vec<u8>, Error>
 mod tests {
 
     use super::*;
-    use keystore2_crypto_bindgen::{
-        generateKeyFromPassword, AES_gcm_decrypt, AES_gcm_encrypt, CreateKeyId,
-    };
+    use keystore2_crypto_bindgen::{AES_gcm_decrypt, AES_gcm_encrypt, CreateKeyId, PBKDF2};
 
     #[test]
     fn test_wrapper_roundtrip() {
@@ -487,9 +497,11 @@ mod tests {
         let input = vec![0; 16];
         let mut out = vec![0; 16];
         let mut out2 = vec![0; 16];
-        let key = vec![0; 16];
-        let iv = vec![0; 12];
+        let key = [0; 16];
+        let iv = [0; 12];
         let mut tag = vec![0; 16];
+        // SAFETY: The various pointers are obtained from references so they are valid, and
+        // `AES_gcm_encrypt` and `AES_gcm_decrypt` don't do anything with them after they return.
         unsafe {
             let res = AES_gcm_encrypt(
                 input.as_ptr(),
@@ -519,22 +531,27 @@ mod tests {
 
     #[test]
     fn test_create_key_id() {
-        let blob = vec![0; 16];
+        let blob = [0; 16];
         let mut out: u64 = 0;
+        // SAFETY: The pointers are obtained from references so they are valid, the length matches
+        // the length of the array, and `CreateKeyId` doesn't access them after it returns.
         unsafe {
-            let res = CreateKeyId(blob.as_ptr(), 16, &mut out);
+            let res = CreateKeyId(blob.as_ptr(), blob.len(), &mut out);
             assert!(res);
             assert_ne!(out, 0);
         }
     }
 
     #[test]
-    fn test_generate_key_from_password() {
+    fn test_pbkdf2() {
         let mut key = vec![0; 16];
-        let pw = vec![0; 16];
-        let salt = vec![0; 16];
+        let pw = [0; 16];
+        let salt = [0; 16];
+        // SAFETY: The pointers are obtained from references so they are valid, the salt is the
+        // expected length, the other lengths match the lengths of the arrays, and `PBKDF2` doesn't
+        // access them after it returns.
         unsafe {
-            generateKeyFromPassword(key.as_mut_ptr(), 16, pw.as_ptr(), 16, salt.as_ptr());
+            PBKDF2(key.as_mut_ptr(), key.len(), pw.as_ptr(), pw.len(), salt.as_ptr());
         }
         assert_ne!(key, vec![0; 16]);
     }

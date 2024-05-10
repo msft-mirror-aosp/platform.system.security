@@ -1,6 +1,7 @@
 // Unit test for AuthTokenTable
 
 package {
+    default_team: "trendy_team_android_hardware_backed_security",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "system_security_license"
@@ -35,14 +36,15 @@ cc_test {
         "libutils",
     ],
     shared_libs: [
+        "android.security.aaid_aidl-cpp",
         "libbinder",
         "libkeymaster_messages",
         "libkeystore-attestation-application-id",
         "libvndksupport",
     ],
-   sanitize: {
-     cfi: false,
-   }
+    sanitize: {
+        cfi: false,
+    },
 }
 
 cc_test {
@@ -67,7 +69,7 @@ cc_test {
     shared_libs: [
         "libbinder_ndk",
     ],
-   sanitize: {
-     cfi: false,
-   }
+    sanitize: {
+        cfi: false,
+    },
 }

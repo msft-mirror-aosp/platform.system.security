@@ -17,12 +17,11 @@
 //!    stores them in an in-memory store.
 //! 2. Returns the collected metrics when requested by the statsd proxy.
 
-use crate::error::{get_error_code, Error};
+use crate::error::anyhow_error_to_serialized_error;
 use crate::globals::DB;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
 use crate::ks_err;
 use crate::operation::Outcome;
-use crate::remote_provisioning::get_pool_status;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, BlockMode::BlockMode, Digest::Digest, EcCurve::EcCurve,
     HardwareAuthenticatorType::HardwareAuthenticatorType, KeyOrigin::KeyOrigin,
@@ -42,16 +41,12 @@ use android_security_metrics::aidl::android::security::metrics::{
     KeystoreAtom::KeystoreAtom, KeystoreAtomPayload::KeystoreAtomPayload,
     Outcome::Outcome as MetricsOutcome, Purpose::Purpose as MetricsPurpose,
     RkpError::RkpError as MetricsRkpError, RkpErrorStats::RkpErrorStats,
-    RkpPoolStats::RkpPoolStats, SecurityLevel::SecurityLevel as MetricsSecurityLevel,
-    Storage::Storage as MetricsStorage,
+    SecurityLevel::SecurityLevel as MetricsSecurityLevel, Storage::Storage as MetricsStorage,
 };
-use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use lazy_static::lazy_static;
-use rustutils::system_properties::PropertyWatcherError;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Note: Crash events are recorded at keystore restarts, based on the assumption that keystore only
 // gets restarted after a crash, during a boot cycle.
@@ -95,19 +90,17 @@ impl MetricsStore {
             return pull_storage_stats();
         }
 
-        // Process and return RKP pool stats.
-        if AtomID::RKP_POOL_STATS == atom_id {
-            return pull_attestation_pool_stats();
-        }
-
         // Process keystore crash stats.
         if AtomID::CRASH_STATS == atom_id {
-            return Ok(vec![KeystoreAtom {
-                payload: KeystoreAtomPayload::CrashStats(CrashStats {
-                    count_of_crash_events: read_keystore_crash_count()?,
-                }),
-                ..Default::default()
-            }]);
+            return match read_keystore_crash_count()? {
+                Some(count) => Ok(vec![KeystoreAtom {
+                    payload: KeystoreAtomPayload::CrashStats(CrashStats {
+                        count_of_crash_events: count,
+                    }),
+                    ..Default::default()
+                }]),
+                None => Err(anyhow!("Crash count property is not set")),
+            };
         }
 
         // It is safe to call unwrap here since the lock can not be poisoned based on its usage
@@ -126,15 +119,14 @@ impl MetricsStore {
         // It is ok to unwrap here since the mutex cannot be poisoned according to the way it is
         // used in this module. And the lock is not acquired by this thread before.
         let mut metrics_store_guard = self.metrics_store.lock().unwrap();
-        let atom_count_map = metrics_store_guard.entry(atom_id).or_insert_with(HashMap::new);
+        let atom_count_map = metrics_store_guard.entry(atom_id).or_default();
         if atom_count_map.len() < MetricsStore::SINGLE_ATOM_STORE_MAX_SIZE {
             let atom_count = atom_count_map.entry(atom).or_insert(0);
             *atom_count += 1;
         } else {
             // Insert an overflow atom
-            let overflow_atom_count_map = metrics_store_guard
-                .entry(AtomID::KEYSTORE2_ATOM_WITH_OVERFLOW)
-                .or_insert_with(HashMap::new);
+            let overflow_atom_count_map =
+                metrics_store_guard.entry(AtomID::KEYSTORE2_ATOM_WITH_OVERFLOW).or_default();
 
             if overflow_atom_count_map.len() < MetricsStore::SINGLE_ATOM_STORE_MAX_SIZE {
                 let overflow_atom = Keystore2AtomWithOverflow { atom_id };
@@ -209,7 +201,7 @@ fn process_key_creation_event_stats<U>(
     };
 
     if let Err(ref e) = result {
-        key_creation_with_general_info.error_code = get_error_code(e);
+        key_creation_with_general_info.error_code = anyhow_error_to_serialized_error(e).0;
     }
 
     key_creation_with_auth_info.security_level = process_security_level(sec_level);
@@ -560,45 +552,6 @@ fn pull_storage_stats() -> Result<Vec<KeystoreAtom>> {
     Ok(atom_vec)
 }
 
-fn pull_attestation_pool_stats() -> Result<Vec<KeystoreAtom>> {
-    let mut atoms = Vec::<KeystoreAtom>::new();
-    for sec_level in &[SecurityLevel::TRUSTED_ENVIRONMENT, SecurityLevel::STRONGBOX] {
-        // set the expired_by date to be three days from now
-        let expired_by = SystemTime::now()
-            .checked_add(Duration::from_secs(60 * 60 * 24 * 3))
-            .ok_or(Error::Rc(ResponseCode::SYSTEM_ERROR))
-            .context(ks_err!("Failed to compute expired by system time."))?
-            .duration_since(UNIX_EPOCH)
-            .context(ks_err!("Failed to compute expired by duration."))?
-            .as_millis() as i64;
-
-        let result = get_pool_status(expired_by, *sec_level);
-
-        if let Ok(pool_status) = result {
-            let rkp_pool_stats = RkpPoolStats {
-                security_level: process_security_level(*sec_level),
-                expiring: pool_status.expiring,
-                unassigned: pool_status.unassigned,
-                attested: pool_status.attested,
-                total: pool_status.total,
-            };
-            atoms.push(KeystoreAtom {
-                payload: KeystoreAtomPayload::RkpPoolStats(rkp_pool_stats),
-                ..Default::default()
-            });
-        } else {
-            log::error!(
-                concat!(
-                    "In pull_attestation_pool_stats: Failed to retrieve pool status",
-                    " for security level: {:?}"
-                ),
-                sec_level
-            );
-        }
-    }
-    Ok(atoms)
-}
-
 /// Log error events related to Remote Key Provisioning (RKP).
 pub fn log_rkp_error_stats(rkp_error: MetricsRkpError, sec_level: &SecurityLevel) {
     let rkp_error_stats = KeystoreAtomPayload::RkpErrorStats(RkpErrorStats {
@@ -612,27 +565,21 @@ pub fn log_rkp_error_stats(rkp_error: MetricsRkpError, sec_level: &SecurityLevel
 /// If the property is absent, it sets the property with value 0. If the property is present, it
 /// increments the value. This helps tracking keystore crashes internally.
 pub fn update_keystore_crash_sysprop() {
-    let crash_count = read_keystore_crash_count();
-    let new_count = match crash_count {
-        Ok(count) => count + 1,
+    let new_count = match read_keystore_crash_count() {
+        Ok(Some(count)) => count + 1,
+        // If the property is absent, then this is the first start up during the boot.
+        // Proceed to write the system property with value 0.
+        Ok(None) => 0,
         Err(error) => {
-            // If the property is absent, this is the first start up during the boot.
-            // Proceed to write the system property with value 0. Otherwise, log and return.
-            if !matches!(
-                error.root_cause().downcast_ref::<PropertyWatcherError>(),
-                Some(PropertyWatcherError::SystemPropertyAbsent)
-            ) {
-                log::warn!(
-                    concat!(
-                        "In update_keystore_crash_sysprop: ",
-                        "Failed to read the existing system property due to: {:?}.",
-                        "Therefore, keystore crashes will not be logged."
-                    ),
-                    error
-                );
-                return;
-            }
-            0
+            log::warn!(
+                concat!(
+                    "In update_keystore_crash_sysprop: ",
+                    "Failed to read the existing system property due to: {:?}.",
+                    "Therefore, keystore crashes will not be logged."
+                ),
+                error
+            );
+            return;
         }
     };
 
@@ -650,12 +597,12 @@ pub fn update_keystore_crash_sysprop() {
 }
 
 /// Read the system property: keystore.crash_count.
-pub fn read_keystore_crash_count() -> Result<i32> {
-    rustutils::system_properties::read("keystore.crash_count")
-        .context(ks_err!("Failed read property."))?
-        .context(ks_err!("Property not set."))?
-        .parse::<i32>()
-        .map_err(std::convert::Into::into)
+pub fn read_keystore_crash_count() -> Result<Option<i32>> {
+    match rustutils::system_properties::read("keystore.crash_count") {
+        Ok(Some(count)) => count.parse::<i32>().map(Some).map_err(std::convert::Into::into),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e).context(ks_err!("Failed to read crash count property.")),
+    }
 }
 
 /// Enum defining the bit position for each padding mode. Since padding mode can be repeatable, it
