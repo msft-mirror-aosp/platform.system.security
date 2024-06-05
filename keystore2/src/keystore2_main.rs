@@ -40,8 +40,8 @@ fn main() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_tag("keystore2")
-            .with_min_level(log::Level::Debug)
-            .with_log_id(android_logger::LogId::System)
+            .with_max_level(log::LevelFilter::Debug)
+            .with_log_buffer(android_logger::LogId::System)
             .format(|buf, record| {
                 writeln!(
                     buf,
@@ -68,6 +68,8 @@ fn main() {
     fn sqlite_log_handler(err: c_int, message: &str) {
         log::error!("[SQLITE3] {}: {}", err, message);
     }
+    // SAFETY: There are no other threads yet, `sqlite_log_handler` is threadsafe, and it doesn't
+    // invoke any SQLite calls.
     unsafe { sqlite_trace::config_log(Some(sqlite_log_handler)) }
         .expect("Error setting sqlite log callback.");
 

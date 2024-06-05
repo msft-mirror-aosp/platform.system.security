@@ -29,9 +29,7 @@ use keystore2::{
     legacy_blob::LegacyBlobLoader, maintenance::DeleteListener, maintenance::Domain,
     utils::uid_to_android_user, utils::watchdog as wd,
 };
-use rusqlite::{
-    params, Connection, OptionalExtension, Transaction, TransactionBehavior, NO_PARAMS,
-};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::sync::Arc;
 use std::{
     collections::HashSet,
@@ -57,7 +55,7 @@ impl DB {
         F: Fn(&Transaction) -> Result<T>,
     {
         loop {
-            match self
+            let result = self
                 .conn
                 .transaction_with_behavior(behavior)
                 .context("In with_transaction.")
@@ -65,7 +63,8 @@ impl DB {
                 .and_then(|(result, tx)| {
                     tx.commit().context("In with_transaction: Failed to commit transaction.")?;
                     Ok(result)
-                }) {
+                });
+            match result {
                 Ok(result) => break Ok(result),
                 Err(e) => {
                     if Self::is_locked_error(&e) {
@@ -95,7 +94,7 @@ impl DB {
                      alias BLOB,
                      profile BLOB,
                      UNIQUE(owner, alias));",
-                NO_PARAMS,
+                [],
             )
             .context("Failed to initialize \"profiles\" table.")?;
             Ok(())
@@ -123,6 +122,7 @@ impl DB {
     }
 
     fn put(&mut self, caller_uid: u32, alias: &str, entry: &[u8]) -> Result<()> {
+        ensure_keystore_put_is_enabled()?;
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             tx.execute(
                 "INSERT OR REPLACE INTO profiles (owner, alias, profile) values (?, ?, ?)",
@@ -203,6 +203,11 @@ impl Error {
     pub fn perm() -> Self {
         Error::Error(ERROR_PERMISSION_DENIED)
     }
+
+    /// Short hand for `Error::Error(ERROR_SYSTEM_ERROR)`
+    pub fn deprecated() -> Self {
+        Error::Error(ERROR_SYSTEM_ERROR)
+    }
 }
 
 /// This function should be used by legacykeystore service calls to translate error conditions
@@ -240,6 +245,17 @@ where
         },
         handle_ok,
     )
+}
+
+fn ensure_keystore_put_is_enabled() -> Result<()> {
+    if keystore2_flags::disable_legacy_keystore_put_v2() {
+        Err(Error::deprecated()).context(concat!(
+            "Storing into Keystore's legacy database is ",
+            "no longer supported, store in an app-specific database instead"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 struct LegacyKeystoreDeleteListener {
@@ -334,6 +350,7 @@ impl LegacyKeystore {
     }
 
     fn put(&self, alias: &str, uid: i32, entry: &[u8]) -> Result<()> {
+        ensure_keystore_put_is_enabled()?;
         let uid = Self::get_effective_uid(uid).context("In put.")?;
         let mut db = self.open_db().context("In put.")?;
         db.put(uid, alias, entry).context("In put: Trying to insert entry into DB.")?;
@@ -502,8 +519,10 @@ impl LegacyKeystore {
     ) -> Result<bool> {
         let blob = legacy_loader
             .read_legacy_keystore_entry(uid, alias, |ciphertext, iv, tag, _salt, _key_size| {
-                if let Some(key) =
-                    SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(uid))
+                if let Some(key) = SUPER_KEY
+                    .read()
+                    .unwrap()
+                    .get_after_first_unlock_key_by_user_id(uid_to_android_user(uid))
                 {
                     key.decrypt(ciphertext, iv, tag)
                 } else {
@@ -532,19 +551,19 @@ impl binder::Interface for LegacyKeystoreService {}
 
 impl ILegacyKeystore for LegacyKeystoreService {
     fn get(&self, alias: &str, uid: i32) -> BinderResult<Vec<u8>> {
-        let _wp = wd::watch_millis("ILegacyKeystore::get", 500);
+        let _wp = wd::watch("ILegacyKeystore::get");
         map_or_log_err(self.legacy_keystore.get(alias, uid), Ok)
     }
     fn put(&self, alias: &str, uid: i32, entry: &[u8]) -> BinderResult<()> {
-        let _wp = wd::watch_millis("ILegacyKeystore::put", 500);
+        let _wp = wd::watch("ILegacyKeystore::put");
         map_or_log_err(self.legacy_keystore.put(alias, uid, entry), Ok)
     }
     fn remove(&self, alias: &str, uid: i32) -> BinderResult<()> {
-        let _wp = wd::watch_millis("ILegacyKeystore::remove", 500);
+        let _wp = wd::watch("ILegacyKeystore::remove");
         map_or_log_err(self.legacy_keystore.remove(alias, uid), Ok)
     }
     fn list(&self, prefix: &str, uid: i32) -> BinderResult<Vec<String>> {
-        let _wp = wd::watch_millis("ILegacyKeystore::list", 500);
+        let _wp = wd::watch("ILegacyKeystore::list");
         map_or_log_err(self.legacy_keystore.list(prefix, uid), Ok)
     }
 }

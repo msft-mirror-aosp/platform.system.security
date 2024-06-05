@@ -22,7 +22,7 @@ use crate::error::{map_km_error, Error};
 use crate::key_parameter::{KeyParameter, KeyParameterValue};
 use crate::ks_err;
 use crate::legacy_blob::{self, Blob, BlobValue, LegacyKeyCharacteristics};
-use crate::super_key::USER_SUPER_KEY;
+use crate::super_key::USER_AFTER_FIRST_UNLOCK_SUPER_KEY;
 use crate::utils::{
     key_characteristics_to_internal, uid_to_android_user, upgrade_keyblob_if_required_with,
     watchdog as wd, AesGcm,
@@ -100,6 +100,11 @@ impl LegacyImporter {
             initializer: Default::default(),
             state: AtomicU8::new(Self::STATE_UNINITIALIZED),
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_empty(&mut self) {
+        self.state = AtomicU8::new(Self::STATE_EMPTY);
     }
 
     /// The legacy importer must be initialized deferred, because keystore starts very early.
@@ -197,7 +202,7 @@ impl LegacyImporter {
 
     /// List all aliases for uid in the legacy database.
     pub fn list_uid(&self, domain: Domain, namespace: i64) -> Result<Vec<KeyDescriptor>> {
-        let _wp = wd::watch_millis("LegacyImporter::list_uid", 500);
+        let _wp = wd::watch("LegacyImporter::list_uid");
 
         let uid = match (domain, namespace) {
             (Domain::APP, namespace) => namespace as u32,
@@ -294,7 +299,7 @@ impl LegacyImporter {
     where
         F: Fn() -> Result<T>,
     {
-        let _wp = wd::watch_millis("LegacyImporter::with_try_import", 500);
+        let _wp = wd::watch("LegacyImporter::with_try_import");
 
         // Access the key and return on success.
         match key_accessor() {
@@ -350,7 +355,7 @@ impl LegacyImporter {
     where
         F: FnMut() -> Result<Option<T>>,
     {
-        let _wp = wd::watch_millis("LegacyImporter::with_try_import_super_key", 500);
+        let _wp = wd::watch("LegacyImporter::with_try_import_super_key");
 
         match key_accessor() {
             Ok(Some(result)) => return Ok(Some(result)),
@@ -374,7 +379,7 @@ impl LegacyImporter {
     /// Deletes all keys belonging to the given namespace, importing them into the database
     /// for subsequent garbage collection if necessary.
     pub fn bulk_delete_uid(&self, domain: Domain, nspace: i64) -> Result<()> {
-        let _wp = wd::watch_millis("LegacyImporter::bulk_delete_uid", 500);
+        let _wp = wd::watch("LegacyImporter::bulk_delete_uid");
 
         let uid = match (domain, nspace) {
             (Domain::APP, nspace) => nspace as u32,
@@ -397,7 +402,7 @@ impl LegacyImporter {
         user_id: u32,
         keep_non_super_encrypted_keys: bool,
     ) -> Result<()> {
-        let _wp = wd::watch_millis("LegacyImporter::bulk_delete_user", 500);
+        let _wp = wd::watch("LegacyImporter::bulk_delete_user");
 
         let result = self.do_serialized(move |importer_state| {
             importer_state
@@ -445,7 +450,7 @@ impl LegacyImporterState {
 
         match self
             .db
-            .load_super_key(&USER_SUPER_KEY, user_id)
+            .load_super_key(&USER_AFTER_FIRST_UNLOCK_SUPER_KEY, user_id)
             .context(ks_err!("Failed to load super key"))?
         {
             Some((_, entry)) => Ok(entry.id()),
@@ -724,7 +729,7 @@ impl LegacyImporterState {
             self.db
                 .store_super_key(
                     user_id,
-                    &USER_SUPER_KEY,
+                    &USER_AFTER_FIRST_UNLOCK_SUPER_KEY,
                     &blob,
                     &blob_metadata,
                     &KeyMetaData::new(),
@@ -767,7 +772,7 @@ impl LegacyImporterState {
 
         let super_key_id = self
             .db
-            .load_super_key(&USER_SUPER_KEY, user_id)
+            .load_super_key(&USER_AFTER_FIRST_UNLOCK_SUPER_KEY, user_id)
             .context(ks_err!("Failed to load super key"))?
             .map(|(_, entry)| entry.id());
 
@@ -909,15 +914,16 @@ fn get_key_characteristics_without_app_data(
     uuid: &Uuid,
     blob: &[u8],
 ) -> Result<(Vec<KeyParameter>, Option<Vec<u8>>)> {
-    let (km_dev, _) = crate::globals::get_keymint_dev_by_uuid(uuid)
+    let (km_dev, info) = crate::globals::get_keymint_dev_by_uuid(uuid)
         .with_context(|| ks_err!("Trying to get km device for id {:?}", uuid))?;
 
     let (characteristics, upgraded_blob) = upgrade_keyblob_if_required_with(
         &*km_dev,
+        info.versionNumber,
         blob,
         &[],
         |blob| {
-            let _wd = wd::watch_millis("Calling GetKeyCharacteristics.", 500);
+            let _wd = wd::watch("Calling GetKeyCharacteristics.");
             map_km_error(km_dev.getKeyCharacteristics(blob, &[], &[]))
         },
         |_| Ok(()),

@@ -912,7 +912,8 @@ pub enum KeyParameterValue {
     /// The time in seconds for which the key is authorized for use, after user authentication
     #[key_param(tag = AUTH_TIMEOUT, field = Integer)]
     AuthTimeout(i32),
-    /// The key may be used after authentication timeout if device is still on-body
+    /// The key's authentication timeout, if it has one, is automatically expired when the device is
+    /// removed from the user's body. No longer implemented; this tag is no longer enforced.
     #[key_param(tag = ALLOW_WHILE_ON_BODY, field = BoolValue)]
     AllowWhileOnBody,
     /// The key must be unusable except when the user has provided proof of physical presence
@@ -1216,7 +1217,7 @@ mod storage_tests {
     use crate::key_parameter::*;
     use anyhow::Result;
     use rusqlite::types::ToSql;
-    use rusqlite::{params, Connection, NO_PARAMS};
+    use rusqlite::{params, Connection};
 
     /// Test initializing a KeyParameter (with key parameter value corresponding to an enum of i32)
     /// from a database table row.
@@ -1423,7 +1424,7 @@ mod storage_tests {
                                 tag INTEGER,
                                 data ANY,
                                 security_level INTEGER);",
-            NO_PARAMS,
+            [],
         )
         .context("Failed to initialize \"keyparameter\" table.")?;
         Ok(db)
@@ -1459,7 +1460,7 @@ mod storage_tests {
     fn query_from_keyparameter(db: &Connection) -> Result<KeyParameter> {
         let mut stmt =
             db.prepare("SELECT tag, data, security_level FROM persistent.keyparameter")?;
-        let mut rows = stmt.query(NO_PARAMS)?;
+        let mut rows = stmt.query([])?;
         let row = rows.next()?.unwrap();
         KeyParameter::new_from_sql(
             Tag(row.get(0)?),

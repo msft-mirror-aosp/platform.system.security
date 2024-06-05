@@ -211,13 +211,10 @@ impl KeyMintDevice {
                         KeyBlob::NonSensitive(key_blob_vec),
                         |key_blob| {
                             map_km_error({
-                                let _wp = wd::watch_millis(
-                                    concat!(
-                                        "In KeyMintDevice::lookup_or_generate_key: ",
-                                        "calling getKeyCharacteristics."
-                                    ),
-                                    500,
-                                );
+                                let _wp = wd::watch(concat!(
+                                    "In KeyMintDevice::lookup_or_generate_key: ",
+                                    "calling getKeyCharacteristics."
+                                ));
                                 self.km_dev.getKeyCharacteristics(key_blob, &[], &[])
                             })
                         },
@@ -263,35 +260,31 @@ impl KeyMintDevice {
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        match f(&key_blob) {
-            Err(Error::Km(ErrorCode::KEY_REQUIRES_UPGRADE)) => {
-                let upgraded_blob = map_km_error({
-                    let _wp = wd::watch_millis(
-                        "In KeyMintDevice::upgrade_keyblob_if_required_with: calling upgradeKey.",
-                        500,
-                    );
-                    self.km_dev.upgradeKey(&key_blob, &[])
-                })
-                .context(ks_err!("Upgrade failed"))?;
-
+        let (f_result, upgraded_blob) = crate::utils::upgrade_keyblob_if_required_with(
+            &*self.km_dev,
+            self.version(),
+            &key_blob,
+            &[],
+            f,
+            |upgraded_blob| {
                 let mut new_blob_metadata = BlobMetaData::new();
                 new_blob_metadata.add(BlobMetaEntry::KmUuid(self.km_uuid));
 
                 db.set_blob(
                     key_id_guard,
                     SubComponentType::KEY_BLOB,
-                    Some(&upgraded_blob),
+                    Some(upgraded_blob),
                     Some(&new_blob_metadata),
                 )
                 .context(ks_err!("Failed to insert upgraded blob into the database"))?;
-
-                Ok((
-                    f(&upgraded_blob).context(ks_err!("Closure failed after upgrade"))?,
-                    KeyBlob::NonSensitive(upgraded_blob),
-                ))
-            }
-            result => Ok((result.context(ks_err!("Closure failed"))?, key_blob)),
-        }
+                Ok(())
+            },
+        )?;
+        let returned_blob = match upgraded_blob {
+            None => key_blob,
+            Some(upgraded_blob) => KeyBlob::NonSensitive(upgraded_blob),
+        };
+        Ok((f_result, returned_blob))
     }
 
     /// Use the created key in an operation that can be done with
@@ -312,7 +305,7 @@ impl KeyMintDevice {
         let (begin_result, _) = self
             .upgrade_keyblob_if_required_with(db, key_id_guard, key_blob, |blob| {
                 map_km_error({
-                    let _wp = wd::watch_millis("In use_key_in_one_step: calling: begin", 500);
+                    let _wp = wd::watch("In use_key_in_one_step: calling: begin");
                     self.km_dev.begin(purpose, blob, operation_parameters, auth_token)
                 })
             })
@@ -320,7 +313,7 @@ impl KeyMintDevice {
         let operation: Strong<dyn IKeyMintOperation> =
             begin_result.operation.ok_or_else(Error::sys).context(ks_err!("Operation missing"))?;
         map_km_error({
-            let _wp = wd::watch_millis("In use_key_in_one_step: calling: finish", 500);
+            let _wp = wd::watch("In use_key_in_one_step: calling: finish");
             operation.finish(Some(input), None, None, None, None)
         })
         .context(ks_err!("Failed to finish operation."))

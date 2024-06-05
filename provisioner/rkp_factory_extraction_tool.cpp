@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <aidl/android/hardware/drm/IDrmFactory.h>
 #include <aidl/android/hardware/security/keymint/IRemotelyProvisionedComponent.h>
 #include <android/binder_manager.h>
 #include <cppbor.h>
@@ -23,11 +24,14 @@
 #include <remote_prov/remote_prov_utils.h>
 #include <sys/random.h>
 
+#include <future>
 #include <string>
 #include <vector>
 
+#include "DrmRkpAdapter.h"
 #include "rkp_factory_extraction_lib.h"
 
+using aidl::android::hardware::drm::IDrmFactory;
 using aidl::android::hardware::security::keymint::IRemotelyProvisionedComponent;
 using aidl::android::hardware::security::keymint::remote_prov::jsonEncodeCsrWithBuild;
 
@@ -39,6 +43,8 @@ DEFINE_bool(self_test, true,
             "If true, this tool performs a self-test, validating the payload for correctness. "
             "This checks that the device on the factory line is producing valid output "
             "before attempting to upload the output to the device info service.");
+DEFINE_string(serialno_prop, "ro.serialno",
+              "The property of getting serial number. Defaults to 'ro.serialno'.");
 
 namespace {
 
@@ -47,12 +53,16 @@ constexpr std::string_view kBinaryCsrOutput = "csr";     // Just the raw csr as 
 constexpr std::string_view kBuildPlusCsr = "build+csr";  // Text-encoded (JSON) build
                                                          // fingerprint plus CSR.
 
+std::string getFullServiceName(const char* descriptor, const char* name) {
+    return  std::string(descriptor) + "/" + name;
+}
+
 void writeOutput(const std::string instance_name, const Array& csr) {
     if (FLAGS_output_format == kBinaryCsrOutput) {
         auto bytes = csr.encode();
         std::copy(bytes.begin(), bytes.end(), std::ostream_iterator<char>(std::cout));
     } else if (FLAGS_output_format == kBuildPlusCsr) {
-        auto [json, error] = jsonEncodeCsrWithBuild(instance_name, csr);
+        auto [json, error] = jsonEncodeCsrWithBuild(instance_name, csr, FLAGS_serialno_prop);
         if (!error.empty()) {
             std::cerr << "Error JSON encoding the output: " << error;
             exit(1);
@@ -67,13 +77,28 @@ void writeOutput(const std::string instance_name, const Array& csr) {
     }
 }
 
+void getCsrForIRpc(const char* descriptor, const char* name, IRemotelyProvisionedComponent* irpc) {
+    auto [request, errMsg] = getCsr(name, irpc, FLAGS_self_test);
+    auto fullName = getFullServiceName(descriptor, name);
+    if (!request) {
+        std::cerr << "Unable to build CSR for '" << fullName << ": " << errMsg << std::endl;
+        exit(-1);
+    }
+
+    writeOutput(std::string(name), *request);
+}
+
 // Callback for AServiceManager_forEachDeclaredInstance that writes out a CSR
 // for every IRemotelyProvisionedComponent.
 void getCsrForInstance(const char* name, void* /*context*/) {
-    const std::vector<uint8_t> challenge = generateChallenge();
-
-    auto fullName = std::string(IRemotelyProvisionedComponent::descriptor) + "/" + name;
-    AIBinder* rkpAiBinder = AServiceManager_getService(fullName.c_str());
+    auto fullName = getFullServiceName(IRemotelyProvisionedComponent::descriptor, name);
+    std::future<AIBinder*> wait_for_service_func =
+        std::async(std::launch::async, AServiceManager_waitForService, fullName.c_str());
+    if (wait_for_service_func.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
+        std::cerr << "Wait for service timed out after 10 seconds: " << fullName;
+        exit(-1);
+    }
+    AIBinder* rkpAiBinder = wait_for_service_func.get();
     ::ndk::SpAIBinder rkp_binder(rkpAiBinder);
     auto rkp_service = IRemotelyProvisionedComponent::fromBinder(rkp_binder);
     if (!rkp_service) {
@@ -81,13 +106,7 @@ void getCsrForInstance(const char* name, void* /*context*/) {
         exit(-1);
     }
 
-    auto [request, errMsg] = getCsr(name, rkp_service.get(), FLAGS_self_test);
-    if (!request) {
-        std::cerr << "Unable to build CSR for '" << fullName << ": " << errMsg << std::endl;
-        exit(-1);
-    }
-
-    writeOutput(std::string(name), *request);
+    getCsrForIRpc(IRemotelyProvisionedComponent::descriptor, name, rkp_service.get());
 }
 
 }  // namespace
@@ -97,6 +116,11 @@ int main(int argc, char** argv) {
 
     AServiceManager_forEachDeclaredInstance(IRemotelyProvisionedComponent::descriptor,
                                             /*context=*/nullptr, getCsrForInstance);
+
+    // Append drm csr's
+    for (auto const& e : android::mediadrm::getDrmRemotelyProvisionedComponents()) {
+        getCsrForIRpc(IDrmFactory::descriptor, e.first.c_str(), e.second.get());
+    }
 
     return 0;
 }

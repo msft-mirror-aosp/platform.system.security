@@ -126,8 +126,10 @@ impl KeystoreService {
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
         let caller_uid = ThreadState::get_calling_uid();
 
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
@@ -181,8 +183,10 @@ impl KeystoreService {
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with::<_, Result<()>>(|db| {
             let entry = match LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -315,8 +319,10 @@ impl KeystoreService {
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with(|db| {
             LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -337,8 +343,10 @@ impl KeystoreService {
         access_vector: permission::KeyPermSet,
     ) -> Result<KeyDescriptor> {
         let caller_uid = ThreadState::get_calling_uid();
-        let super_key =
-            SUPER_KEY.read().unwrap().get_per_boot_key_by_user_id(uid_to_android_user(caller_uid));
+        let super_key = SUPER_KEY
+            .read()
+            .unwrap()
+            .get_after_first_unlock_key_by_user_id(uid_to_android_user(caller_uid));
 
         DB.with(|db| {
             LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
@@ -379,7 +387,7 @@ impl IKeystoreService for KeystoreService {
         map_or_log_err(self.get_security_level(security_level), Ok)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::Result<KeyEntryResponse> {
-        let _wp = wd::watch_millis("IKeystoreService::get_key_entry", 500);
+        let _wp = wd::watch("IKeystoreService::get_key_entry");
         map_or_log_err(self.get_key_entry(key), Ok)
     }
     fn updateSubcomponent(
@@ -388,15 +396,15 @@ impl IKeystoreService for KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::updateSubcomponent", 500);
+        let _wp = wd::watch("IKeystoreService::updateSubcomponent");
         map_or_log_err(self.update_subcomponent(key, public_cert, certificate_chain), Ok)
     }
     fn listEntries(&self, domain: Domain, namespace: i64) -> binder::Result<Vec<KeyDescriptor>> {
-        let _wp = wd::watch_millis("IKeystoreService::listEntries", 500);
+        let _wp = wd::watch("IKeystoreService::listEntries");
         map_or_log_err(self.list_entries(domain, namespace), Ok)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::deleteKey", 500);
+        let _wp = wd::watch("IKeystoreService::deleteKey");
         let result = self.delete_key(key);
         log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());
         map_or_log_err(result, Ok)
@@ -407,11 +415,11 @@ impl IKeystoreService for KeystoreService {
         grantee_uid: i32,
         access_vector: i32,
     ) -> binder::Result<KeyDescriptor> {
-        let _wp = wd::watch_millis("IKeystoreService::grant", 500);
+        let _wp = wd::watch("IKeystoreService::grant");
         map_or_log_err(self.grant(key, grantee_uid, access_vector.into()), Ok)
     }
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::ungrant", 500);
+        let _wp = wd::watch("IKeystoreService::ungrant");
         map_or_log_err(self.ungrant(key, grantee_uid), Ok)
     }
     fn listEntriesBatched(
@@ -420,12 +428,12 @@ impl IKeystoreService for KeystoreService {
         namespace: i64,
         start_past_alias: Option<&str>,
     ) -> binder::Result<Vec<KeyDescriptor>> {
-        let _wp = wd::watch_millis("IKeystoreService::listEntriesBatched", 500);
+        let _wp = wd::watch("IKeystoreService::listEntriesBatched");
         map_or_log_err(self.list_entries_batched(domain, namespace, start_past_alias), Ok)
     }
 
     fn getNumberOfEntries(&self, domain: Domain, namespace: i64) -> binder::Result<i32> {
-        let _wp = wd::watch_millis("IKeystoreService::getNumberOfEntries", 500);
+        let _wp = wd::watch("IKeystoreService::getNumberOfEntries");
         map_or_log_err(self.count_num_entries(domain, namespace), Ok)
     }
 }

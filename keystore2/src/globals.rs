@@ -16,32 +16,36 @@
 //! database connections and connections to services that Keystore needs
 //! to talk to.
 
-use crate::ks_err;
+use crate::async_task::AsyncTask;
 use crate::gc::Gc;
+use crate::km_compat::{BacklevelKeyMintWrapper, KeyMintV1};
+use crate::ks_err;
 use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_importer::LegacyImporter;
 use crate::super_key::SuperKeyManager;
 use crate::utils::watchdog as wd;
-use crate::{async_task::AsyncTask, database::MonotonicRawTime};
 use crate::{
     database::KeystoreDB,
     database::Uuid,
     error::{map_binder_status, map_binder_status_code, Error, ErrorCode},
 };
-use crate::km_compat::{KeyMintV1, BacklevelKeyMintWrapper};
 use crate::{enforcements::Enforcements, error::map_km_error};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     IKeyMintDevice::BpKeyMintDevice, IKeyMintDevice::IKeyMintDevice,
     KeyMintHardwareInfo::KeyMintHardwareInfo, SecurityLevel::SecurityLevel,
 };
-use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
-    ISecureClock::ISecureClock,
-};
 use android_hardware_security_keymint::binder::{StatusCode, Strong};
+use android_hardware_security_rkp::aidl::android::hardware::security::keymint::{
+    IRemotelyProvisionedComponent::BpRemotelyProvisionedComponent,
+    IRemotelyProvisionedComponent::IRemotelyProvisionedComponent,
+};
+use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
+    ISecureClock::BpSecureClock, ISecureClock::ISecureClock,
+};
 use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 use anyhow::{Context, Result};
-use binder::FromIBinder;
 use binder::get_declared_instances;
+use binder::FromIBinder;
 use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{cell::RefCell, sync::Once};
@@ -64,7 +68,6 @@ pub fn create_thread_local_db() -> KeystoreDB {
 
     DB_INIT.call_once(|| {
         log::info!("Touching Keystore 2.0 database for this first time since boot.");
-        db.insert_last_off_body(MonotonicRawTime::now());
         log::info!("Calling cleanup leftovers.");
         let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup.");
         if n != 0 {
@@ -162,7 +165,7 @@ lazy_static! {
         (
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
-                let _wp = wd::watch_millis("In invalidate key closure: calling deleteKey", 500);
+                let _wp = wd::watch("In invalidate key closure: calling deleteKey");
                 map_km_error(km_dev.deleteKey(blob))
                     .context(ks_err!("Trying to invalidate key blob."))
             }),
@@ -174,8 +177,8 @@ lazy_static! {
 }
 
 /// Determine the service name for a KeyMint device of the given security level
-/// which implements at least the specified version of the `IKeyMintDevice`
-/// interface.
+/// gotten by binder service from the device and determining what services
+/// are available.
 fn keymint_service_name(security_level: &SecurityLevel) -> Result<Option<String>> {
     let keymint_descriptor: &str = <BpKeyMintDevice as IKeyMintDevice>::get_descriptor();
     let keymint_instances = get_declared_instances(keymint_descriptor).unwrap();
@@ -212,10 +215,10 @@ fn keymint_service_name(security_level: &SecurityLevel) -> Result<Option<String>
 fn connect_keymint(
     security_level: &SecurityLevel,
 ) -> Result<(Strong<dyn IKeyMintDevice>, KeyMintHardwareInfo)> {
-    // Connects to binder to get the current keymint interface and
-    // based on the security level returns a service name to connect
-    // to.
-    let service_name = keymint_service_name(security_level).context(ks_err!("Get service name"))?;
+    // Show the keymint interface that is registered in the binder
+    // service and use the security level to get the service name.
+    let service_name = keymint_service_name(security_level)
+        .context(ks_err!("Get service name from binder service"))?;
 
     let (keymint, hal_version) = if let Some(service_name) = service_name {
         let km: Strong<dyn IKeyMintDevice> =
@@ -243,7 +246,11 @@ fn connect_keymint(
                     }
                     e => e,
                 })
-                .context(ks_err!("Trying to get Legacy wrapper."))?,
+                .context(ks_err!(
+                    "Trying to get Legacy wrapper. Attempt to get keystore \
+                    compat service for security level {:?}",
+                    *security_level
+                ))?,
             None,
         )
     };
@@ -299,7 +306,7 @@ fn connect_keymint(
         }
     };
 
-    let wp = wd::watch_millis("In connect_keymint: calling getHardwareInfo()", 500);
+    let wp = wd::watch("In connect_keymint: calling getHardwareInfo()");
     let mut hw_info =
         map_km_error(keymint.getHardwareInfo()).context(ks_err!("Failed to get hardware info."))?;
     drop(wp);
@@ -359,19 +366,17 @@ pub fn get_keymint_devices() -> Vec<Strong<dyn IKeyMintDevice>> {
     KEY_MINT_DEVICES.lock().unwrap().devices()
 }
 
-static TIME_STAMP_SERVICE_NAME: &str = "android.hardware.security.secureclock.ISecureClock";
-
 /// Make a new connection to a secure clock service.
 /// If no native SecureClock device can be found brings up the compatibility service and attempts
 /// to connect to the legacy wrapper.
 fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
-    let secureclock_instances =
-        get_declared_instances("android.hardware.security.secureclock.ISecureClock").unwrap();
+    let secure_clock_descriptor: &str = <BpSecureClock as ISecureClock>::get_descriptor();
+    let secureclock_instances = get_declared_instances(secure_clock_descriptor).unwrap();
 
     let secure_clock_available =
         secureclock_instances.iter().any(|instance| *instance == "default");
 
-    let default_time_stamp_service_name = format!("{}/default", TIME_STAMP_SERVICE_NAME);
+    let default_time_stamp_service_name = format!("{}/default", secure_clock_descriptor);
 
     let secureclock = if secure_clock_available {
         map_binder_status_code(binder::get_interface(&default_time_stamp_service_name))
@@ -392,7 +397,7 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
                 }
                 e => e,
             })
-            .context(ks_err!("Trying to get Legacy wrapper."))
+            .context(ks_err!("Failed attempt to get legacy secure clock."))
     }?;
 
     Ok(secureclock)
@@ -411,25 +416,23 @@ pub fn get_timestamp_service() -> Result<Strong<dyn ISecureClock>> {
     }
 }
 
-static REMOTE_PROVISIONING_HAL_SERVICE_NAME: &str =
-    "android.hardware.security.keymint.IRemotelyProvisionedComponent";
-
 /// Get the service name of a remotely provisioned component corresponding to given security level.
 pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -> Result<String> {
-    let remotely_prov_instances =
-        get_declared_instances(REMOTE_PROVISIONING_HAL_SERVICE_NAME).unwrap();
+    let remote_prov_descriptor: &str =
+        <BpRemotelyProvisionedComponent as IRemotelyProvisionedComponent>::get_descriptor();
+    let remotely_prov_instances = get_declared_instances(remote_prov_descriptor).unwrap();
 
     match *security_level {
         SecurityLevel::TRUSTED_ENVIRONMENT => {
             if remotely_prov_instances.iter().any(|instance| *instance == "default") {
-                Some(format!("{}/default", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+                Some(format!("{}/default", remote_prov_descriptor))
             } else {
                 None
             }
         }
         SecurityLevel::STRONGBOX => {
             if remotely_prov_instances.iter().any(|instance| *instance == "strongbox") {
-                Some(format!("{}/strongbox", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+                Some(format!("{}/strongbox", remote_prov_descriptor))
             } else {
                 None
             }
@@ -437,5 +440,5 @@ pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -
         _ => None,
     }
     .ok_or(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-    .context(ks_err!())
+    .context(ks_err!("Failed to get rpc for sec level {:?}", *security_level))
 }
