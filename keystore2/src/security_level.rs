@@ -515,7 +515,7 @@ impl KeystoreSecurityLevel {
         flags: i32,
         _entropy: &[u8],
     ) -> Result<KeyMetadata> {
-        log::info!("security_level: generate_key(key={:?})", key);
+        log::info!("security_level: generate_key(key={:?})", key.alias);
         if key.domain != Domain::BLOB && key.alias.is_none() {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context(ks_err!("Alias must be specified"));
@@ -586,9 +586,8 @@ impl KeystoreSecurityLevel {
                     },
                 )
                 .context(ks_err!(
-                    "While generating Key {:?} with remote \
-                    provisioned attestation key and params: {:?}.",
-                    key.alias,
+                    "While generating with a user-generated \
+                     attestation key, params: {:?}.",
                     log_security_safe_params(&params)
                 ))
                 .map(|(result, _)| result),
@@ -632,9 +631,8 @@ impl KeystoreSecurityLevel {
                 self.keymint.generateKey(&params, None)
             })
             .context(ks_err!(
-                "While generating Key {:?} with remote \
-                provisioned attestation key and params: {:?}.",
-                key.alias,
+                "While generating without a provided \
+                attestation key and params: {:?}.",
                 log_security_safe_params(&params)
             )),
         }
@@ -864,7 +862,6 @@ impl KeystoreSecurityLevel {
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        log::info!("upgrade_keyblob_if_required_with(key_id={:?})", key_id_guard);
         let (v, upgraded_blob) = crate::utils::upgrade_keyblob_if_required_with(
             &*self.keymint,
             self.hw_info.versionNumber,
@@ -882,7 +879,7 @@ impl KeystoreSecurityLevel {
                 }
             },
         )
-        .context(ks_err!())?;
+        .context(ks_err!("upgrade_keyblob_if_required_with(key_id={:?})", key_id_guard))?;
 
         // If no upgrade was needed, use the opportunity to reencrypt the blob if required
         // and if the a key_id_guard is held. Note: key_id_guard can only be Some if no
@@ -905,10 +902,6 @@ impl KeystoreSecurityLevel {
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        log::info!(
-            "upgrade_rkpd_keyblob_if_required_with(params={:?})",
-            log_security_safe_params(params)
-        );
         let rpc_name = get_remotely_provisioned_component_name(&self.security_level)
             .context(ks_err!("Trying to get IRPC name."))?;
         crate::utils::upgrade_keyblob_if_required_with(
@@ -926,7 +919,10 @@ impl KeystoreSecurityLevel {
                 }
             },
         )
-        .context(ks_err!())
+        .context(ks_err!(
+            "upgrade_rkpd_keyblob_if_required_with(params={:?})",
+            log_security_safe_params(params)
+        ))
     }
 
     fn convert_storage_key_to_ephemeral(
