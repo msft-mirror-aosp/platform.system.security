@@ -162,6 +162,11 @@ aconfig_declarations {
     srcs: ["aconfig/flags.aconfig"],
 }
 
+java_aconfig_library {
+    name: "keystore2_flags_java",
+    aconfig_declarations: "keystore2_flags",
+}
+
 rust_aconfig_library {
     name: "libkeystore2_flags_rust",
     crate_name: "keystore2_flags",
