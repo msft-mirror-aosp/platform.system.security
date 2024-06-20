@@ -177,9 +177,7 @@ impl Maintenance {
         let (km_dev, _, _) =
             get_keymint_device(&sec_level).context(ks_err!("getting keymint device"))?;
 
-        let _wp = wd::watch_millis_with("In call_with_watchdog", 500, move || {
-            format!("Seclevel: {:?} Op: {}", sec_level, name)
-        });
+        let _wp = wd::watch_millis_with("In call_with_watchdog", 500, (sec_level, name));
         map_km_error(op(km_dev)).with_context(|| ks_err!("calling {}", name))?;
         Ok(())
     }

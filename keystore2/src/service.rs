@@ -381,9 +381,7 @@ impl IKeystoreService for KeystoreService {
         &self,
         security_level: SecurityLevel,
     ) -> binder::Result<Strong<dyn IKeystoreSecurityLevel>> {
-        let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, move || {
-            format!("security_level: {}", security_level.0)
-        });
+        let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, security_level);
         self.get_security_level(security_level).map_err(into_logged_binder)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::Result<KeyEntryResponse> {

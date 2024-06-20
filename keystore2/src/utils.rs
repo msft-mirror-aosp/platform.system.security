@@ -551,8 +551,8 @@ fn estimate_safe_amount_to_return(
     items_to_return
 }
 
-/// List all key aliases for a given domain + namespace. whose alias is greater
-/// than start_past_alias (if provided).
+/// Log the key parameters, excluding sensitive ones such as
+/// APPLICATION_DATA and APPLICATION_ID
 pub fn list_key_entries(
     db: &mut KeystoreDB,
     domain: Domain,
@@ -589,6 +589,16 @@ pub fn count_key_entries(db: &mut KeystoreDB, domain: Domain, namespace: i64) ->
     let num_keys_in_db = db.count_keys(domain, namespace, KeyType::Client)?;
 
     Ok((legacy_keys.len() + num_keys_in_db) as i32)
+}
+
+/// For params remove sensitive data before returning a string for logging
+pub fn log_security_safe_params(params: &[KmKeyParameter]) -> String {
+    format!(
+        "{:?}",
+        params
+            .iter()
+            .filter(|kp| (kp.tag != Tag::APPLICATION_ID && kp.tag != Tag::APPLICATION_DATA))
+    )
 }
 
 /// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
