@@ -110,14 +110,12 @@ impl KeystoreSecurityLevel {
 
     fn watch_millis(&self, id: &'static str, millis: u64) -> Option<wd::WatchPoint> {
         let sec_level = self.security_level;
-        wd::watch_millis_with(id, millis, move || format!("SecurityLevel {:?}", sec_level))
+        wd::watch_millis_with(id, millis, sec_level)
     }
 
     fn watch(&self, id: &'static str) -> Option<wd::WatchPoint> {
         let sec_level = self.security_level;
-        wd::watch_millis_with(id, wd::DEFAULT_TIMEOUT_MS, move || {
-            format!("SecurityLevel {:?}", sec_level)
-        })
+        wd::watch_millis_with(id, wd::DEFAULT_TIMEOUT_MS, sec_level)
     }
 
     fn store_new_key(
