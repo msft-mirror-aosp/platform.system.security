@@ -22,7 +22,7 @@ use crate::globals::get_keymint_device;
 use crate::globals::{DB, LEGACY_IMPORTER, SUPER_KEY};
 use crate::ks_err;
 use crate::permission::{KeyPerm, KeystorePerm};
-use crate::super_key::{SuperKeyManager, UserState};
+use crate::super_key::SuperKeyManager;
 use crate::utils::{
     check_get_app_uids_affected_by_sid_permissions, check_key_permission,
     check_keystore_permission, uid_to_android_user, watchdog as wd,
@@ -67,40 +67,6 @@ impl Maintenance {
             Self { delete_listener },
             BinderFeatures { set_requesting_sid: true, ..BinderFeatures::default() },
         ))
-    }
-
-    fn on_user_password_changed(user_id: i32, password: Option<Password>) -> Result<()> {
-        // Check permission. Function should return if this failed. Therefore having '?' at the end
-        // is very important.
-        check_keystore_permission(KeystorePerm::ChangePassword).context(ks_err!())?;
-
-        let mut skm = SUPER_KEY.write().unwrap();
-
-        if let Some(pw) = password.as_ref() {
-            DB.with(|db| {
-                skm.unlock_unlocked_device_required_keys(&mut db.borrow_mut(), user_id as u32, pw)
-            })
-            .context(ks_err!("unlock_unlocked_device_required_keys failed"))?;
-        }
-
-        if let UserState::BeforeFirstUnlock = DB
-            .with(|db| skm.get_user_state(&mut db.borrow_mut(), &LEGACY_IMPORTER, user_id as u32))
-            .context(ks_err!("Could not get user state while changing password!"))?
-        {
-            // Error - password can not be changed when the device is locked
-            return Err(Error::Rc(ResponseCode::LOCKED)).context(ks_err!("Device is locked."));
-        }
-
-        DB.with(|db| match password {
-            Some(pass) => {
-                skm.init_user(&mut db.borrow_mut(), &LEGACY_IMPORTER, user_id as u32, &pass)
-            }
-            None => {
-                // User transitioned to swipe.
-                skm.reset_user(&mut db.borrow_mut(), &LEGACY_IMPORTER, user_id as u32)
-            }
-        })
-        .context(ks_err!("Failed to change user password!"))
     }
 
     fn add_or_remove_user(&self, user_id: i32) -> Result<()> {
@@ -294,17 +260,6 @@ impl Maintenance {
 impl Interface for Maintenance {}
 
 impl IKeystoreMaintenance for Maintenance {
-    fn onUserPasswordChanged(&self, user_id: i32, password: Option<&[u8]>) -> BinderResult<()> {
-        log::info!(
-            "onUserPasswordChanged(user={}, password.is_some()={})",
-            user_id,
-            password.is_some()
-        );
-        let _wp = wd::watch("IKeystoreMaintenance::onUserPasswordChanged");
-        Self::on_user_password_changed(user_id, password.map(|pw| pw.into()))
-            .map_err(into_logged_binder)
-    }
-
     fn onUserAdded(&self, user_id: i32) -> BinderResult<()> {
         log::info!("onUserAdded(user={user_id})");
         let _wp = wd::watch("IKeystoreMaintenance::onUserAdded");
