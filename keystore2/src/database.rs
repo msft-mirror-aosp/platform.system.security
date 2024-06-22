@@ -2371,15 +2371,8 @@ impl KeystoreDB {
         .context(ks_err!())
     }
 
-    /// Delete the keys created on behalf of the user, denoted by the user id.
-    /// Delete all the keys unless 'keep_non_super_encrypted_keys' set to true.
-    /// Returned boolean is to hint the garbage collector to delete the unbound keys.
-    /// The caller of this function should notify the gc if the returned value is true.
-    pub fn unbind_keys_for_user(
-        &mut self,
-        user_id: u32,
-        keep_non_super_encrypted_keys: bool,
-    ) -> Result<()> {
+    /// Deletes all keys for the given user, including both client keys and super keys.
+    pub fn unbind_keys_for_user(&mut self, user_id: u32) -> Result<()> {
         let _wp = wd::watch("KeystoreDB::unbind_keys_for_user");
 
         self.with_transaction(Immediate("TX_unbind_keys_for_user"), |tx| {
@@ -2427,17 +2420,6 @@ impl KeystoreDB {
 
             let mut notify_gc = false;
             for key_id in key_ids {
-                if keep_non_super_encrypted_keys {
-                    // Load metadata and filter out non-super-encrypted keys.
-                    if let (_, Some((_, blob_metadata)), _, _) =
-                        Self::load_blob_components(key_id, KeyEntryLoadBits::KM, tx)
-                            .context(ks_err!("Trying to load blob info."))?
-                    {
-                        if blob_metadata.encrypted_by().is_none() {
-                            continue;
-                        }
-                    }
-                }
                 notify_gc = Self::mark_unreferenced(tx, key_id)
                     .context("In unbind_keys_for_user.")?
                     || notify_gc;
@@ -4946,16 +4928,16 @@ pub mod tests {
     #[test]
     fn test_unbind_keys_for_user() -> Result<()> {
         let mut db = new_test_db()?;
-        db.unbind_keys_for_user(1, false)?;
+        db.unbind_keys_for_user(1)?;
 
         make_test_key_entry(&mut db, Domain::APP, 210000, TEST_ALIAS, None)?;
         make_test_key_entry(&mut db, Domain::APP, 110000, TEST_ALIAS, None)?;
-        db.unbind_keys_for_user(2, false)?;
+        db.unbind_keys_for_user(2)?;
 
         assert_eq!(1, db.list_past_alias(Domain::APP, 110000, KeyType::Client, None)?.len());
         assert_eq!(0, db.list_past_alias(Domain::APP, 210000, KeyType::Client, None)?.len());
 
-        db.unbind_keys_for_user(1, true)?;
+        db.unbind_keys_for_user(1)?;
         assert_eq!(0, db.list_past_alias(Domain::APP, 110000, KeyType::Client, None)?.len());
 
         Ok(())
@@ -5009,28 +4991,14 @@ pub mod tests {
         assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
         assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
 
-        // Delete only encrypted keys.
-        db.unbind_keys_for_user(1, true)?;
+        // Delete all keys for user 1.
+        db.unbind_keys_for_user(1)?;
 
-        // The encrypted superkey should be gone now.
-        assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
-        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
-
-        // Reinsert the encrypted key.
-        db.store_super_key(1, &key_name_enc, &encrypted_super_key, &metadata, &KeyMetaData::new())?;
-
-        // Check that both can be found in the database, again..
-        assert!(db.load_super_key(&key_name_enc, 1)?.is_some());
-        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
-
-        // Delete all even unencrypted keys.
-        db.unbind_keys_for_user(1, false)?;
-
-        // Both should be gone now.
+        // All of user 1's keys should be gone.
         assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
         assert!(db.load_super_key(&key_name_nonenc, 1)?.is_none());
 
-        // Check that the second pair of keys was untouched.
+        // User 2's keys should not have been touched.
         assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
         assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
 

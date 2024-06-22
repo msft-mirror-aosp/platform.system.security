@@ -576,13 +576,9 @@ impl SuperKeyManager {
         pw: &Password,
     ) -> Result<(Vec<u8>, BlobMetaData)> {
         let salt = generate_salt().context("In encrypt_with_password: Failed to generate salt.")?;
-        let derived_key = if android_security_flags::fix_unlocked_device_required_keys_v2() {
-            pw.derive_key_hkdf(&salt, AES_256_KEY_LENGTH)
-                .context(ks_err!("Failed to derive key from password."))?
-        } else {
-            pw.derive_key_pbkdf2(&salt, AES_256_KEY_LENGTH)
-                .context(ks_err!("Failed to derive password."))?
-        };
+        let derived_key = pw
+            .derive_key_hkdf(&salt, AES_256_KEY_LENGTH)
+            .context(ks_err!("Failed to derive key from password."))?;
         let mut metadata = BlobMetaData::new();
         metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::Password));
         metadata.add(BlobMetaEntry::Salt(salt));
@@ -879,9 +875,7 @@ impl SuperKeyManager {
     ) {
         let entry = self.data.user_keys.entry(user_id).or_default();
         if unlocking_sids.is_empty() {
-            if android_security_flags::fix_unlocked_device_required_keys_v2() {
-                entry.biometric_unlock = None;
-            }
+            entry.biometric_unlock = None;
         } else if let (Some(aes), Some(ecdh)) = (
             entry.unlocked_device_required_symmetric.as_ref().cloned(),
             entry.unlocked_device_required_private.as_ref().cloned(),
@@ -984,8 +978,7 @@ impl SuperKeyManager {
         user_id: UserId,
     ) -> Result<()> {
         let entry = self.data.user_keys.entry(user_id).or_default();
-        if android_security_flags::fix_unlocked_device_required_keys_v2()
-            && entry.unlocked_device_required_symmetric.is_some()
+        if entry.unlocked_device_required_symmetric.is_some()
             && entry.unlocked_device_required_private.is_some()
         {
             // If the keys are already cached in plaintext, then there is no need to decrypt the
@@ -1096,90 +1089,11 @@ impl SuperKeyManager {
         legacy_importer
             .bulk_delete_user(user_id, false)
             .context(ks_err!("Trying to delete legacy keys."))?;
-        db.unbind_keys_for_user(user_id, false).context(ks_err!("Error in unbinding keys."))?;
+        db.unbind_keys_for_user(user_id).context(ks_err!("Error in unbinding keys."))?;
 
         // Delete super key in cache, if exists.
         self.forget_all_keys_for_user(user_id);
         Ok(())
-    }
-
-    /// Deletes all authentication bound keys and super keys for the given user.  The user must be
-    /// unlocked before this function is called.  This function is used to transition a user to
-    /// swipe.
-    pub fn reset_user(
-        &mut self,
-        db: &mut KeystoreDB,
-        legacy_importer: &LegacyImporter,
-        user_id: UserId,
-    ) -> Result<()> {
-        log::info!("reset_user(user={user_id})");
-        match self.get_user_state(db, legacy_importer, user_id)? {
-            UserState::Uninitialized => {
-                Err(Error::sys()).context(ks_err!("Tried to reset an uninitialized user!"))
-            }
-            UserState::BeforeFirstUnlock => {
-                Err(Error::sys()).context(ks_err!("Tried to reset a locked user's password!"))
-            }
-            UserState::AfterFirstUnlock(_) => {
-                // Mark keys created on behalf of the user as unreferenced.
-                legacy_importer
-                    .bulk_delete_user(user_id, true)
-                    .context(ks_err!("Trying to delete legacy keys."))?;
-                db.unbind_keys_for_user(user_id, true)
-                    .context(ks_err!("Error in unbinding keys."))?;
-
-                // Delete super key in cache, if exists.
-                self.forget_all_keys_for_user(user_id);
-                Ok(())
-            }
-        }
-    }
-
-    /// If the user hasn't been initialized yet, then this function generates the user's
-    /// AfterFirstUnlock super key and sets the user's state to AfterFirstUnlock. Otherwise this
-    /// function returns an error.
-    pub fn init_user(
-        &mut self,
-        db: &mut KeystoreDB,
-        legacy_importer: &LegacyImporter,
-        user_id: UserId,
-        password: &Password,
-    ) -> Result<()> {
-        log::info!("init_user(user={user_id})");
-        match self.get_user_state(db, legacy_importer, user_id)? {
-            UserState::AfterFirstUnlock(_) | UserState::BeforeFirstUnlock => {
-                Err(Error::sys()).context(ks_err!("Tried to re-init an initialized user!"))
-            }
-            UserState::Uninitialized => {
-                // Generate a new super key.
-                let super_key =
-                    generate_aes256_key().context(ks_err!("Failed to generate AES 256 key."))?;
-                // Derive an AES256 key from the password and re-encrypt the super key
-                // before we insert it in the database.
-                let (encrypted_super_key, blob_metadata) =
-                    Self::encrypt_with_password(&super_key, password)
-                        .context(ks_err!("Failed to encrypt super key with password!"))?;
-
-                let key_entry = db
-                    .store_super_key(
-                        user_id,
-                        &USER_AFTER_FIRST_UNLOCK_SUPER_KEY,
-                        &encrypted_super_key,
-                        &blob_metadata,
-                        &KeyMetaData::new(),
-                    )
-                    .context(ks_err!("Failed to store super key."))?;
-
-                self.populate_cache_from_super_key_blob(
-                    user_id,
-                    USER_AFTER_FIRST_UNLOCK_SUPER_KEY.algorithm,
-                    key_entry,
-                    password,
-                )
-                .context(ks_err!("Failed to initialize user!"))?;
-                Ok(())
-            }
-        }
     }
 
     /// Initializes the given user by creating their super keys, both AfterFirstUnlock and
@@ -1354,7 +1268,7 @@ mod tests {
         assert!(skm
             .write()
             .unwrap()
-            .init_user(&mut keystore_db, &legacy_importer, USER_ID, pw)
+            .initialize_user(&mut keystore_db, &legacy_importer, USER_ID, pw, false)
             .is_ok());
         (skm, keystore_db, legacy_importer)
     }
@@ -1405,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_init_user() {
+    fn test_initialize_user() {
         let pw: Password = generate_password_blob();
         let (skm, mut keystore_db, legacy_importer) = setup_test(&pw);
         assert_unlocked(
@@ -1598,98 +1512,6 @@ mod tests {
             .unwrap());
     }
 
-    fn test_user_reset(locked: bool) {
-        let pw: Password = generate_password_blob();
-        let (skm, mut keystore_db, legacy_importer) = setup_test(&pw);
-        assert_unlocked(
-            &skm,
-            &mut keystore_db,
-            &legacy_importer,
-            USER_ID,
-            "The user was not unlocked after initialization!",
-        );
-
-        assert!(make_test_key_entry(
-            &mut keystore_db,
-            Domain::APP,
-            USER_ID.into(),
-            TEST_KEY_ALIAS,
-            None
-        )
-        .is_ok());
-        assert!(make_bootlevel_key_entry(
-            &mut keystore_db,
-            Domain::APP,
-            USER_ID.into(),
-            TEST_BOOT_KEY_ALIAS,
-            false
-        )
-        .is_ok());
-        assert!(keystore_db
-            .key_exists(Domain::APP, USER_ID.into(), TEST_KEY_ALIAS, KeyType::Client)
-            .unwrap());
-        assert!(keystore_db
-            .key_exists(Domain::APP, USER_ID.into(), TEST_BOOT_KEY_ALIAS, KeyType::Client)
-            .unwrap());
-
-        if locked {
-            skm.write().unwrap().data.user_keys.clear();
-            assert_locked(
-                &skm,
-                &mut keystore_db,
-                &legacy_importer,
-                USER_ID,
-                "Clearing the cache did not lock the user!",
-            );
-            assert!(skm
-                .write()
-                .unwrap()
-                .reset_user(&mut keystore_db, &legacy_importer, USER_ID)
-                .is_err());
-            assert_locked(
-                &skm,
-                &mut keystore_db,
-                &legacy_importer,
-                USER_ID,
-                "User state should not have changed!",
-            );
-
-            // Keys should still exist.
-            assert!(keystore_db
-                .key_exists(Domain::APP, USER_ID.into(), TEST_KEY_ALIAS, KeyType::Client)
-                .unwrap());
-            assert!(keystore_db
-                .key_exists(Domain::APP, USER_ID.into(), TEST_BOOT_KEY_ALIAS, KeyType::Client)
-                .unwrap());
-        } else {
-            assert!(skm
-                .write()
-                .unwrap()
-                .reset_user(&mut keystore_db, &legacy_importer, USER_ID)
-                .is_ok());
-            assert_uninitialized(
-                &skm,
-                &mut keystore_db,
-                &legacy_importer,
-                USER_ID,
-                "The user was not reset!",
-            );
-            assert!(!skm
-                .write()
-                .unwrap()
-                .super_key_exists_in_db_for_user(&mut keystore_db, &legacy_importer, USER_ID)
-                .unwrap());
-
-            // Auth bound key should no longer exist.
-            assert!(!keystore_db
-                .key_exists(Domain::APP, USER_ID.into(), TEST_KEY_ALIAS, KeyType::Client)
-                .unwrap());
-            assert!(keystore_db
-                .key_exists(Domain::APP, USER_ID.into(), TEST_BOOT_KEY_ALIAS, KeyType::Client)
-                .unwrap());
-        }
-    }
-
     #[test]
     fn test_remove_unlocked_user() {
         test_user_removal(false);
@@ -1698,15 +1520,5 @@ mod tests {
     #[test]
     fn test_remove_locked_user() {
         test_user_removal(true);
-    }
-
-    #[test]
-    fn test_reset_unlocked_user() {
-        test_user_reset(false);
-    }
-
-    #[test]
-    fn test_reset_locked_user() {
-        test_user_reset(true);
     }
 }
