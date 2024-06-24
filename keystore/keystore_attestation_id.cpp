@@ -29,6 +29,7 @@
 #include <binder/Parcelable.h>
 #include <binder/PersistableBundle.h>
 
+#include <aidl/android/system/keystore2/ResponseCode.h>
 #include <android/security/keystore/BpKeyAttestationApplicationIdProvider.h>
 #include <android/security/keystore/IKeyAttestationApplicationIdProvider.h>
 #include <android/security/keystore/KeyAttestationApplicationId.h>
@@ -49,6 +50,8 @@ namespace {
 
 constexpr const char* kAttestationSystemPackageName = "AndroidSystem";
 constexpr const char* kUnknownPackageName = "UnknownPackage";
+constexpr const size_t kMaxAttempts = 3;
+constexpr const unsigned long kRetryIntervalUsecs = 500000;  // sleep for 500 ms
 
 std::vector<uint8_t> signature2SHA256(const security::keystore::Signature& sig) {
     std::vector<uint8_t> digest_buffer(SHA256_DIGEST_LENGTH);
@@ -56,6 +59,7 @@ std::vector<uint8_t> signature2SHA256(const security::keystore::Signature& sig) 
     return digest_buffer;
 }
 
+using ::aidl::android::system::keystore2::ResponseCode;
 using ::android::security::keystore::BpKeyAttestationApplicationIdProvider;
 
 class KeyAttestationApplicationIdProvider : public BpKeyAttestationApplicationIdProvider {
@@ -279,17 +283,31 @@ StatusOr<std::vector<uint8_t>> gather_attestation_application_id(uid_t uid) {
     } else {
         /* Get the attestation application ID from package manager */
         auto& pm = KeyAttestationApplicationIdProvider::get();
-        auto status = pm.getKeyAttestationApplicationId(uid, &key_attestation_id);
+        ::android::binder::Status status;
+
+        // Retry on failure if a service specific error code.
+        for (size_t attempt{0}; attempt < kMaxAttempts; ++attempt) {
+            status = pm.getKeyAttestationApplicationId(uid, &key_attestation_id);
+            if (status.isOk()) {
+                break;
+            } else if (status.exceptionCode() != binder::Status::EX_SERVICE_SPECIFIC) {
+                ALOGW("Retry: key attestation ID failed with service specific error: %s %d",
+                      status.exceptionMessage().c_str(), status.serviceSpecificErrorCode());
+                usleep(kRetryIntervalUsecs);
+            } else {
+                ALOGW("Retry: key attestation ID failed with error: %s %d",
+                      status.exceptionMessage().c_str(), status.exceptionCode());
+                usleep(kRetryIntervalUsecs);
+            }
+        }
+
         // Package Manager call has failed, perform attestation but indicate that the
         // caller is unknown.
         if (!status.isOk()) {
             ALOGW("package manager request for key attestation ID failed with: %s %d",
                   status.exceptionMessage().c_str(), status.exceptionCode());
 
-            auto pinfo = KeyAttestationPackageInfo();
-            pinfo.packageName = String16(kUnknownPackageName);
-            pinfo.versionCode = 1;
-            key_attestation_id.packageInfos.push_back(std::move(pinfo));
+            return int32_t(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED);
         }
     }
 
