@@ -443,17 +443,19 @@ impl KeystoreSecurityLevel {
 
         // If there is an attestation challenge we need to get an application id.
         if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
-            let aaid = {
-                let _wp = self
-                    .watch("In KeystoreSecurityLevel::add_required_parameters calling: get_aaid");
-                keystore2_aaid::get_aaid(uid)
-                    .map_err(|e| anyhow!(ks_err!("get_aaid returned status {}.", e)))
-            }?;
-
-            result.push(KeyParameter {
-                tag: Tag::ATTESTATION_APPLICATION_ID,
-                value: KeyParameterValue::Blob(aaid),
-            });
+            let _wp =
+                self.watch("In KeystoreSecurityLevel::add_required_parameters calling: get_aaid");
+            match keystore2_aaid::get_aaid(uid) {
+                Ok(aaid_ok) => {
+                    result.push(KeyParameter {
+                        tag: Tag::ATTESTATION_APPLICATION_ID,
+                        value: KeyParameterValue::Blob(aaid_ok),
+                    });
+                }
+                Err(e) => {
+                    return Err(anyhow!(e)).context(ks_err!("Attestation ID retrieval error."))
+                }
+            }
         }
 
         if params.iter().any(|kp| kp.tag == Tag::INCLUDE_UNIQUE_ID) {
