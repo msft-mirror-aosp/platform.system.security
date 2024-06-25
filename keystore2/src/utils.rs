@@ -551,8 +551,8 @@ fn estimate_safe_amount_to_return(
     items_to_return
 }
 
-/// Log the key parameters, excluding sensitive ones such as
-/// APPLICATION_DATA and APPLICATION_ID
+/// List all key aliases for a given domain + namespace. whose alias is greater
+/// than start_past_alias (if provided).
 pub fn list_key_entries(
     db: &mut KeystoreDB,
     domain: Domain,
