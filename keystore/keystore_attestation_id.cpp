@@ -49,7 +49,6 @@ namespace android {
 namespace {
 
 constexpr const char* kAttestationSystemPackageName = "AndroidSystem";
-constexpr const char* kUnknownPackageName = "UnknownPackage";
 constexpr const size_t kMaxAttempts = 3;
 constexpr const unsigned long kRetryIntervalUsecs = 500000;  // sleep for 500 ms
 
@@ -274,7 +273,7 @@ build_attestation_application_id(const KeyAttestationApplicationId& key_attestat
 StatusOr<std::vector<uint8_t>> gather_attestation_application_id(uid_t uid) {
     KeyAttestationApplicationId key_attestation_id;
 
-    if (uid == AID_SYSTEM) {
+    if (uid == AID_SYSTEM || uid == AID_ROOT) {
         /* Use a fixed ID for system callers */
         auto pinfo = KeyAttestationPackageInfo();
         pinfo.packageName = String16(kAttestationSystemPackageName);
@@ -301,8 +300,6 @@ StatusOr<std::vector<uint8_t>> gather_attestation_application_id(uid_t uid) {
             }
         }
 
-        // Package Manager call has failed, perform attestation but indicate that the
-        // caller is unknown.
         if (!status.isOk()) {
             ALOGW("package manager request for key attestation ID failed with: %s %d",
                   status.exceptionMessage().c_str(), status.exceptionCode());
