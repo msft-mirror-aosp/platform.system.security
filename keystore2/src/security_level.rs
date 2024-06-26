@@ -34,8 +34,7 @@ use crate::super_key::{KeyBlob, SuperKeyManager};
 use crate::utils::{
     check_device_attestation_permissions, check_key_permission,
     check_unique_id_attestation_permissions, is_device_id_attestation_tag,
-    key_characteristics_to_internal, log_security_safe_params, uid_to_android_user, watchdog as wd,
-    UNDEFINED_NOT_AFTER,
+    key_characteristics_to_internal, uid_to_android_user, watchdog as wd, UNDEFINED_NOT_AFTER,
 };
 use crate::{
     database::{
@@ -517,7 +516,6 @@ impl KeystoreSecurityLevel {
         flags: i32,
         _entropy: &[u8],
     ) -> Result<KeyMetadata> {
-        log::info!("security_level: generate_key(key={:?})", key.alias);
         if key.domain != Domain::BLOB && key.alias.is_none() {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context(ks_err!("Alias must be specified"));
@@ -587,11 +585,7 @@ impl KeystoreSecurityLevel {
                         })
                     },
                 )
-                .context(ks_err!(
-                    "While generating with a user-generated \
-                     attestation key, params: {:?}.",
-                    log_security_safe_params(&params)
-                ))
+                .context(ks_err!("Using user generated attestation key."))
                 .map(|(result, _)| result),
             Some(AttestationKeyInfo::RkpdProvisioned { attestation_key, attestation_certs }) => {
                 self.upgrade_rkpd_keyblob_if_required_with(&attestation_key.keyBlob, &[], |blob| {
@@ -611,12 +605,7 @@ impl KeystoreSecurityLevel {
                         self.keymint.generateKey(&params, dynamic_attest_key.as_ref())
                     })
                 })
-                .context(ks_err!(
-                    "While generating Key {:?} with remote \
-                    provisioned attestation key and params: {:?}.",
-                    key.alias,
-                    log_security_safe_params(&params)
-                ))
+                .context(ks_err!("While generating Key with remote provisioned attestation key."))
                 .map(|(mut result, _)| {
                     result.certificateChain.push(attestation_certs);
                     result
@@ -632,11 +621,7 @@ impl KeystoreSecurityLevel {
                 );
                 self.keymint.generateKey(&params, None)
             })
-            .context(ks_err!(
-                "While generating without a provided \
-                attestation key and params: {:?}.",
-                log_security_safe_params(&params)
-            )),
+            .context(ks_err!("While generating Key without explicit attestation key.")),
         }
         .context(ks_err!())?;
 
@@ -921,10 +906,7 @@ impl KeystoreSecurityLevel {
                 }
             },
         )
-        .context(ks_err!(
-            "upgrade_rkpd_keyblob_if_required_with(params={:?})",
-            log_security_safe_params(params)
-        ))
+        .context(ks_err!())
     }
 
     fn convert_storage_key_to_ephemeral(
