@@ -591,16 +591,6 @@ pub fn count_key_entries(db: &mut KeystoreDB, domain: Domain, namespace: i64) ->
     Ok((legacy_keys.len() + num_keys_in_db) as i32)
 }
 
-/// For params remove sensitive data before returning a string for logging
-pub fn log_security_safe_params(params: &[KmKeyParameter]) -> String {
-    format!(
-        "{:?}",
-        params
-            .iter()
-            .filter(|kp| (kp.tag != Tag::APPLICATION_ID && kp.tag != Tag::APPLICATION_DATA))
-    )
-}
-
 /// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
 pub trait AesGcm {
     /// Deciphers `data` using the initialization vector `iv` and AEAD tag `tag`
