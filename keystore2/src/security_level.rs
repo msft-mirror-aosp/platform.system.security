@@ -20,7 +20,7 @@ use crate::audit_log::{
 };
 use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
 use crate::error::{
-    self, map_km_error, map_or_log_err, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
+    self, into_logged_binder, map_km_error, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
 };
 use crate::globals::{
     get_remotely_provisioned_component_name, DB, ENFORCEMENTS, LEGACY_IMPORTER, SUPER_KEY,
@@ -109,14 +109,12 @@ impl KeystoreSecurityLevel {
 
     fn watch_millis(&self, id: &'static str, millis: u64) -> Option<wd::WatchPoint> {
         let sec_level = self.security_level;
-        wd::watch_millis_with(id, millis, move || format!("SecurityLevel {:?}", sec_level))
+        wd::watch_millis_with(id, millis, sec_level)
     }
 
     fn watch(&self, id: &'static str) -> Option<wd::WatchPoint> {
         let sec_level = self.security_level;
-        wd::watch_millis_with(id, wd::DEFAULT_TIMEOUT_MS, move || {
-            format!("SecurityLevel {:?}", sec_level)
-        })
+        wd::watch_millis_with(id, wd::DEFAULT_TIMEOUT_MS, sec_level)
     }
 
     fn store_new_key(
@@ -444,17 +442,19 @@ impl KeystoreSecurityLevel {
 
         // If there is an attestation challenge we need to get an application id.
         if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
-            let aaid = {
-                let _wp = self
-                    .watch("In KeystoreSecurityLevel::add_required_parameters calling: get_aaid");
-                keystore2_aaid::get_aaid(uid)
-                    .map_err(|e| anyhow!(ks_err!("get_aaid returned status {}.", e)))
-            }?;
-
-            result.push(KeyParameter {
-                tag: Tag::ATTESTATION_APPLICATION_ID,
-                value: KeyParameterValue::Blob(aaid),
-            });
+            let _wp =
+                self.watch("In KeystoreSecurityLevel::add_required_parameters calling: get_aaid");
+            match keystore2_aaid::get_aaid(uid) {
+                Ok(aaid_ok) => {
+                    result.push(KeyParameter {
+                        tag: Tag::ATTESTATION_APPLICATION_ID,
+                        value: KeyParameterValue::Blob(aaid_ok),
+                    });
+                }
+                Err(e) => {
+                    return Err(anyhow!(e)).context(ks_err!("Attestation ID retrieval error."))
+                }
+            }
         }
 
         if params.iter().any(|kp| kp.tag == Tag::INCLUDE_UNIQUE_ID) {
@@ -866,7 +866,7 @@ impl KeystoreSecurityLevel {
                 }
             },
         )
-        .context(ks_err!())?;
+        .context(ks_err!("upgrade_keyblob_if_required_with(key_id={:?})", key_id_guard))?;
 
         // If no upgrade was needed, use the opportunity to reencrypt the blob if required
         // and if the a key_id_guard is held. Note: key_id_guard can only be Some if no
@@ -996,7 +996,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         forced: bool,
     ) -> binder::Result<CreateOperationResponse> {
         let _wp = self.watch("IKeystoreSecurityLevel::createOperation");
-        map_or_log_err(self.create_operation(key, operation_parameters, forced), Ok)
+        self.create_operation(key, operation_parameters, forced).map_err(into_logged_binder)
     }
     fn generateKey(
         &self,
@@ -1012,7 +1012,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         let result = self.generate_key(key, attestation_key, params, flags, entropy);
         log_key_creation_event_stats(self.security_level, params, &result);
         log_key_generated(key, ThreadState::get_calling_uid(), result.is_ok());
-        map_or_log_err(result, Ok)
+        result.map_err(into_logged_binder)
     }
     fn importKey(
         &self,
@@ -1026,7 +1026,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         let result = self.import_key(key, attestation_key, params, flags, key_data);
         log_key_creation_event_stats(self.security_level, params, &result);
         log_key_imported(key, ThreadState::get_calling_uid(), result.is_ok());
-        map_or_log_err(result, Ok)
+        result.map_err(into_logged_binder)
     }
     fn importWrappedKey(
         &self,
@@ -1041,20 +1041,20 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
             self.import_wrapped_key(key, wrapping_key, masking_key, params, authenticators);
         log_key_creation_event_stats(self.security_level, params, &result);
         log_key_imported(key, ThreadState::get_calling_uid(), result.is_ok());
-        map_or_log_err(result, Ok)
+        result.map_err(into_logged_binder)
     }
     fn convertStorageKeyToEphemeral(
         &self,
         storage_key: &KeyDescriptor,
     ) -> binder::Result<EphemeralStorageKeyResponse> {
         let _wp = self.watch("IKeystoreSecurityLevel::convertStorageKeyToEphemeral");
-        map_or_log_err(self.convert_storage_key_to_ephemeral(storage_key), Ok)
+        self.convert_storage_key_to_ephemeral(storage_key).map_err(into_logged_binder)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::Result<()> {
         let _wp = self.watch("IKeystoreSecurityLevel::deleteKey");
         let result = self.delete_key(key);
         log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());
-        map_or_log_err(result, Ok)
+        result.map_err(into_logged_binder)
     }
 }
 
