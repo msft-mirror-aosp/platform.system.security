@@ -34,8 +34,7 @@ use crate::super_key::{KeyBlob, SuperKeyManager};
 use crate::utils::{
     check_device_attestation_permissions, check_key_permission,
     check_unique_id_attestation_permissions, is_device_id_attestation_tag,
-    key_characteristics_to_internal, log_security_safe_params, uid_to_android_user, watchdog as wd,
-    UNDEFINED_NOT_AFTER,
+    key_characteristics_to_internal, uid_to_android_user, watchdog as wd, UNDEFINED_NOT_AFTER,
 };
 use crate::{
     database::{
@@ -517,7 +516,6 @@ impl KeystoreSecurityLevel {
         flags: i32,
         _entropy: &[u8],
     ) -> Result<KeyMetadata> {
-        log::info!("security_level: generate_key(key={:?})", key);
         if key.domain != Domain::BLOB && key.alias.is_none() {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context(ks_err!("Alias must be specified"));
@@ -587,12 +585,7 @@ impl KeystoreSecurityLevel {
                         })
                     },
                 )
-                .context(ks_err!(
-                    "While generating Key {:?} with remote \
-                    provisioned attestation key and params: {:?}.",
-                    key.alias,
-                    log_security_safe_params(&params)
-                ))
+                .context(ks_err!("Using user generated attestation key."))
                 .map(|(result, _)| result),
             Some(AttestationKeyInfo::RkpdProvisioned { attestation_key, attestation_certs }) => {
                 self.upgrade_rkpd_keyblob_if_required_with(&attestation_key.keyBlob, &[], |blob| {
@@ -612,12 +605,7 @@ impl KeystoreSecurityLevel {
                         self.keymint.generateKey(&params, dynamic_attest_key.as_ref())
                     })
                 })
-                .context(ks_err!(
-                    "While generating Key {:?} with remote \
-                    provisioned attestation key and params: {:?}.",
-                    key.alias,
-                    log_security_safe_params(&params)
-                ))
+                .context(ks_err!("While generating Key with remote provisioned attestation key."))
                 .map(|(mut result, _)| {
                     result.certificateChain.push(attestation_certs);
                     result
@@ -633,12 +621,7 @@ impl KeystoreSecurityLevel {
                 );
                 self.keymint.generateKey(&params, None)
             })
-            .context(ks_err!(
-                "While generating Key {:?} with remote \
-                provisioned attestation key and params: {:?}.",
-                key.alias,
-                log_security_safe_params(&params)
-            )),
+            .context(ks_err!("While generating Key without explicit attestation key.")),
         }
         .context(ks_err!())?;
 
@@ -866,7 +849,6 @@ impl KeystoreSecurityLevel {
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        log::info!("upgrade_keyblob_if_required_with(key_id={:?})", key_id_guard);
         let (v, upgraded_blob) = crate::utils::upgrade_keyblob_if_required_with(
             &*self.keymint,
             self.hw_info.versionNumber,
@@ -884,7 +866,7 @@ impl KeystoreSecurityLevel {
                 }
             },
         )
-        .context(ks_err!())?;
+        .context(ks_err!("upgrade_keyblob_if_required_with(key_id={:?})", key_id_guard))?;
 
         // If no upgrade was needed, use the opportunity to reencrypt the blob if required
         // and if the a key_id_guard is held. Note: key_id_guard can only be Some if no
@@ -907,10 +889,6 @@ impl KeystoreSecurityLevel {
     where
         F: Fn(&[u8]) -> Result<T, Error>,
     {
-        log::info!(
-            "upgrade_rkpd_keyblob_if_required_with(params={:?})",
-            log_security_safe_params(params)
-        );
         let rpc_name = get_remotely_provisioned_component_name(&self.security_level)
             .context(ks_err!("Trying to get IRPC name."))?;
         crate::utils::upgrade_keyblob_if_required_with(
