@@ -928,6 +928,6 @@ fn get_key_characteristics_without_app_data(
         },
         |_| Ok(()),
     )
-    .context(ks_err!())?;
+    .context(ks_err!("getKeyCharacteristics failed: possibly invalid keyblob for uuid {uuid:?}"))?;
     Ok((key_characteristics_to_internal(characteristics), upgraded_blob))
 }
