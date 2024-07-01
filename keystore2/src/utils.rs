@@ -514,6 +514,8 @@ fn merge_and_filter_key_entry_lists(
 }
 
 fn estimate_safe_amount_to_return(
+    domain: Domain,
+    namespace: i64,
     key_descriptors: &[KeyDescriptor],
     response_size_limit: usize,
 ) -> usize {
@@ -538,11 +540,9 @@ fn estimate_safe_amount_to_return(
         // 350KB and return a partial list.
         if returned_bytes > response_size_limit {
             log::warn!(
-                "Key descriptors list ({} items) may exceed binder \
-                       size, returning {} items est {} bytes.",
+                "{domain:?}:{namespace}: Key descriptors list ({} items) may exceed binder \
+                       size, returning {items_to_return} items est {returned_bytes} bytes.",
                 key_descriptors.len(),
-                items_to_return,
-                returned_bytes
             );
             break;
         }
@@ -576,7 +576,7 @@ pub fn list_key_entries(
 
     const RESPONSE_SIZE_LIMIT: usize = 358400;
     let safe_amount_to_return =
-        estimate_safe_amount_to_return(&merged_key_entries, RESPONSE_SIZE_LIMIT);
+        estimate_safe_amount_to_return(domain, namespace, &merged_key_entries, RESPONSE_SIZE_LIMIT);
     Ok(merged_key_entries[..safe_amount_to_return].to_vec())
 }
 
@@ -669,9 +669,9 @@ mod tests {
         let key_aliases = vec!["key1", "key2", "key3"];
         let key_descriptors = create_key_descriptors_from_aliases(&key_aliases);
 
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 20), 1);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 50), 2);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 100), 3);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 20), 1);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 50), 2);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 100), 3);
         Ok(())
     }
 
