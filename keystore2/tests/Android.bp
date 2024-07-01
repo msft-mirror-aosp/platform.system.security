@@ -13,6 +13,7 @@
 // limitations under the License.
 
 package {
+    default_team: "trendy_team_android_hardware_backed_security",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "system_security_license"
@@ -38,9 +39,13 @@ rust_test {
     rustlibs: [
         "android.hardware.security.secureclock-V1-rust",
         "android.security.authorization-rust",
+        "android.security.maintenance-rust",
         "libaconfig_android_hardware_biometrics_rust",
+        "libandroid_logger",
+        "libandroid_security_flags_rust",
         "libbinder_rs",
         "libkeystore2_test_utils",
+        "liblog_rust",
         "libnix",
         "libopenssl",
         "librustutils",
