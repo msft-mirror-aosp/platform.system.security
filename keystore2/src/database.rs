@@ -46,7 +46,7 @@ pub(crate) mod utils;
 mod versioning;
 
 use crate::gc::Gc;
-use crate::impl_metadata; // This is in db_utils.rs
+use crate::impl_metadata; // This is in database/utils.rs
 use crate::key_parameter::{KeyParameter, KeyParameterValue, Tag};
 use crate::ks_err;
 use crate::permission::KeyPermSet;
@@ -856,6 +856,18 @@ impl AuthTokenEntry {
     }
 }
 
+/// Information about a superseded blob (a blob that is no longer the
+/// most recent blob of that type for a given key, due to upgrade or
+/// replacement).
+pub struct SupersededBlob {
+    /// ID
+    pub blob_id: i64,
+    /// Contents.
+    pub blob: Vec<u8>,
+    /// Metadata.
+    pub metadata: BlobMetaData,
+}
+
 impl KeystoreDB {
     const UNASSIGNED_KEY_ID: i64 = -1i64;
     const CURRENT_DB_VERSION: u32 = 1;
@@ -1167,7 +1179,7 @@ impl KeystoreDB {
         &mut self,
         blob_ids_to_delete: &[i64],
         max_blobs: usize,
-    ) -> Result<Vec<(i64, Vec<u8>, BlobMetaData)>> {
+    ) -> Result<Vec<SupersededBlob>> {
         let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob");
         self.with_transaction(Immediate("TX_handle_next_superseded_blob"), |tx| {
             // Delete the given blobs.
@@ -1183,8 +1195,9 @@ impl KeystoreDB {
 
             Self::cleanup_unreferenced(tx).context("Trying to cleanup unreferenced.")?;
 
-            // Find up to max_blobx more superseded key blobs, load their metadata and return it.
+            // Find up to `max_blobs` more superseded key blobs, load their metadata and return it.
             let result: Vec<(i64, Vec<u8>)> = {
+                let _wp = wd::watch("handle_next_superseded_blob find_next");
                 let mut stmt = tx
                     .prepare(
                         "SELECT id, blob FROM persistent.blobentry
@@ -1215,12 +1228,17 @@ impl KeystoreDB {
                     .context("Trying to extract superseded blobs.")?
             };
 
+            let _wp = wd::watch("handle_next_superseded_blob load_metadata");
             let result = result
                 .into_iter()
                 .map(|(blob_id, blob)| {
-                    Ok((blob_id, blob, BlobMetaData::load_from_db(blob_id, tx)?))
+                    Ok(SupersededBlob {
+                        blob_id,
+                        blob,
+                        metadata: BlobMetaData::load_from_db(blob_id, tx)?,
+                    })
                 })
-                .collect::<Result<Vec<(i64, Vec<u8>, BlobMetaData)>>>()
+                .collect::<Result<Vec<_>>>()
                 .context("Trying to load blob metadata.")?;
             if !result.is_empty() {
                 return Ok(result).no_gc();
@@ -1228,6 +1246,7 @@ impl KeystoreDB {
 
             // We did not find any superseded key blob, so let's remove other superseded blob in
             // one transaction.
+            let _wp = wd::watch("handle_next_superseded_blob delete");
             tx.execute(
                 "DELETE FROM persistent.blobentry
                  WHERE NOT subcomponent_type = ?
