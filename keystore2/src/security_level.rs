@@ -451,6 +451,10 @@ impl KeystoreSecurityLevel {
                         value: KeyParameterValue::Blob(aaid_ok),
                     });
                 }
+                Err(e) if e == ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED.0 as u32 => {
+                    return Err(Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED))
+                        .context(ks_err!("Attestation ID retrieval failed."));
+                }
                 Err(e) => {
                     return Err(anyhow!(e)).context(ks_err!("Attestation ID retrieval error."))
                 }
