@@ -591,6 +591,15 @@ pub fn count_key_entries(db: &mut KeystoreDB, domain: Domain, namespace: i64) ->
     Ok((legacy_keys.len() + num_keys_in_db) as i32)
 }
 
+/// For params remove sensitive data before returning a string for logging
+pub fn log_security_safe_params(params: &[KmKeyParameter]) -> Vec<KmKeyParameter> {
+    params
+        .iter()
+        .filter(|kp| (kp.tag != Tag::APPLICATION_ID && kp.tag != Tag::APPLICATION_DATA))
+        .cloned()
+        .collect::<Vec<KmKeyParameter>>()
+}
+
 /// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
 pub trait AesGcm {
     /// Deciphers `data` using the initialization vector `iv` and AEAD tag `tag`
@@ -714,6 +723,35 @@ mod tests {
             Some("key_c"),
         );
         assert_eq!(aliases_from_key_descriptors(&result), vec!["key_d", "key_e", "key_f", "key_g"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_key_parameters_with_filter_on_security_sensitive_info() -> Result<()> {
+        let params = vec![
+            KmKeyParameter { tag: Tag::APPLICATION_ID, value: KeyParameterValue::Integer(0) },
+            KmKeyParameter { tag: Tag::APPLICATION_DATA, value: KeyParameterValue::Integer(0) },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
+            },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+        ];
+        let wanted = vec![
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
+            },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+        ];
+
+        assert_eq!(log_security_safe_params(&params), wanted);
         Ok(())
     }
 }
