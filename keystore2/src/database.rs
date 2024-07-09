@@ -46,7 +46,7 @@ pub(crate) mod utils;
 mod versioning;
 
 use crate::gc::Gc;
-use crate::impl_metadata; // This is in db_utils.rs
+use crate::impl_metadata; // This is in database/utils.rs
 use crate::key_parameter::{KeyParameter, KeyParameterValue, Tag};
 use crate::ks_err;
 use crate::permission::KeyPermSet;
@@ -125,21 +125,6 @@ impl TransactionBehavior {
 
 /// If the database returns a busy error code, retry after this interval.
 const DB_BUSY_RETRY_INTERVAL: Duration = Duration::from_micros(500);
-/// If the database returns a busy error code, keep retrying for this long.
-const MAX_DB_BUSY_RETRY_PERIOD: Duration = Duration::from_secs(15);
-
-/// Check whether a database lock has timed out.
-fn check_lock_timeout(start: &std::time::Instant, timeout: Duration) -> Result<()> {
-    if keystore2_flags::database_loop_timeout() {
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            error!("Abandon locked DB after {elapsed:?}");
-            return Err(&KsError::Rc(ResponseCode::BACKEND_BUSY))
-                .context(ks_err!("Abandon locked DB after {elapsed:?}",));
-        }
-    }
-    Ok(())
-}
 
 impl_metadata!(
     /// A set of metadata for key entries.
@@ -871,6 +856,18 @@ impl AuthTokenEntry {
     }
 }
 
+/// Information about a superseded blob (a blob that is no longer the
+/// most recent blob of that type for a given key, due to upgrade or
+/// replacement).
+pub struct SupersededBlob {
+    /// ID
+    pub blob_id: i64,
+    /// Contents.
+    pub blob: Vec<u8>,
+    /// Metadata.
+    pub metadata: BlobMetaData,
+}
+
 impl KeystoreDB {
     const UNASSIGNED_KEY_ID: i64 = -1i64;
     const CURRENT_DB_VERSION: u32 = 1;
@@ -1182,7 +1179,7 @@ impl KeystoreDB {
         &mut self,
         blob_ids_to_delete: &[i64],
         max_blobs: usize,
-    ) -> Result<Vec<(i64, Vec<u8>, BlobMetaData)>> {
+    ) -> Result<Vec<SupersededBlob>> {
         let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob");
         self.with_transaction(Immediate("TX_handle_next_superseded_blob"), |tx| {
             // Delete the given blobs.
@@ -1198,8 +1195,9 @@ impl KeystoreDB {
 
             Self::cleanup_unreferenced(tx).context("Trying to cleanup unreferenced.")?;
 
-            // Find up to max_blobx more superseded key blobs, load their metadata and return it.
+            // Find up to `max_blobs` more superseded key blobs, load their metadata and return it.
             let result: Vec<(i64, Vec<u8>)> = {
+                let _wp = wd::watch("handle_next_superseded_blob find_next");
                 let mut stmt = tx
                     .prepare(
                         "SELECT id, blob FROM persistent.blobentry
@@ -1230,12 +1228,17 @@ impl KeystoreDB {
                     .context("Trying to extract superseded blobs.")?
             };
 
+            let _wp = wd::watch("handle_next_superseded_blob load_metadata");
             let result = result
                 .into_iter()
                 .map(|(blob_id, blob)| {
-                    Ok((blob_id, blob, BlobMetaData::load_from_db(blob_id, tx)?))
+                    Ok(SupersededBlob {
+                        blob_id,
+                        blob,
+                        metadata: BlobMetaData::load_from_db(blob_id, tx)?,
+                    })
                 })
-                .collect::<Result<Vec<(i64, Vec<u8>, BlobMetaData)>>>()
+                .collect::<Result<Vec<_>>>()
                 .context("Trying to load blob metadata.")?;
             if !result.is_empty() {
                 return Ok(result).no_gc();
@@ -1243,6 +1246,7 @@ impl KeystoreDB {
 
             // We did not find any superseded key blob, so let's remove other superseded blob in
             // one transaction.
+            let _wp = wd::watch("handle_next_superseded_blob delete");
             tx.execute(
                 "DELETE FROM persistent.blobentry
                  WHERE NOT subcomponent_type = ?
@@ -1397,18 +1401,6 @@ impl KeystoreDB {
     where
         F: Fn(&Transaction) -> Result<(bool, T)>,
     {
-        self.with_transaction_timeout(behavior, MAX_DB_BUSY_RETRY_PERIOD, f)
-    }
-    fn with_transaction_timeout<T, F>(
-        &mut self,
-        behavior: TransactionBehavior,
-        timeout: Duration,
-        f: F,
-    ) -> Result<T>
-    where
-        F: Fn(&Transaction) -> Result<(bool, T)>,
-    {
-        let start = std::time::Instant::now();
         let name = behavior.name();
         loop {
             let result = self
@@ -1427,7 +1419,6 @@ impl KeystoreDB {
                 Ok(result) => break Ok(result),
                 Err(e) => {
                     if Self::is_locked_error(&e) {
-                        check_lock_timeout(&start, timeout)?;
                         std::thread::sleep(DB_BUSY_RETRY_INTERVAL);
                         continue;
                     } else {
@@ -2156,7 +2147,6 @@ impl KeystoreDB {
         check_permission: impl Fn(&KeyDescriptor, Option<KeyPermSet>) -> Result<()>,
     ) -> Result<(KeyIdGuard, KeyEntry)> {
         let _wp = wd::watch("KeystoreDB::load_key_entry");
-        let start = std::time::Instant::now();
 
         loop {
             match self.load_key_entry_internal(
@@ -2169,7 +2159,6 @@ impl KeystoreDB {
                 Ok(result) => break Ok(result),
                 Err(e) => {
                     if Self::is_locked_error(&e) {
-                        check_lock_timeout(&start, MAX_DB_BUSY_RETRY_PERIOD)?;
                         std::thread::sleep(DB_BUSY_RETRY_INTERVAL);
                         continue;
                     } else {
@@ -2401,15 +2390,8 @@ impl KeystoreDB {
         .context(ks_err!())
     }
 
-    /// Delete the keys created on behalf of the user, denoted by the user id.
-    /// Delete all the keys unless 'keep_non_super_encrypted_keys' set to true.
-    /// Returned boolean is to hint the garbage collector to delete the unbound keys.
-    /// The caller of this function should notify the gc if the returned value is true.
-    pub fn unbind_keys_for_user(
-        &mut self,
-        user_id: u32,
-        keep_non_super_encrypted_keys: bool,
-    ) -> Result<()> {
+    /// Deletes all keys for the given user, including both client keys and super keys.
+    pub fn unbind_keys_for_user(&mut self, user_id: u32) -> Result<()> {
         let _wp = wd::watch("KeystoreDB::unbind_keys_for_user");
 
         self.with_transaction(Immediate("TX_unbind_keys_for_user"), |tx| {
@@ -2457,17 +2439,6 @@ impl KeystoreDB {
 
             let mut notify_gc = false;
             for key_id in key_ids {
-                if keep_non_super_encrypted_keys {
-                    // Load metadata and filter out non-super-encrypted keys.
-                    if let (_, Some((_, blob_metadata)), _, _) =
-                        Self::load_blob_components(key_id, KeyEntryLoadBits::KM, tx)
-                            .context(ks_err!("Trying to load blob info."))?
-                    {
-                        if blob_metadata.encrypted_by().is_none() {
-                            continue;
-                        }
-                    }
-                }
                 notify_gc = Self::mark_unreferenced(tx, key_id)
                     .context("In unbind_keys_for_user.")?
                     || notify_gc;
@@ -4976,16 +4947,16 @@ pub mod tests {
     #[test]
     fn test_unbind_keys_for_user() -> Result<()> {
         let mut db = new_test_db()?;
-        db.unbind_keys_for_user(1, false)?;
+        db.unbind_keys_for_user(1)?;
 
         make_test_key_entry(&mut db, Domain::APP, 210000, TEST_ALIAS, None)?;
         make_test_key_entry(&mut db, Domain::APP, 110000, TEST_ALIAS, None)?;
-        db.unbind_keys_for_user(2, false)?;
+        db.unbind_keys_for_user(2)?;
 
         assert_eq!(1, db.list_past_alias(Domain::APP, 110000, KeyType::Client, None)?.len());
         assert_eq!(0, db.list_past_alias(Domain::APP, 210000, KeyType::Client, None)?.len());
 
-        db.unbind_keys_for_user(1, true)?;
+        db.unbind_keys_for_user(1)?;
         assert_eq!(0, db.list_past_alias(Domain::APP, 110000, KeyType::Client, None)?.len());
 
         Ok(())
@@ -5039,28 +5010,14 @@ pub mod tests {
         assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
         assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
 
-        // Delete only encrypted keys.
-        db.unbind_keys_for_user(1, true)?;
+        // Delete all keys for user 1.
+        db.unbind_keys_for_user(1)?;
 
-        // The encrypted superkey should be gone now.
-        assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
-        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
-
-        // Reinsert the encrypted key.
-        db.store_super_key(1, &key_name_enc, &encrypted_super_key, &metadata, &KeyMetaData::new())?;
-
-        // Check that both can be found in the database, again..
-        assert!(db.load_super_key(&key_name_enc, 1)?.is_some());
-        assert!(db.load_super_key(&key_name_nonenc, 1)?.is_some());
-
-        // Delete all even unencrypted keys.
-        db.unbind_keys_for_user(1, false)?;
-
-        // Both should be gone now.
+        // All of user 1's keys should be gone.
         assert!(db.load_super_key(&key_name_enc, 1)?.is_none());
         assert!(db.load_super_key(&key_name_nonenc, 1)?.is_none());
 
-        // Check that the second pair of keys was untouched.
+        // User 2's keys should not have been touched.
         assert!(db.load_super_key(&key_name_enc, 2)?.is_some());
         assert!(db.load_super_key(&key_name_nonenc, 2)?.is_some());
 
@@ -5521,83 +5478,6 @@ pub mod tests {
 
         let third_sid_apps = db.get_app_uids_affected_by_sid(uid, third_sid)?;
         assert_eq!(third_sid_apps, vec![second_app_id]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_key_id_guard_immediate() -> Result<()> {
-        if !keystore2_flags::database_loop_timeout() {
-            eprintln!("Skipping test as loop timeout flag disabled");
-            return Ok(());
-        }
-        // Emit logging from test.
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_tag("keystore_database_tests")
-                .with_max_level(log::LevelFilter::Debug),
-        );
-
-        // Preparation: put a single entry into a test DB.
-        let temp_dir = Arc::new(TempDir::new("key_id_guard_immediate")?);
-        let temp_dir_clone_a = temp_dir.clone();
-        let temp_dir_clone_b = temp_dir.clone();
-        let mut db = KeystoreDB::new(temp_dir.path(), None)?;
-        let key_id = make_test_key_entry(&mut db, Domain::APP, 1, TEST_ALIAS, None)?.0;
-
-        let (a_sender, b_receiver) = std::sync::mpsc::channel();
-        let (b_sender, a_receiver) = std::sync::mpsc::channel();
-
-        // First thread starts an immediate transaction, then waits on a synchronization channel
-        // before trying to get the `KeyIdGuard`.
-        let handle_a = thread::spawn(move || {
-            let temp_dir = temp_dir_clone_a;
-            let mut db = KeystoreDB::new(temp_dir.path(), None).unwrap();
-
-            // Make sure the other thread has initialized its database access before we lock it out.
-            a_receiver.recv().unwrap();
-
-            let _result =
-                db.with_transaction_timeout(Immediate("TX_test"), Duration::from_secs(3), |_tx| {
-                    // Notify the other thread that we're inside the immediate transaction...
-                    a_sender.send(()).unwrap();
-                    // ...then wait to be sure that the other thread has the `KeyIdGuard` before
-                    // this thread also tries to get it.
-                    a_receiver.recv().unwrap();
-
-                    let _guard = KEY_ID_LOCK.get(key_id);
-                    Ok(()).no_gc()
-                });
-        });
-
-        // Second thread gets the `KeyIdGuard`, then waits before trying to perform an immediate
-        // transaction.
-        let handle_b = thread::spawn(move || {
-            let temp_dir = temp_dir_clone_b;
-            let mut db = KeystoreDB::new(temp_dir.path(), None).unwrap();
-            // Notify the other thread that we are initialized (so it can lock the immediate
-            // transaction).
-            b_sender.send(()).unwrap();
-
-            let _guard = KEY_ID_LOCK.get(key_id);
-            // Notify the other thread that we have the `KeyIdGuard`...
-            b_sender.send(()).unwrap();
-            // ...then wait to be sure that the other thread is in the immediate transaction before
-            // this thread also tries to do one.
-            b_receiver.recv().unwrap();
-
-            let result =
-                db.with_transaction_timeout(Immediate("TX_test"), Duration::from_secs(3), |_tx| {
-                    Ok(()).no_gc()
-                });
-            // Expect the attempt to get an immediate transaction to fail, and then this thread will
-            // exit and release the `KeyIdGuard`, allowing the other thread to complete.
-            assert!(result.is_err());
-            check_result_is_error_containing_string(result, "BACKEND_BUSY");
-        });
-
-        let _ = handle_a.join();
-        let _ = handle_b.join();
-
         Ok(())
     }
 }

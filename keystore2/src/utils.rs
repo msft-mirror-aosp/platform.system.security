@@ -514,6 +514,8 @@ fn merge_and_filter_key_entry_lists(
 }
 
 fn estimate_safe_amount_to_return(
+    domain: Domain,
+    namespace: i64,
     key_descriptors: &[KeyDescriptor],
     response_size_limit: usize,
 ) -> usize {
@@ -538,11 +540,9 @@ fn estimate_safe_amount_to_return(
         // 350KB and return a partial list.
         if returned_bytes > response_size_limit {
             log::warn!(
-                "Key descriptors list ({} items) may exceed binder \
-                       size, returning {} items est {} bytes.",
+                "{domain:?}:{namespace}: Key descriptors list ({} items) may exceed binder \
+                       size, returning {items_to_return} items est {returned_bytes} bytes.",
                 key_descriptors.len(),
-                items_to_return,
-                returned_bytes
             );
             break;
         }
@@ -576,7 +576,7 @@ pub fn list_key_entries(
 
     const RESPONSE_SIZE_LIMIT: usize = 358400;
     let safe_amount_to_return =
-        estimate_safe_amount_to_return(&merged_key_entries, RESPONSE_SIZE_LIMIT);
+        estimate_safe_amount_to_return(domain, namespace, &merged_key_entries, RESPONSE_SIZE_LIMIT);
     Ok(merged_key_entries[..safe_amount_to_return].to_vec())
 }
 
@@ -589,6 +589,15 @@ pub fn count_key_entries(db: &mut KeystoreDB, domain: Domain, namespace: i64) ->
     let num_keys_in_db = db.count_keys(domain, namespace, KeyType::Client)?;
 
     Ok((legacy_keys.len() + num_keys_in_db) as i32)
+}
+
+/// For params remove sensitive data before returning a string for logging
+pub fn log_security_safe_params(params: &[KmKeyParameter]) -> Vec<KmKeyParameter> {
+    params
+        .iter()
+        .filter(|kp| (kp.tag != Tag::APPLICATION_ID && kp.tag != Tag::APPLICATION_DATA))
+        .cloned()
+        .collect::<Vec<KmKeyParameter>>()
 }
 
 /// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
@@ -669,9 +678,9 @@ mod tests {
         let key_aliases = vec!["key1", "key2", "key3"];
         let key_descriptors = create_key_descriptors_from_aliases(&key_aliases);
 
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 20), 1);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 50), 2);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 100), 3);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 20), 1);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 50), 2);
+        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 100), 3);
         Ok(())
     }
 
@@ -714,6 +723,35 @@ mod tests {
             Some("key_c"),
         );
         assert_eq!(aliases_from_key_descriptors(&result), vec!["key_d", "key_e", "key_f", "key_g"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_key_parameters_with_filter_on_security_sensitive_info() -> Result<()> {
+        let params = vec![
+            KmKeyParameter { tag: Tag::APPLICATION_ID, value: KeyParameterValue::Integer(0) },
+            KmKeyParameter { tag: Tag::APPLICATION_DATA, value: KeyParameterValue::Integer(0) },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
+            },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+        ];
+        let wanted = vec![
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_AFTER,
+                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
+            },
+            KmKeyParameter {
+                tag: Tag::CERTIFICATE_NOT_BEFORE,
+                value: KeyParameterValue::DateTime(0),
+            },
+        ];
+
+        assert_eq!(log_security_safe_params(&params), wanted);
         Ok(())
     }
 }
