@@ -68,9 +68,26 @@ struct WatchdogState {
     idle_timeout: Duration,
     records: HashMap<Index, Record>,
     last_report: Option<Instant>,
+    noisy_timeout: Duration,
 }
 
 impl WatchdogState {
+    /// If we have overdue records, we want to log them but slowly backoff
+    /// so that we do not clog the logs. We start with logs every
+    /// `MIN_REPORT_TIMEOUT` sec then increment the timeout by 5 up
+    /// to a maximum of `MAX_REPORT_TIMEOUT`.
+    const MIN_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
+    const MAX_REPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn reset_noisy_timeout(&mut self) {
+        self.noisy_timeout = Self::MIN_REPORT_TIMEOUT;
+    }
+
+    fn update_noisy_timeout(&mut self) {
+        let noisy_update = self.noisy_timeout + Duration::from_secs(5);
+        self.noisy_timeout = min(Self::MAX_REPORT_TIMEOUT, noisy_update);
+    }
+
     fn overdue_and_next_timeout(&self) -> (bool, Option<Duration>) {
         let now = Instant::now();
         let mut next_timeout: Option<Duration> = None;
@@ -100,12 +117,13 @@ impl WatchdogState {
         }
         // Something to report...
         if let Some(reported_at) = self.last_report {
-            if reported_at.elapsed() < Watchdog::NOISY_REPORT_TIMEOUT {
+            if reported_at.elapsed() < self.noisy_timeout {
                 // .. but it's too soon since the last report.
                 self.last_report = None;
                 return;
             }
         }
+        self.update_noisy_timeout();
         self.last_report = Some(Instant::now());
         log::warn!("### Keystore Watchdog report - BEGIN ###");
 
@@ -190,10 +208,6 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
-    /// If we have overdue records, we want to be noisy about it and log a report
-    /// at least every `NOISY_REPORT_TIMEOUT` interval.
-    const NOISY_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
-
     /// Construct a [`Watchdog`]. When `idle_timeout` has elapsed since the watchdog thread became
     /// idle, i.e., there are no more active or overdue watch points, the watchdog thread
     /// terminates.
@@ -207,6 +221,7 @@ impl Watchdog {
                     idle_timeout,
                     records: HashMap::new(),
                     last_report: None,
+                    noisy_timeout: WatchdogState::MIN_REPORT_TIMEOUT,
                 }),
             )),
         })
@@ -294,10 +309,8 @@ impl Watchdog {
                 state.log_report(has_overdue);
 
                 let (next_timeout, idle) = match (has_overdue, next_timeout) {
-                    (true, Some(next_timeout)) => {
-                        (min(next_timeout, Self::NOISY_REPORT_TIMEOUT), false)
-                    }
-                    (true, None) => (Self::NOISY_REPORT_TIMEOUT, false),
+                    (true, Some(next_timeout)) => (min(next_timeout, state.noisy_timeout), false),
+                    (true, None) => (state.noisy_timeout, false),
                     (false, Some(next_timeout)) => (next_timeout, false),
                     (false, None) => (state.idle_timeout, true),
                 };
@@ -309,6 +322,7 @@ impl Watchdog {
                 state = s;
 
                 if idle && timeout.timed_out() && state.records.is_empty() {
+                    state.reset_noisy_timeout();
                     state.state = State::NotRunning;
                     break;
                 }
@@ -327,6 +341,21 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Count the number of times `Debug::fmt` is invoked.
+    #[derive(Default, Clone)]
+    struct DebugCounter(Arc<atomic::AtomicU8>);
+    impl DebugCounter {
+        fn value(&self) -> u8 {
+            self.0.load(atomic::Ordering::Relaxed)
+        }
+    }
+    impl std::fmt::Debug for DebugCounter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+            let count = self.0.fetch_add(1, atomic::Ordering::Relaxed);
+            write!(f, "hit_count: {count}")
+        }
+    }
+
     #[test]
     fn test_watchdog() {
         android_logger::init_once(
@@ -335,22 +364,7 @@ mod tests {
                 .with_max_level(log::LevelFilter::Debug),
         );
 
-        /// Count the number of times `Debug::fmt` is invoked.
-        #[derive(Default, Clone)]
-        struct DebugCounter(Arc<atomic::AtomicU8>);
-        impl DebugCounter {
-            fn value(&self) -> u8 {
-                self.0.load(atomic::Ordering::Relaxed)
-            }
-        }
-        impl std::fmt::Debug for DebugCounter {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-                let count = self.0.fetch_add(1, atomic::Ordering::Relaxed);
-                write!(f, "hit_count: {count}")
-            }
-        }
-
-        let wd = Watchdog::new(Watchdog::NOISY_REPORT_TIMEOUT.checked_mul(3).unwrap());
+        let wd = Watchdog::new(Duration::from_secs(3));
         let hit_counter = DebugCounter::default();
         let wp = Watchdog::watch_with(
             &wd,
@@ -361,13 +375,43 @@ mod tests {
         assert_eq!(0, hit_counter.value());
         thread::sleep(Duration::from_millis(500));
         assert_eq!(1, hit_counter.value());
-        thread::sleep(Watchdog::NOISY_REPORT_TIMEOUT);
-        assert_eq!(2, hit_counter.value());
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(1, hit_counter.value());
+
         drop(wp);
-        thread::sleep(Watchdog::NOISY_REPORT_TIMEOUT.checked_mul(4).unwrap());
-        assert_eq!(2, hit_counter.value());
+        thread::sleep(Duration::from_secs(10));
+        assert_eq!(1, hit_counter.value());
         let (_, ref state) = *wd.state;
         let state = state.lock().unwrap();
         assert_eq!(state.state, State::NotRunning);
+    }
+
+    #[test]
+    fn test_watchdog_backoff() {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_tag("keystore2_watchdog_tests")
+                .with_max_level(log::LevelFilter::Debug),
+        );
+
+        let wd = Watchdog::new(Duration::from_secs(3));
+        let hit_counter = DebugCounter::default();
+        let wp = Watchdog::watch_with(
+            &wd,
+            "test_watchdog",
+            Duration::from_millis(100),
+            hit_counter.clone(),
+        );
+        assert_eq!(0, hit_counter.value());
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(1, hit_counter.value());
+        thread::sleep(Duration::from_secs(6));
+        assert_eq!(2, hit_counter.value());
+        thread::sleep(Duration::from_secs(11));
+        assert_eq!(3, hit_counter.value());
+
+        drop(wp);
+        thread::sleep(Duration::from_secs(4));
+        assert_eq!(3, hit_counter.value());
     }
 }
