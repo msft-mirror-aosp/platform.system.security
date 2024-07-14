@@ -401,9 +401,8 @@ pub fn check_key_authorizations(
 ) {
     // Make sure key authorizations contains only `ALLOWED_TAGS_IN_KEY_AUTHS`
     authorizations.iter().all(|auth| {
-        // Ignore `INVALID` tag if the backend is Keymaster and not KeyMint.
-        // Keymaster allows INVALID tag for unsupported key parameters.
-        if sl.is_keymaster() && auth.keyParameter.tag == Tag::INVALID {
+        // Ignore `INVALID` tag
+        if auth.keyParameter.tag == Tag::INVALID {
             return true;
         }
         assert!(

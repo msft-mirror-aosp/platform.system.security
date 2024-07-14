@@ -1,12 +1,6 @@
 {
   "presubmit": [
     {
-      "name": "librkpd_client.test"
-    },
-    {
-      "name": "libwatchdog_rs.test"
-    },
-    {
       "name": "keystore2_crypto_test"
     },
     {
@@ -20,9 +14,6 @@
     },
     {
       "name": "keystore2_legacy_blobs_test"
-    },
-    {
-      "name": "keystore2_client_tests"
     },
     {
       "name": "CtsIdentityTestCases"
@@ -39,6 +30,15 @@
   "postsubmit": [
     {
       "name": "CtsKeystorePerformanceTestCases"
+    },
+    {
+      "name": "keystore2_client_tests"
+    },
+    {
+      "name": "librkpd_client.test"
+    },
+    {
+      "name": "libwatchdog_rs.test"
     }
   ]
 }
