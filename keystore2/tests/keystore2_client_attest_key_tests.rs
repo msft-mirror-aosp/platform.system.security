@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nix::unistd::getuid;
-
+use crate::keystore2_client_test_utils::{
+    app_attest_key_feature_exists, device_id_attestation_feature_exists, get_attest_id_value,
+    is_second_imei_id_attestation_required, skip_device_id_attest_tests,
+};
+use crate::{
+    skip_device_id_attestation_tests, skip_test_if_no_app_attest_key_feature,
+    skip_test_if_no_device_id_attestation_feature,
+};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, BlockMode::BlockMode, Digest::Digest, EcCurve::EcCurve,
     ErrorCode::ErrorCode, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
@@ -23,22 +29,12 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, IKeystoreService::IKeystoreService, KeyDescriptor::KeyDescriptor,
     ResponseCode::ResponseCode,
 };
-
-use keystore2_test_utils::{
-    authorizations, get_keystore_service, key_generations, key_generations::Error,
-};
-
 use keystore2_test_utils::ffi_test_utils::{get_value_from_attest_record, validate_certchain};
-
-use crate::{
-    skip_device_id_attestation_tests, skip_test_if_no_app_attest_key_feature,
-    skip_test_if_no_device_id_attestation_feature,
+use keystore2_test_utils::{
+    authorizations, key_generations, key_generations::Error, run_as, SecLevel,
 };
-
-use crate::keystore2_client_test_utils::{
-    app_attest_key_feature_exists, device_id_attestation_feature_exists, get_attest_id_value,
-    is_second_imei_id_attestation_required, skip_device_id_attest_tests,
-};
+use nix::unistd::{getuid, Gid, Uid};
+use rustutils::users::AID_USER_OFFSET;
 
 /// Generate RSA and EC attestation keys and use them for signing RSA-signing keys.
 /// Test should be able to generate attestation keys and use them successfully.
@@ -46,14 +42,13 @@ use crate::keystore2_client_test_utils::{
 fn keystore2_attest_rsa_signing_key_success() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
         let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sec_level, algo, att_challenge).unwrap();
+            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -63,7 +58,7 @@ fn keystore2_attest_rsa_signing_key_success() {
         // Create RSA signing key and use attestation key to sign it.
         let sign_key_alias = format!("ks_attest_rsa_signing_key_{}", getuid());
         let sign_key_metadata = key_generations::generate_rsa_key(
-            &sec_level,
+            &sl,
             Domain::APP,
             -1,
             Some(sign_key_alias),
@@ -94,14 +89,13 @@ fn keystore2_attest_rsa_signing_key_success() {
 fn keystore2_attest_rsa_encrypt_key_success() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
         let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sec_level, algo, att_challenge).unwrap();
+            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -111,7 +105,7 @@ fn keystore2_attest_rsa_encrypt_key_success() {
         // Create RSA encrypt/decrypt key and use attestation key to sign it.
         let decrypt_key_alias = format!("ks_attest_rsa_encrypt_key_{}", getuid());
         let decrypt_key_metadata = key_generations::generate_rsa_key(
-            &sec_level,
+            &sl,
             Domain::APP,
             -1,
             Some(decrypt_key_alias),
@@ -143,14 +137,13 @@ fn keystore2_attest_rsa_encrypt_key_success() {
 fn keystore2_attest_ec_key_success() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
         let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sec_level, algo, att_challenge).unwrap();
+            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -160,7 +153,7 @@ fn keystore2_attest_ec_key_success() {
         // Create EC key and use attestation key to sign it.
         let ec_key_alias = format!("ks_ec_attested_test_key_{}", getuid());
         let ec_key_metadata = key_generations::generate_ec_256_attested_key(
-            &sec_level,
+            &sl,
             Some(ec_key_alias),
             att_challenge,
             &attestation_key_metadata.key,
@@ -183,13 +176,12 @@ fn keystore2_attest_ec_key_success() {
 fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     // Create EcCurve::CURVE_25519 attestation key.
     let attestation_key_metadata = key_generations::generate_ec_attestation_key(
-        &sec_level,
+        &sl,
         att_challenge,
         Digest::NONE,
         EcCurve::CURVE_25519,
@@ -204,7 +196,7 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
     // Create RSA signing key and use attestation key to sign it.
     let sign_key_alias = format!("ksrsa_attested_sign_test_key_{}", getuid());
     let sign_key_metadata = key_generations::generate_rsa_key(
-        &sec_level,
+        &sl,
         Domain::APP,
         -1,
         Some(sign_key_alias),
@@ -233,9 +225,7 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
 #[test]
 fn keystore2_generate_rsa_attest_key_with_multi_purpose_fail() {
     skip_test_if_no_app_attest_key_feature!();
-
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
 
     let digest = Digest::SHA_2_256;
     let padding = PaddingMode::RSA_PKCS1_1_5_SIGN;
@@ -255,7 +245,7 @@ fn keystore2_generate_rsa_attest_key_with_multi_purpose_fail() {
         .rsa_public_exponent(65537)
         .padding_mode(padding);
 
-    let result = key_generations::map_ks_error(sec_level.generateKey(
+    let result = key_generations::map_ks_error(sl.binder.generateKey(
         &KeyDescriptor {
             domain: Domain::APP,
             nspace: -1,
@@ -276,9 +266,7 @@ fn keystore2_generate_rsa_attest_key_with_multi_purpose_fail() {
 #[test]
 fn keystore2_ec_attest_key_with_multi_purpose_fail() {
     skip_test_if_no_app_attest_key_feature!();
-
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
 
     let attest_key_alias = format!("ks_ec_attest_multipurpose_key_{}", getuid());
 
@@ -291,7 +279,7 @@ fn keystore2_ec_attest_key_with_multi_purpose_fail() {
         .digest(Digest::SHA_2_256)
         .ec_curve(EcCurve::P_256);
 
-    let result = key_generations::map_ks_error(sec_level.generateKey(
+    let result = key_generations::map_ks_error(sl.binder.generateKey(
         &KeyDescriptor {
             domain: Domain::APP,
             nspace: -1,
@@ -314,14 +302,12 @@ fn keystore2_ec_attest_key_with_multi_purpose_fail() {
 fn keystore2_attest_key_fails_missing_challenge() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     // Create RSA attestation key.
     let attestation_key_metadata =
-        key_generations::generate_attestation_key(&sec_level, Algorithm::RSA, att_challenge)
-            .unwrap();
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -331,7 +317,7 @@ fn keystore2_attest_key_fails_missing_challenge() {
     // Try to attest RSA signing key without providing attestation challenge.
     let sign_key_alias = format!("ksrsa_attested_test_key_missing_challenge{}", getuid());
     let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
-        &sec_level,
+        &sl,
         Domain::APP,
         -1,
         Some(sign_key_alias),
@@ -357,24 +343,18 @@ fn keystore2_attest_key_fails_missing_challenge() {
 fn keystore2_attest_rsa_key_with_non_attest_key_fails_incompat_purpose_error() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     let alias = format!("non_attest_key_{}", getuid());
-    let non_attest_key_metadata = key_generations::generate_ec_p256_signing_key(
-        &sec_level,
-        Domain::APP,
-        -1,
-        Some(alias),
-        None,
-    )
-    .unwrap();
+    let non_attest_key_metadata =
+        key_generations::generate_ec_p256_signing_key(&sl, Domain::APP, -1, Some(alias), None)
+            .unwrap();
 
     // Try to generate RSA signing key with non-attestation key to sign it.
     let sign_key_alias = format!("ksrsa_attested_sign_test_key_non_attest_{}", getuid());
     let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
-        &sec_level,
+        &sl,
         Domain::APP,
         -1,
         Some(sign_key_alias),
@@ -399,13 +379,12 @@ fn keystore2_attest_rsa_key_with_non_attest_key_fails_incompat_purpose_error() {
 fn keystore2_attest_rsa_key_with_symmetric_key_fails_sys_error() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     let alias = "aes_attest_key";
     let sym_key_metadata = key_generations::generate_sym_key(
-        &sec_level,
+        &sl,
         Algorithm::AES,
         128,
         alias,
@@ -418,7 +397,7 @@ fn keystore2_attest_rsa_key_with_symmetric_key_fails_sys_error() {
     // Try to generate RSA signing key with symmetric key as attestation key.
     let sign_key_alias = format!("ksrsa_attested_sign_test_key_sym_attest_{}", getuid());
     let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
-        &sec_level,
+        &sl,
         Domain::APP,
         -1,
         Some(sign_key_alias),
@@ -444,14 +423,12 @@ fn keystore2_attest_rsa_key_with_symmetric_key_fails_sys_error() {
 fn keystore2_attest_symmetric_key_fail_sys_error() {
     skip_test_if_no_app_attest_key_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
     let att_challenge: &[u8] = b"foo";
 
     // Create attestation key.
     let attestation_key_metadata =
-        key_generations::generate_attestation_key(&sec_level, Algorithm::RSA, att_challenge)
-            .unwrap();
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -470,7 +447,8 @@ fn keystore2_attest_symmetric_key_fail_sys_error() {
         .attestation_challenge(att_challenge.to_vec());
 
     let alias = format!("ks_test_sym_key_attest_{}", getuid());
-    let aes_key_metadata = sec_level
+    let aes_key_metadata = sl
+        .binder
         .generateKey(
             &KeyDescriptor { domain: Domain::APP, nspace: -1, alias: Some(alias), blob: None },
             Some(&attestation_key_metadata.key),
@@ -525,22 +503,21 @@ fn generate_attested_key_with_device_attest_ids(algorithm: Algorithm) {
     skip_test_if_no_device_id_attestation_feature!();
     skip_device_id_attestation_tests!();
     skip_test_if_no_app_attest_key_feature!();
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
 
     let att_challenge: &[u8] = b"foo";
 
     let attest_key_metadata =
-        key_generations::generate_attestation_key(&sec_level, algorithm, att_challenge).unwrap();
+        key_generations::generate_attestation_key(&sl, algorithm, att_challenge).unwrap();
 
-    let attest_id_params = get_attestation_ids(&keystore2);
+    let attest_id_params = get_attestation_ids(&sl.keystore2);
 
     for (attest_id, value) in attest_id_params {
         // Create RSA/EC key and use attestation key to sign it.
         let key_alias = format!("ks_attested_test_key_{}", getuid());
         let key_metadata =
             key_generations::map_ks_error(key_generations::generate_key_with_attest_id(
-                &sec_level,
+                &sl,
                 algorithm,
                 Some(key_alias),
                 att_challenge,
@@ -585,20 +562,15 @@ fn keystore2_attest_rsa_attestation_id() {
 fn keystore2_attest_key_fails_with_invalid_attestation_id() {
     skip_test_if_no_device_id_attestation_feature!();
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
 
     let digest = Digest::SHA_2_256;
     let att_challenge: &[u8] = b"foo";
 
     // Create EC-Attestation key.
-    let attest_key_metadata = key_generations::generate_ec_attestation_key(
-        &sec_level,
-        att_challenge,
-        digest,
-        EcCurve::P_256,
-    )
-    .unwrap();
+    let attest_key_metadata =
+        key_generations::generate_ec_attestation_key(&sl, att_challenge, digest, EcCurve::P_256)
+            .unwrap();
 
     let attest_id_params = vec![
         (Tag::ATTESTATION_ID_BRAND, b"invalid-brand".to_vec()),
@@ -614,7 +586,7 @@ fn keystore2_attest_key_fails_with_invalid_attestation_id() {
         // Create EC key and use attestation key to sign it.
         let ec_key_alias = format!("ks_ec_attested_test_key_fail_{}{}", getuid(), digest.0);
         let result = key_generations::map_ks_error(key_generations::generate_key_with_attest_id(
-            &sec_level,
+            &sl,
             Algorithm::EC,
             Some(ec_key_alias),
             att_challenge,
@@ -638,20 +610,18 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
         return;
     }
 
-    let keystore2 = get_keystore_service();
-    let sec_level = keystore2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+    let sl = SecLevel::tee();
 
     let att_challenge: &[u8] = b"foo";
     let attest_key_metadata =
-        key_generations::generate_attestation_key(&sec_level, Algorithm::RSA, att_challenge)
-            .unwrap();
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
 
-    let attest_id_params = get_attestation_ids(&keystore2);
+    let attest_id_params = get_attestation_ids(&sl.keystore2);
     for (attest_id, value) in attest_id_params {
         // Create RSA/EC key and use attestation key to sign it.
         let key_alias = format!("ks_attested_test_key_{}", getuid());
         let result = key_generations::map_ks_error(key_generations::generate_key_with_attest_id(
-            &sec_level,
+            &sl,
             Algorithm::RSA,
             Some(key_alias),
             att_challenge,
@@ -665,4 +635,50 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
         );
         assert_eq!(result.unwrap_err(), Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
     }
+}
+
+/// Try to generate an attestation key from user context with UID other than AID_SYSTEM or AID_ROOT
+/// and also there is no package name associated with it. In such case key generation should fail
+/// while collecting Attestation Application ID (AAID) from AAID provider service and keystore
+/// should return error response code - `GET_ATTESTATION_APPLICATION_ID_FAILED`.
+#[test]
+fn keystore2_generate_attested_key_fail_to_get_aaid() {
+    static APP_USER_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
+    const USER_ID: u32 = 99;
+    const APPLICATION_ID: u32 = 10001;
+    static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
+    static APP_GID: u32 = APP_UID;
+
+    // SAFETY: The test is run in a separate process with no other threads.
+    unsafe {
+        run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), || {
+            skip_test_if_no_app_attest_key_feature!();
+            let sl = SecLevel::tee();
+            let att_challenge: &[u8] = b"foo";
+            let alias = format!("ks_attest_rsa_encrypt_key_aaid_fail{}", getuid());
+
+            let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
+                &sl,
+                Domain::APP,
+                -1,
+                Some(alias),
+                &key_generations::KeyParams {
+                    key_size: 2048,
+                    purpose: vec![KeyPurpose::ATTEST_KEY],
+                    padding: Some(PaddingMode::RSA_PKCS1_1_5_SIGN),
+                    digest: Some(Digest::SHA_2_256),
+                    mgf_digest: None,
+                    block_mode: None,
+                    att_challenge: Some(att_challenge.to_vec()),
+                },
+                None,
+            ));
+
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED)
+            );
+        })
+    };
 }
