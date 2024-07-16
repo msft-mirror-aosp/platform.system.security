@@ -18,6 +18,14 @@ flag {
 }
 
 flag {
+  name: "disable_legacy_keystore_get"
+  namespace: "hardware_backed_security"
+  description: "This flag disables legacy keystore get and makes it so that get returns an error"
+  bug: "307460850"
+  is_fixed_read_only: true
+}
+
+flag {
   name: "import_previously_emulated_keys"
   namespace: "hardware_backed_security"
   description: "Include support for importing keys that were previously software-emulated into KeyMint"
