@@ -28,7 +28,7 @@ use crate::utils::{
     check_keystore_permission, uid_to_android_user, watchdog as wd,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    IKeyMintDevice::IKeyMintDevice, SecurityLevel::SecurityLevel,
+    ErrorCode::ErrorCode, IKeyMintDevice::IKeyMintDevice, SecurityLevel::SecurityLevel,
 };
 use android_security_maintenance::aidl::android::security::maintenance::IKeystoreMaintenance::{
     BnKeystoreMaintenance, IKeystoreMaintenance,
@@ -164,12 +164,21 @@ impl Maintenance {
                     name,
                     &sec_level_string
                 ),
-                Err(ref e) => log::error!(
-                    "Call to {} failed for security level {}: {}.",
-                    name,
-                    &sec_level_string,
-                    e
-                ),
+                Err(ref e) => {
+                    if *sec_level == SecurityLevel::STRONGBOX
+                        && e.downcast_ref::<Error>()
+                            == Some(&Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
+                    {
+                        log::info!("Call to {} failed for StrongBox as it is not available", name,)
+                    } else {
+                        log::error!(
+                            "Call to {} failed for security level {}: {}.",
+                            name,
+                            &sec_level_string,
+                            e
+                        )
+                    }
+                }
             }
             curr_result
         })
@@ -313,7 +322,7 @@ impl IKeystoreMaintenance for Maintenance {
     }
 
     fn deleteAllKeys(&self) -> BinderResult<()> {
-        log::warn!("deleteAllKeys()");
+        log::warn!("deleteAllKeys() invoked, indicating initial setup or post-factory reset");
         let _wp = wd::watch("IKeystoreMaintenance::deleteAllKeys");
         Self::delete_all_keys().map_err(into_logged_binder)
     }
