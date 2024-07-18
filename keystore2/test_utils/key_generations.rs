@@ -423,13 +423,25 @@ pub fn check_key_authorizations(
             return true;
         }
 
-        // Ignore below parameters if the backend is Keymaster and not KeyMint.
-        // Keymaster does not support these parameters. These key parameters are introduced in
-        // KeyMint1.0.
+        // `Tag::RSA_OAEP_MGF_DIGEST` was added in KeyMint 1.0, but the KeyMint VTS tests didn't
+        // originally check for its presence and so some implementations of early versions (< 3) of
+        // the KeyMint HAL don't include it (cf. b/297306437 and aosp/2758513).
+        //
+        // Given that Keymaster implementations will also omit this tag, skip the check for it
+        // altogether (and rely on the updated KeyMint VTS tests to ensure that up-level KeyMint
+        // implementations correctly populate this tag).
+        if matches!(key_param.tag, Tag::RSA_OAEP_MGF_DIGEST) {
+            return true;
+        }
+
         if sl.is_keymaster() {
-            if matches!(key_param.tag, Tag::RSA_OAEP_MGF_DIGEST | Tag::USAGE_COUNT_LIMIT) {
+            // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0, so don't check for it if the
+            // underlying device is a Keymaster implementation.
+            if matches!(key_param.tag, Tag::USAGE_COUNT_LIMIT) {
                 return true;
             }
+            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0, so don't check for it if the
+            // underlying device is a Keymaster implementation.
             if key_param.tag == Tag::PURPOSE
                 && key_param.value == KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)
             {
