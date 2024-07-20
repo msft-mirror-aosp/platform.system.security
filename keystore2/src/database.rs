@@ -1200,7 +1200,7 @@ impl KeystoreDB {
 
             // Find up to `max_blobs` more superseded key blobs, load their metadata and return it.
             let result: Vec<(i64, Vec<u8>)> = {
-                let _wp = wd::watch("handle_next_superseded_blob find_next");
+                let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob find_next");
                 let mut stmt = tx
                     .prepare(
                         "SELECT id, blob FROM persistent.blobentry
@@ -1231,7 +1231,7 @@ impl KeystoreDB {
                     .context("Trying to extract superseded blobs.")?
             };
 
-            let _wp = wd::watch("handle_next_superseded_blob load_metadata");
+            let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob load_metadata");
             let result = result
                 .into_iter()
                 .map(|(blob_id, blob)| {
@@ -1249,7 +1249,7 @@ impl KeystoreDB {
 
             // We did not find any superseded key blob, so let's remove other superseded blob in
             // one transaction.
-            let _wp = wd::watch("handle_next_superseded_blob delete");
+            let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob delete");
             tx.execute(
                 "DELETE FROM persistent.blobentry
                  WHERE NOT subcomponent_type = ?
