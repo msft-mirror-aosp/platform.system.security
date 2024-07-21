@@ -165,7 +165,7 @@ lazy_static! {
         (
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
-                let _wp = wd::watch("In invalidate key closure: calling deleteKey");
+                let _wp = wd::watch("invalidate key closure: calling IKeyMintDevice::deleteKey");
                 map_km_error(km_dev.deleteKey(blob))
                     .context(ks_err!("Trying to invalidate key blob."))
             }),
@@ -306,7 +306,7 @@ fn connect_keymint(
         }
     };
 
-    let wp = wd::watch("In connect_keymint: calling getHardwareInfo()");
+    let wp = wd::watch("connect_keymint: calling IKeyMintDevice::getHardwareInfo()");
     let mut hw_info =
         map_km_error(keymint.getHardwareInfo()).context(ks_err!("Failed to get hardware info."))?;
     drop(wp);
