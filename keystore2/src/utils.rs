@@ -146,8 +146,7 @@ fn check_android_permission(permission: &str) -> anyhow::Result<()> {
         binder::get_interface("permission")?;
 
     let binder_result = {
-        let _wp =
-            watchdog::watch("In check_device_attestation_permissions: calling checkPermission.");
+        let _wp = watchdog::watch("check_android_permission: calling checkPermission");
         permission_controller.checkPermission(
             permission,
             ThreadState::get_calling_pid(),
@@ -264,7 +263,9 @@ where
     log::debug!("import parameters={import_params:?}");
 
     let creation_result = {
-        let _wp = watchdog::watch("In utils::import_keyblob_and_perform_op: calling importKey.");
+        let _wp = watchdog::watch(
+            "utils::import_keyblob_and_perform_op: calling IKeyMintDevice::importKey",
+        );
         map_km_error(km_dev.importKey(&import_params, format, &key_material, None))
     }
     .context(ks_err!("Upgrade failed."))?;
@@ -304,7 +305,9 @@ where
     NewBlobHandler: FnOnce(&[u8]) -> Result<()>,
 {
     let upgraded_blob = {
-        let _wp = watchdog::watch("In utils::upgrade_keyblob_and_perform_op: calling upgradeKey.");
+        let _wp = watchdog::watch(
+            "utils::upgrade_keyblob_and_perform_op: calling IKeyMintDevice::upgradeKey.",
+        );
         map_km_error(km_dev.upgradeKey(key_blob, upgrade_params))
     }
     .context(ks_err!("Upgrade failed."))?;
