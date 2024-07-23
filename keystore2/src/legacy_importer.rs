@@ -923,7 +923,7 @@ fn get_key_characteristics_without_app_data(
         blob,
         &[],
         |blob| {
-            let _wd = wd::watch("Calling GetKeyCharacteristics.");
+            let _wd = wd::watch("get_key_characteristics_without_app_data: calling IKeyMintDevice::getKeyCharacteristics");
             map_km_error(km_dev.getKeyCharacteristics(blob, &[], &[]))
         },
         |_| Ok(()),
