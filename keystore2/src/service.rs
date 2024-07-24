@@ -35,7 +35,7 @@ use crate::{
     error::ResponseCode,
 };
 use crate::{
-    error::{self, map_or_log_err, ErrorCode},
+    error::{self, into_logged_binder, ErrorCode},
     id_rotation::IdRotationState,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::SecurityLevel::SecurityLevel;
@@ -62,11 +62,18 @@ impl KeystoreService {
         id_rotation_state: IdRotationState,
     ) -> Result<Strong<dyn IKeystoreService>> {
         let mut result: Self = Default::default();
-        let (dev, uuid) = KeystoreSecurityLevel::new_native_binder(
+        let (dev, uuid) = match KeystoreSecurityLevel::new_native_binder(
             SecurityLevel::TRUSTED_ENVIRONMENT,
             id_rotation_state.clone(),
-        )
-        .context(ks_err!("Trying to construct mandatory security level TEE."))?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Failed to construct mandatory security level TEE: {e:?}");
+                log::error!("Does the device have a /default Keymaster or KeyMint instance?");
+                return Err(e.context(ks_err!("Trying to construct mandatory security level TEE")));
+            }
+        };
+
         result.i_sec_level_by_uuid.insert(uuid, dev);
         result.uuid_by_sec_level.insert(SecurityLevel::TRUSTED_ENVIRONMENT, uuid);
 
@@ -381,14 +388,12 @@ impl IKeystoreService for KeystoreService {
         &self,
         security_level: SecurityLevel,
     ) -> binder::Result<Strong<dyn IKeystoreSecurityLevel>> {
-        let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, move || {
-            format!("security_level: {}", security_level.0)
-        });
-        map_or_log_err(self.get_security_level(security_level), Ok)
+        let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, security_level);
+        self.get_security_level(security_level).map_err(into_logged_binder)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::Result<KeyEntryResponse> {
-        let _wp = wd::watch_millis("IKeystoreService::get_key_entry", 500);
-        map_or_log_err(self.get_key_entry(key), Ok)
+        let _wp = wd::watch("IKeystoreService::get_key_entry");
+        self.get_key_entry(key).map_err(into_logged_binder)
     }
     fn updateSubcomponent(
         &self,
@@ -396,18 +401,18 @@ impl IKeystoreService for KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::updateSubcomponent", 500);
-        map_or_log_err(self.update_subcomponent(key, public_cert, certificate_chain), Ok)
+        let _wp = wd::watch("IKeystoreService::updateSubcomponent");
+        self.update_subcomponent(key, public_cert, certificate_chain).map_err(into_logged_binder)
     }
     fn listEntries(&self, domain: Domain, namespace: i64) -> binder::Result<Vec<KeyDescriptor>> {
-        let _wp = wd::watch_millis("IKeystoreService::listEntries", 500);
-        map_or_log_err(self.list_entries(domain, namespace), Ok)
+        let _wp = wd::watch("IKeystoreService::listEntries");
+        self.list_entries(domain, namespace).map_err(into_logged_binder)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::deleteKey", 500);
+        let _wp = wd::watch("IKeystoreService::deleteKey");
         let result = self.delete_key(key);
         log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());
-        map_or_log_err(result, Ok)
+        result.map_err(into_logged_binder)
     }
     fn grant(
         &self,
@@ -415,12 +420,12 @@ impl IKeystoreService for KeystoreService {
         grantee_uid: i32,
         access_vector: i32,
     ) -> binder::Result<KeyDescriptor> {
-        let _wp = wd::watch_millis("IKeystoreService::grant", 500);
-        map_or_log_err(self.grant(key, grantee_uid, access_vector.into()), Ok)
+        let _wp = wd::watch("IKeystoreService::grant");
+        self.grant(key, grantee_uid, access_vector.into()).map_err(into_logged_binder)
     }
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> binder::Result<()> {
-        let _wp = wd::watch_millis("IKeystoreService::ungrant", 500);
-        map_or_log_err(self.ungrant(key, grantee_uid), Ok)
+        let _wp = wd::watch("IKeystoreService::ungrant");
+        self.ungrant(key, grantee_uid).map_err(into_logged_binder)
     }
     fn listEntriesBatched(
         &self,
@@ -428,12 +433,12 @@ impl IKeystoreService for KeystoreService {
         namespace: i64,
         start_past_alias: Option<&str>,
     ) -> binder::Result<Vec<KeyDescriptor>> {
-        let _wp = wd::watch_millis("IKeystoreService::listEntriesBatched", 500);
-        map_or_log_err(self.list_entries_batched(domain, namespace, start_past_alias), Ok)
+        let _wp = wd::watch("IKeystoreService::listEntriesBatched");
+        self.list_entries_batched(domain, namespace, start_past_alias).map_err(into_logged_binder)
     }
 
     fn getNumberOfEntries(&self, domain: Domain, namespace: i64) -> binder::Result<i32> {
-        let _wp = wd::watch_millis("IKeystoreService::getNumberOfEntries", 500);
-        map_or_log_err(self.count_num_entries(domain, namespace), Ok)
+        let _wp = wd::watch("IKeystoreService::getNumberOfEntries");
+        self.count_num_entries(domain, namespace).map_err(into_logged_binder)
     }
 }

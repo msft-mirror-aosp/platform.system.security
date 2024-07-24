@@ -51,10 +51,7 @@ pub enum Error {
     Binder(ExceptionCode, i32),
 }
 
-/// This function should be used by authorization service calls to translate error conditions
-/// into service specific exceptions.
-///
-/// All error conditions get logged by this function.
+/// Translate an error into a service specific exception, logging along the way.
 ///
 /// `Error::Rc(x)` variants get mapped onto a service specific error code of `x`.
 /// Certain response codes may be returned from keystore/ResponseCode.aidl by the keystore2 modules,
@@ -64,53 +61,36 @@ pub enum Error {
 /// `selinux::Error::perm()` is mapped on `ResponseCode::PERMISSION_DENIED`.
 ///
 /// All non `Error` error conditions get mapped onto ResponseCode::SYSTEM_ERROR`.
-///
-/// `handle_ok` will be called if `result` is `Ok(value)` where `value` will be passed
-/// as argument to `handle_ok`. `handle_ok` must generate a `BinderResult<T>`, but it
-/// typically returns Ok(value).
-pub fn map_or_log_err<T, U, F>(result: Result<U>, handle_ok: F) -> BinderResult<T>
-where
-    F: FnOnce(U) -> BinderResult<T>,
-{
-    result.map_or_else(
-        |e| {
-            log::error!("{:#?}", e);
-            let root_cause = e.root_cause();
-            if let Some(KeystoreError::Rc(ks_rcode)) = root_cause.downcast_ref::<KeystoreError>() {
-                let rc = match *ks_rcode {
-                    // Although currently keystore2/ResponseCode.aidl and
-                    // authorization/ResponseCode.aidl share the same integer values for the
-                    // common response codes, this may deviate in the future, hence the
-                    // conversion here.
-                    KsResponseCode::SYSTEM_ERROR => ResponseCode::SYSTEM_ERROR.0,
-                    KsResponseCode::KEY_NOT_FOUND => ResponseCode::KEY_NOT_FOUND.0,
-                    KsResponseCode::VALUE_CORRUPTED => ResponseCode::VALUE_CORRUPTED.0,
-                    KsResponseCode::INVALID_ARGUMENT => ResponseCode::INVALID_ARGUMENT.0,
-                    // If the code paths of IKeystoreAuthorization aidl's methods happen to return
-                    // other error codes from KsResponseCode in the future, they should be converted
-                    // as well.
-                    _ => ResponseCode::SYSTEM_ERROR.0,
-                };
-                return Err(BinderStatus::new_service_specific_error(
-                    rc,
-                    anyhow_error_to_cstring(&e).as_deref(),
-                ));
-            }
-            let rc = match root_cause.downcast_ref::<Error>() {
-                Some(Error::Rc(rcode)) => rcode.0,
-                Some(Error::Binder(_, _)) => ResponseCode::SYSTEM_ERROR.0,
-                None => match root_cause.downcast_ref::<selinux::Error>() {
-                    Some(selinux::Error::PermissionDenied) => ResponseCode::PERMISSION_DENIED.0,
-                    _ => ResponseCode::SYSTEM_ERROR.0,
-                },
-            };
-            Err(BinderStatus::new_service_specific_error(
-                rc,
-                anyhow_error_to_cstring(&e).as_deref(),
-            ))
-        },
-        handle_ok,
-    )
+pub fn into_logged_binder(e: anyhow::Error) -> BinderStatus {
+    log::error!("{:#?}", e);
+    let root_cause = e.root_cause();
+    if let Some(KeystoreError::Rc(ks_rcode)) = root_cause.downcast_ref::<KeystoreError>() {
+        let rc = match *ks_rcode {
+            // Although currently keystore2/ResponseCode.aidl and
+            // authorization/ResponseCode.aidl share the same integer values for the
+            // common response codes, this may deviate in the future, hence the
+            // conversion here.
+            KsResponseCode::SYSTEM_ERROR => ResponseCode::SYSTEM_ERROR.0,
+            KsResponseCode::KEY_NOT_FOUND => ResponseCode::KEY_NOT_FOUND.0,
+            KsResponseCode::VALUE_CORRUPTED => ResponseCode::VALUE_CORRUPTED.0,
+            KsResponseCode::INVALID_ARGUMENT => ResponseCode::INVALID_ARGUMENT.0,
+            // If the code paths of IKeystoreAuthorization aidl's methods happen to return
+            // other error codes from KsResponseCode in the future, they should be converted
+            // as well.
+            _ => ResponseCode::SYSTEM_ERROR.0,
+        };
+        BinderStatus::new_service_specific_error(rc, anyhow_error_to_cstring(&e).as_deref())
+    } else {
+        let rc = match root_cause.downcast_ref::<Error>() {
+            Some(Error::Rc(rcode)) => rcode.0,
+            Some(Error::Binder(_, _)) => ResponseCode::SYSTEM_ERROR.0,
+            None => match root_cause.downcast_ref::<selinux::Error>() {
+                Some(selinux::Error::PermissionDenied) => ResponseCode::PERMISSION_DENIED.0,
+                _ => ResponseCode::SYSTEM_ERROR.0,
+            },
+        };
+        BinderStatus::new_service_specific_error(rc, anyhow_error_to_cstring(&e).as_deref())
+    }
 }
 
 /// This struct is defined to implement the aforementioned AIDL interface.
@@ -128,7 +108,8 @@ impl AuthorizationManager {
 
     fn add_auth_token(&self, auth_token: &HardwareAuthToken) -> Result<()> {
         // Check keystore permission.
-        check_keystore_permission(KeystorePerm::AddAuth).context(ks_err!())?;
+        check_keystore_permission(KeystorePerm::AddAuth)
+            .context(ks_err!("caller missing AddAuth permissions"))?;
 
         log::info!(
             "add_auth_token(challenge={}, userId={}, authId={}, authType={:#x}, timestamp={}ms)",
@@ -149,7 +130,8 @@ impl AuthorizationManager {
             user_id,
             password.is_some(),
         );
-        check_keystore_permission(KeystorePerm::Unlock).context(ks_err!("Unlock."))?;
+        check_keystore_permission(KeystorePerm::Unlock)
+            .context(ks_err!("caller missing Unlock permissions"))?;
         ENFORCEMENTS.set_device_locked(user_id, false);
 
         let mut skm = SUPER_KEY.write().unwrap();
@@ -160,7 +142,7 @@ impl AuthorizationManager {
             .context(ks_err!("Unlock with password."))
         } else {
             DB.with(|db| skm.try_unlock_user_with_biometric(&mut db.borrow_mut(), user_id as u32))
-                .context(ks_err!("try_unlock_user_with_biometric failed"))
+                .context(ks_err!("try_unlock_user_with_biometric failed user_id={user_id}"))
         }
     }
 
@@ -168,7 +150,7 @@ impl AuthorizationManager {
         &self,
         user_id: i32,
         unlocking_sids: &[i64],
-        mut weak_unlock_enabled: bool,
+        weak_unlock_enabled: bool,
     ) -> Result<()> {
         log::info!(
             "on_device_locked(user_id={}, unlocking_sids={:?}, weak_unlock_enabled={})",
@@ -176,10 +158,8 @@ impl AuthorizationManager {
             unlocking_sids,
             weak_unlock_enabled
         );
-        if !android_security_flags::fix_unlocked_device_required_keys_v2() {
-            weak_unlock_enabled = false;
-        }
-        check_keystore_permission(KeystorePerm::Lock).context(ks_err!("Lock"))?;
+        check_keystore_permission(KeystorePerm::Lock)
+            .context(ks_err!("caller missing Lock permission"))?;
         ENFORCEMENTS.set_device_locked(user_id, true);
         let mut skm = SUPER_KEY.write().unwrap();
         DB.with(|db| {
@@ -195,20 +175,16 @@ impl AuthorizationManager {
 
     fn on_weak_unlock_methods_expired(&self, user_id: i32) -> Result<()> {
         log::info!("on_weak_unlock_methods_expired(user_id={})", user_id);
-        if !android_security_flags::fix_unlocked_device_required_keys_v2() {
-            return Ok(());
-        }
-        check_keystore_permission(KeystorePerm::Lock).context(ks_err!("Lock"))?;
+        check_keystore_permission(KeystorePerm::Lock)
+            .context(ks_err!("caller missing Lock permission"))?;
         SUPER_KEY.write().unwrap().wipe_plaintext_unlocked_device_required_keys(user_id as u32);
         Ok(())
     }
 
     fn on_non_lskf_unlock_methods_expired(&self, user_id: i32) -> Result<()> {
         log::info!("on_non_lskf_unlock_methods_expired(user_id={})", user_id);
-        if !android_security_flags::fix_unlocked_device_required_keys_v2() {
-            return Ok(());
-        }
-        check_keystore_permission(KeystorePerm::Lock).context(ks_err!("Lock"))?;
+        check_keystore_permission(KeystorePerm::Lock)
+            .context(ks_err!("caller missing Lock permission"))?;
         SUPER_KEY.write().unwrap().wipe_all_unlocked_device_required_keys(user_id as u32);
         Ok(())
     }
@@ -221,7 +197,8 @@ impl AuthorizationManager {
     ) -> Result<AuthorizationTokens> {
         // Check permission. Function should return if this failed. Therefore having '?' at the end
         // is very important.
-        check_keystore_permission(KeystorePerm::GetAuthToken).context(ks_err!("GetAuthToken"))?;
+        check_keystore_permission(KeystorePerm::GetAuthToken)
+            .context(ks_err!("caller missing GetAuthToken permission"))?;
 
         // If the challenge is zero, return error
         if challenge == 0 {
@@ -240,7 +217,8 @@ impl AuthorizationManager {
         auth_types: &[HardwareAuthenticatorType],
     ) -> Result<i64> {
         // Check keystore permission.
-        check_keystore_permission(KeystorePerm::GetLastAuthTime).context(ks_err!())?;
+        check_keystore_permission(KeystorePerm::GetLastAuthTime)
+            .context(ks_err!("caller missing GetLastAuthTime permission"))?;
 
         let mut max_time: i64 = -1;
         for auth_type in auth_types.iter() {
@@ -264,13 +242,13 @@ impl Interface for AuthorizationManager {}
 
 impl IKeystoreAuthorization for AuthorizationManager {
     fn addAuthToken(&self, auth_token: &HardwareAuthToken) -> BinderResult<()> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::addAuthToken", 500);
-        map_or_log_err(self.add_auth_token(auth_token), Ok)
+        let _wp = wd::watch("IKeystoreAuthorization::addAuthToken");
+        self.add_auth_token(auth_token).map_err(into_logged_binder)
     }
 
     fn onDeviceUnlocked(&self, user_id: i32, password: Option<&[u8]>) -> BinderResult<()> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::onDeviceUnlocked", 500);
-        map_or_log_err(self.on_device_unlocked(user_id, password.map(|pw| pw.into())), Ok)
+        let _wp = wd::watch("IKeystoreAuthorization::onDeviceUnlocked");
+        self.on_device_unlocked(user_id, password.map(|pw| pw.into())).map_err(into_logged_binder)
     }
 
     fn onDeviceLocked(
@@ -279,18 +257,19 @@ impl IKeystoreAuthorization for AuthorizationManager {
         unlocking_sids: &[i64],
         weak_unlock_enabled: bool,
     ) -> BinderResult<()> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::onDeviceLocked", 500);
-        map_or_log_err(self.on_device_locked(user_id, unlocking_sids, weak_unlock_enabled), Ok)
+        let _wp = wd::watch("IKeystoreAuthorization::onDeviceLocked");
+        self.on_device_locked(user_id, unlocking_sids, weak_unlock_enabled)
+            .map_err(into_logged_binder)
     }
 
     fn onWeakUnlockMethodsExpired(&self, user_id: i32) -> BinderResult<()> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::onWeakUnlockMethodsExpired", 500);
-        map_or_log_err(self.on_weak_unlock_methods_expired(user_id), Ok)
+        let _wp = wd::watch("IKeystoreAuthorization::onWeakUnlockMethodsExpired");
+        self.on_weak_unlock_methods_expired(user_id).map_err(into_logged_binder)
     }
 
     fn onNonLskfUnlockMethodsExpired(&self, user_id: i32) -> BinderResult<()> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::onNonLskfUnlockMethodsExpired", 500);
-        map_or_log_err(self.on_non_lskf_unlock_methods_expired(user_id), Ok)
+        let _wp = wd::watch("IKeystoreAuthorization::onNonLskfUnlockMethodsExpired");
+        self.on_non_lskf_unlock_methods_expired(user_id).map_err(into_logged_binder)
     }
 
     fn getAuthTokensForCredStore(
@@ -299,15 +278,9 @@ impl IKeystoreAuthorization for AuthorizationManager {
         secure_user_id: i64,
         auth_token_max_age_millis: i64,
     ) -> binder::Result<AuthorizationTokens> {
-        let _wp = wd::watch_millis("IKeystoreAuthorization::getAuthTokensForCredStore", 500);
-        map_or_log_err(
-            self.get_auth_tokens_for_credstore(
-                challenge,
-                secure_user_id,
-                auth_token_max_age_millis,
-            ),
-            Ok,
-        )
+        let _wp = wd::watch("IKeystoreAuthorization::getAuthTokensForCredStore");
+        self.get_auth_tokens_for_credstore(challenge, secure_user_id, auth_token_max_age_millis)
+            .map_err(into_logged_binder)
     }
 
     fn getLastAuthTime(
@@ -316,7 +289,7 @@ impl IKeystoreAuthorization for AuthorizationManager {
         auth_types: &[HardwareAuthenticatorType],
     ) -> binder::Result<i64> {
         if aconfig_android_hardware_biometrics_rust::last_authentication_time() {
-            map_or_log_err(self.get_last_auth_time(secure_user_id, auth_types), Ok)
+            self.get_last_auth_time(secure_user_id, auth_types).map_err(into_logged_binder)
         } else {
             Err(BinderStatus::new_service_specific_error(
                 ResponseCode::PERMISSION_DENIED.0,

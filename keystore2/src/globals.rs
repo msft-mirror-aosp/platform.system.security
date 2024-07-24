@@ -16,6 +16,7 @@
 //! database connections and connections to services that Keystore needs
 //! to talk to.
 
+use crate::async_task::AsyncTask;
 use crate::gc::Gc;
 use crate::km_compat::{BacklevelKeyMintWrapper, KeyMintV1};
 use crate::ks_err;
@@ -23,7 +24,6 @@ use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_importer::LegacyImporter;
 use crate::super_key::SuperKeyManager;
 use crate::utils::watchdog as wd;
-use crate::{async_task::AsyncTask, database::BootTime};
 use crate::{
     database::KeystoreDB,
     database::Uuid,
@@ -44,8 +44,8 @@ use android_hardware_security_secureclock::aidl::android::hardware::security::se
 };
 use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 use anyhow::{Context, Result};
-use binder::get_declared_instances;
 use binder::FromIBinder;
+use binder::{get_declared_instances, is_declared};
 use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{cell::RefCell, sync::Once};
@@ -62,22 +62,25 @@ static DB_INIT: Once = Once::new();
 /// is run only once, as long as the ASYNC_TASK instance is the same. So only one additional
 /// database connection is created for the garbage collector worker.
 pub fn create_thread_local_db() -> KeystoreDB {
-    let db_path = DB_PATH.read().expect("Could not get the database directory.");
+    let db_path = DB_PATH.read().expect("Could not get the database directory");
 
-    let mut db = KeystoreDB::new(&db_path, Some(GC.clone())).expect("Failed to open database.");
+    let result = KeystoreDB::new(&db_path, Some(GC.clone()));
+    let mut db = match result {
+        Ok(db) => db,
+        Err(e) => {
+            log::error!("Failed to open Keystore database at {db_path:?}: {e:?}");
+            log::error!("Has /data been mounted correctly?");
+            panic!("Failed to open database for Keystore, cannot continue: {e:?}")
+        }
+    };
 
     DB_INIT.call_once(|| {
         log::info!("Touching Keystore 2.0 database for this first time since boot.");
-        db.insert_last_off_body(BootTime::now());
         log::info!("Calling cleanup leftovers.");
-        let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup.");
+        let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup");
         if n != 0 {
             log::info!(
-                concat!(
-                    "Cleaned up {} failed entries. ",
-                    "This indicates keystore crashed during key generation."
-                ),
-                n
+                "Cleaned up {n} failed entries, indicating keystore crash on key generation"
             );
         }
     });
@@ -89,8 +92,7 @@ thread_local! {
     /// same database multiple times is safe as long as each connection is
     /// used by only one thread. So we store one database connection per
     /// thread in this thread local key.
-    pub static DB: RefCell<KeystoreDB> =
-            RefCell::new(create_thread_local_db());
+    pub static DB: RefCell<KeystoreDB> = RefCell::new(create_thread_local_db());
 }
 
 struct DevicesMap<T: FromIBinder + ?Sized> {
@@ -155,7 +157,7 @@ lazy_static! {
     /// LegacyBlobLoader is initialized and exists globally.
     /// The same directory used by the database is used by the LegacyBlobLoader as well.
     pub static ref LEGACY_BLOB_LOADER: Arc<LegacyBlobLoader> = Arc::new(LegacyBlobLoader::new(
-        &DB_PATH.read().expect("Could not get the database path for legacy blob loader.")));
+        &DB_PATH.read().expect("Could not determine database path for legacy blob loader")));
     /// Legacy migrator. Atomically migrates legacy blobs to the database.
     pub static ref LEGACY_IMPORTER: Arc<LegacyImporter> =
         Arc::new(LegacyImporter::new(Arc::new(Default::default())));
@@ -166,12 +168,12 @@ lazy_static! {
         (
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
-                let _wp = wd::watch_millis("In invalidate key closure: calling deleteKey", 500);
+                let _wp = wd::watch("invalidate key closure: calling IKeyMintDevice::deleteKey");
                 map_km_error(km_dev.deleteKey(blob))
                     .context(ks_err!("Trying to invalidate key blob."))
             }),
-            KeystoreDB::new(&DB_PATH.read().expect("Could not get the database directory."), None)
-                .expect("Failed to open database."),
+            KeystoreDB::new(&DB_PATH.read().expect("Could not determine database path for GC"), None)
+                .expect("Failed to open database"),
             SUPER_KEY.clone(),
         )
     }));
@@ -247,7 +249,11 @@ fn connect_keymint(
                     }
                     e => e,
                 })
-                .context(ks_err!("Trying to get Legacy wrapper."))?,
+                .context(ks_err!(
+                    "Trying to get Legacy wrapper. Attempt to get keystore \
+                    compat service for security level {:?}",
+                    *security_level
+                ))?,
             None,
         )
     };
@@ -303,7 +309,7 @@ fn connect_keymint(
         }
     };
 
-    let wp = wd::watch_millis("In connect_keymint: calling getHardwareInfo()", 500);
+    let wp = wd::watch("connect_keymint: calling IKeyMintDevice::getHardwareInfo()");
     let mut hw_info =
         map_km_error(keymint.getHardwareInfo()).context(ks_err!("Failed to get hardware info."))?;
     drop(wp);
@@ -394,7 +400,7 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
                 }
                 e => e,
             })
-            .context(ks_err!("Trying to get Legacy wrapper."))
+            .context(ks_err!("Failed attempt to get legacy secure clock."))
     }?;
 
     Ok(secureclock)
@@ -417,19 +423,20 @@ pub fn get_timestamp_service() -> Result<Strong<dyn ISecureClock>> {
 pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -> Result<String> {
     let remote_prov_descriptor: &str =
         <BpRemotelyProvisionedComponent as IRemotelyProvisionedComponent>::get_descriptor();
-    let remotely_prov_instances = get_declared_instances(remote_prov_descriptor).unwrap();
 
     match *security_level {
         SecurityLevel::TRUSTED_ENVIRONMENT => {
-            if remotely_prov_instances.iter().any(|instance| *instance == "default") {
-                Some(format!("{}/default", remote_prov_descriptor))
+            let instance = format!("{}/default", remote_prov_descriptor);
+            if is_declared(&instance)? {
+                Some(instance)
             } else {
                 None
             }
         }
         SecurityLevel::STRONGBOX => {
-            if remotely_prov_instances.iter().any(|instance| *instance == "strongbox") {
-                Some(format!("{}/strongbox", remote_prov_descriptor))
+            let instance = format!("{}/strongbox", remote_prov_descriptor);
+            if is_declared(&instance)? {
+                Some(instance)
             } else {
                 None
             }
@@ -437,5 +444,5 @@ pub fn get_remotely_provisioned_component_name(security_level: &SecurityLevel) -
         _ => None,
     }
     .ok_or(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-    .context(ks_err!())
+    .context(ks_err!("Failed to get rpc for sec level {:?}", *security_level))
 }
