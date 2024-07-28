@@ -62,21 +62,25 @@ static DB_INIT: Once = Once::new();
 /// is run only once, as long as the ASYNC_TASK instance is the same. So only one additional
 /// database connection is created for the garbage collector worker.
 pub fn create_thread_local_db() -> KeystoreDB {
-    let db_path = DB_PATH.read().expect("Could not get the database directory.");
+    let db_path = DB_PATH.read().expect("Could not get the database directory");
 
-    let mut db = KeystoreDB::new(&db_path, Some(GC.clone())).expect("Failed to open database.");
+    let result = KeystoreDB::new(&db_path, Some(GC.clone()));
+    let mut db = match result {
+        Ok(db) => db,
+        Err(e) => {
+            log::error!("Failed to open Keystore database at {db_path:?}: {e:?}");
+            log::error!("Has /data been mounted correctly?");
+            panic!("Failed to open database for Keystore, cannot continue: {e:?}")
+        }
+    };
 
     DB_INIT.call_once(|| {
         log::info!("Touching Keystore 2.0 database for this first time since boot.");
         log::info!("Calling cleanup leftovers.");
-        let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup.");
+        let n = db.cleanup_leftovers().expect("Failed to cleanup database on startup");
         if n != 0 {
             log::info!(
-                concat!(
-                    "Cleaned up {} failed entries. ",
-                    "This indicates keystore crashed during key generation."
-                ),
-                n
+                "Cleaned up {n} failed entries, indicating keystore crash on key generation"
             );
         }
     });
@@ -88,8 +92,7 @@ thread_local! {
     /// same database multiple times is safe as long as each connection is
     /// used by only one thread. So we store one database connection per
     /// thread in this thread local key.
-    pub static DB: RefCell<KeystoreDB> =
-            RefCell::new(create_thread_local_db());
+    pub static DB: RefCell<KeystoreDB> = RefCell::new(create_thread_local_db());
 }
 
 struct DevicesMap<T: FromIBinder + ?Sized> {
@@ -154,7 +157,7 @@ lazy_static! {
     /// LegacyBlobLoader is initialized and exists globally.
     /// The same directory used by the database is used by the LegacyBlobLoader as well.
     pub static ref LEGACY_BLOB_LOADER: Arc<LegacyBlobLoader> = Arc::new(LegacyBlobLoader::new(
-        &DB_PATH.read().expect("Could not get the database path for legacy blob loader.")));
+        &DB_PATH.read().expect("Could not determine database path for legacy blob loader")));
     /// Legacy migrator. Atomically migrates legacy blobs to the database.
     pub static ref LEGACY_IMPORTER: Arc<LegacyImporter> =
         Arc::new(LegacyImporter::new(Arc::new(Default::default())));
@@ -169,8 +172,8 @@ lazy_static! {
                 map_km_error(km_dev.deleteKey(blob))
                     .context(ks_err!("Trying to invalidate key blob."))
             }),
-            KeystoreDB::new(&DB_PATH.read().expect("Could not get the database directory."), None)
-                .expect("Failed to open database."),
+            KeystoreDB::new(&DB_PATH.read().expect("Could not determine database path for GC"), None)
+                .expect("Failed to open database"),
             SUPER_KEY.clone(),
         )
     }));
