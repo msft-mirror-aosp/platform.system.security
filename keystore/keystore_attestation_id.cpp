@@ -21,6 +21,7 @@
 #include <log/log.h>
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,7 @@ namespace {
 constexpr const char* kAttestationSystemPackageName = "AndroidSystem";
 constexpr const size_t kMaxAttempts = 3;
 constexpr const unsigned long kRetryIntervalUsecs = 500000;  // sleep for 500 ms
+constexpr const char* kProviderServiceName = "sec_key_att_app_id_provider";
 
 std::vector<uint8_t> signature2SHA256(const security::keystore::Signature& sig) {
     std::vector<uint8_t> digest_buffer(SHA256_DIGEST_LENGTH);
@@ -61,24 +63,24 @@ std::vector<uint8_t> signature2SHA256(const security::keystore::Signature& sig) 
 using ::aidl::android::system::keystore2::ResponseCode;
 using ::android::security::keystore::BpKeyAttestationApplicationIdProvider;
 
-class KeyAttestationApplicationIdProvider : public BpKeyAttestationApplicationIdProvider {
-  public:
-    KeyAttestationApplicationIdProvider();
+[[clang::no_destroy]] std::mutex gServiceMu;
+[[clang::no_destroy]] std::shared_ptr<BpKeyAttestationApplicationIdProvider>
+    gService;  // GUARDED_BY gServiceMu
 
-    static KeyAttestationApplicationIdProvider& get();
-
-  private:
-    android::sp<android::IServiceManager> service_manager_;
-};
-
-KeyAttestationApplicationIdProvider& KeyAttestationApplicationIdProvider::get() {
-    static KeyAttestationApplicationIdProvider mpm;
-    return mpm;
+std::shared_ptr<BpKeyAttestationApplicationIdProvider> get_service() {
+    std::lock_guard<std::mutex> guard(gServiceMu);
+    if (gService.get() == nullptr) {
+        gService = std::make_shared<BpKeyAttestationApplicationIdProvider>(
+            android::defaultServiceManager()->waitForService(String16(kProviderServiceName)));
+    }
+    return gService;
 }
 
-KeyAttestationApplicationIdProvider::KeyAttestationApplicationIdProvider()
-    : BpKeyAttestationApplicationIdProvider(android::defaultServiceManager()->waitForService(
-          String16("sec_key_att_app_id_provider"))) {}
+void reset_service() {
+    std::lock_guard<std::mutex> guard(gServiceMu);
+    // Drop the global reference; any thread that already has a reference can keep using it.
+    gService.reset();
+}
 
 DECLARE_STACK_OF(ASN1_OCTET_STRING);
 
@@ -281,23 +283,31 @@ StatusOr<std::vector<uint8_t>> gather_attestation_application_id(uid_t uid) {
         key_attestation_id.packageInfos.push_back(std::move(pinfo));
     } else {
         /* Get the attestation application ID from package manager */
-        auto& pm = KeyAttestationApplicationIdProvider::get();
         ::android::binder::Status status;
 
-        // Retry on failure if a service specific error code.
+        // Retry on failure.
         for (size_t attempt{0}; attempt < kMaxAttempts; ++attempt) {
-            status = pm.getKeyAttestationApplicationId(uid, &key_attestation_id);
+            auto pm = get_service();
+            status = pm->getKeyAttestationApplicationId(uid, &key_attestation_id);
             if (status.isOk()) {
                 break;
-            } else if (status.exceptionCode() != binder::Status::EX_SERVICE_SPECIFIC) {
-                ALOGW("Retry: key attestation ID failed with service specific error: %s %d",
-                      status.exceptionMessage().c_str(), status.serviceSpecificErrorCode());
-                usleep(kRetryIntervalUsecs);
-            } else {
-                ALOGW("Retry: key attestation ID failed with error: %s %d",
-                      status.exceptionMessage().c_str(), status.exceptionCode());
-                usleep(kRetryIntervalUsecs);
             }
+
+            if (status.exceptionCode() == binder::Status::EX_SERVICE_SPECIFIC) {
+                ALOGW("Retry: get attestation ID for %d failed with service specific error: %s %d",
+                      uid, status.exceptionMessage().c_str(), status.serviceSpecificErrorCode());
+            } else if (status.exceptionCode() == binder::Status::EX_TRANSACTION_FAILED) {
+                // If the transaction failed, drop the package manager connection so that the next
+                // attempt will try again.
+                ALOGW(
+                    "Retry: get attestation ID for %d transaction failed, reset connection: %s %d",
+                    uid, status.exceptionMessage().c_str(), status.exceptionCode());
+                reset_service();
+            } else {
+                ALOGW("Retry: get attestation ID for %d failed with error: %s %d", uid,
+                      status.exceptionMessage().c_str(), status.exceptionCode());
+            }
+            usleep(kRetryIntervalUsecs);
         }
 
         if (!status.isOk()) {
