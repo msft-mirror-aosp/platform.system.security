@@ -193,7 +193,30 @@ impl WatchdogState {
     }
 
     fn disarm(&mut self, index: Index) {
-        self.records.remove(&index);
+        let result = self.records.remove(&index);
+        if let Some(record) = result {
+            let now = Instant::now();
+            let timeout_left = record.deadline.saturating_duration_since(now);
+            if timeout_left == Duration::new(0, 0) {
+                match &record.context {
+                    Some(ctx) => log::info!(
+                        "Watchdog complete for: {:?} {} Pending: {:?} Overdue {:?} for {:?}",
+                        index.tid,
+                        index.id,
+                        record.started.elapsed(),
+                        record.deadline.elapsed(),
+                        ctx
+                    ),
+                    None => log::info!(
+                        "Watchdog complete for: {:?} {} Pending: {:?} Overdue {:?}",
+                        index.tid,
+                        index.id,
+                        record.started.elapsed(),
+                        record.deadline.elapsed()
+                    ),
+                }
+            }
+        }
     }
 
     fn arm(&mut self, index: Index, record: Record) {
