@@ -30,8 +30,11 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     ResponseCode::ResponseCode,
 };
 use keystore2_test_utils::ffi_test_utils::{get_value_from_attest_record, validate_certchain};
-use keystore2_test_utils::{authorizations, key_generations, key_generations::Error, SecLevel};
-use nix::unistd::getuid;
+use keystore2_test_utils::{
+    authorizations, key_generations, key_generations::Error, run_as, SecLevel,
+};
+use nix::unistd::{getuid, Gid, Uid};
+use rustutils::users::AID_USER_OFFSET;
 
 /// Generate RSA and EC attestation keys and use them for signing RSA-signing keys.
 /// Test should be able to generate attestation keys and use them successfully.
@@ -174,6 +177,13 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
     skip_test_if_no_app_attest_key_feature!();
 
     let sl = SecLevel::tee();
+    if sl.get_keymint_version() < 2 {
+        // Curve 25519 was included in version 2 of the KeyMint interface.
+        // For device with KeyMint-V1 or Keymaster in backend, emulated Ed25519 key can't attest
+        // to a "real" RSA key.
+        return;
+    }
+
     let att_challenge: &[u8] = b"foo";
 
     // Create EcCurve::CURVE_25519 attestation key.
@@ -223,6 +233,13 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
 fn keystore2_generate_rsa_attest_key_with_multi_purpose_fail() {
     skip_test_if_no_app_attest_key_feature!();
     let sl = SecLevel::tee();
+    if sl.get_keymint_version() < 2 {
+        // The KeyMint v1 spec required that KeyPurpose::ATTEST_KEY not be combined
+        // with other key purposes.  However, this was not checked at the time
+        // so we can only be strict about checking this for implementations of KeyMint
+        // version 2 and above.
+        return;
+    }
 
     let digest = Digest::SHA_2_256;
     let padding = PaddingMode::RSA_PKCS1_1_5_SIGN;
@@ -264,6 +281,13 @@ fn keystore2_generate_rsa_attest_key_with_multi_purpose_fail() {
 fn keystore2_ec_attest_key_with_multi_purpose_fail() {
     skip_test_if_no_app_attest_key_feature!();
     let sl = SecLevel::tee();
+    if sl.get_keymint_version() < 2 {
+        // The KeyMint v1 spec required that KeyPurpose::ATTEST_KEY not be combined
+        // with other key purposes.  However, this was not checked at the time
+        // so we can only be strict about checking this for implementations of KeyMint
+        // version 2 and above.
+        return;
+    }
 
     let attest_key_alias = format!("ks_ec_attest_multipurpose_key_{}", getuid());
 
@@ -632,4 +656,55 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
         );
         assert_eq!(result.unwrap_err(), Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
     }
+}
+
+/// Try to generate an attestation key from user context with UID other than AID_SYSTEM or AID_ROOT
+/// and also there is no package name associated with it. In such case key generation should fail
+/// while collecting Attestation Application ID (AAID) from AAID provider service and keystore
+/// should return error response code - `GET_ATTESTATION_APPLICATION_ID_FAILED`.
+#[test]
+fn keystore2_generate_attested_key_fail_to_get_aaid() {
+    static APP_USER_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
+    const USER_ID: u32 = 99;
+    const APPLICATION_ID: u32 = 10001;
+    static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
+    static APP_GID: u32 = APP_UID;
+
+    // SAFETY: The test is run in a separate process with no other threads.
+    unsafe {
+        run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), || {
+            skip_test_if_no_app_attest_key_feature!();
+            let sl = SecLevel::tee();
+            if sl.keystore2.getInterfaceVersion().unwrap() < 4 {
+                // `GET_ATTESTATION_APPLICATION_ID_FAILED` is supported on devices with
+                // `IKeystoreService` version >= 4.
+                return;
+            }
+            let att_challenge: &[u8] = b"foo";
+            let alias = format!("ks_attest_rsa_encrypt_key_aaid_fail{}", getuid());
+
+            let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
+                &sl,
+                Domain::APP,
+                -1,
+                Some(alias),
+                &key_generations::KeyParams {
+                    key_size: 2048,
+                    purpose: vec![KeyPurpose::ATTEST_KEY],
+                    padding: Some(PaddingMode::RSA_PKCS1_1_5_SIGN),
+                    digest: Some(Digest::SHA_2_256),
+                    mgf_digest: None,
+                    block_mode: None,
+                    att_challenge: Some(att_challenge.to_vec()),
+                },
+                None,
+            ));
+
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED)
+            );
+        })
+    };
 }
