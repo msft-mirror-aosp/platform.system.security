@@ -666,7 +666,7 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
 fn keystore2_generate_attested_key_fail_to_get_aaid() {
     static APP_USER_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
-    const APPLICATION_ID: u32 = 10001;
+    const APPLICATION_ID: u32 = 19901;
     static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
     static APP_GID: u32 = APP_UID;
 
