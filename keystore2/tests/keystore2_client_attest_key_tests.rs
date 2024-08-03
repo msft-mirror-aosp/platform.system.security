@@ -666,7 +666,7 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
 fn keystore2_generate_attested_key_fail_to_get_aaid() {
     static APP_USER_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
-    const APPLICATION_ID: u32 = 10001;
+    const APPLICATION_ID: u32 = 19901;
     static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
     static APP_GID: u32 = APP_UID;
 
@@ -675,6 +675,11 @@ fn keystore2_generate_attested_key_fail_to_get_aaid() {
         run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), || {
             skip_test_if_no_app_attest_key_feature!();
             let sl = SecLevel::tee();
+            if sl.keystore2.getInterfaceVersion().unwrap() < 4 {
+                // `GET_ATTESTATION_APPLICATION_ID_FAILED` is supported on devices with
+                // `IKeystoreService` version >= 4.
+                return;
+            }
             let att_challenge: &[u8] = b"foo";
             let alias = format!("ks_attest_rsa_encrypt_key_aaid_fail{}", getuid());
 
