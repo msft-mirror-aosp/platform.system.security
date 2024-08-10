@@ -141,6 +141,7 @@ fn keystore2_test_unlocked_device_required() {
 
                 let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
                 let params = AuthSetBuilder::new()
+                    .no_auth_required()
                     .unlocked_device_required()
                     .algorithm(Algorithm::EC)
                     .purpose(KeyPurpose::SIGN)
