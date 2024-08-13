@@ -30,7 +30,10 @@ rust_defaults {
         "keystore2_use_latest_aidl_rust",
         "structured_log_rust_defaults",
     ],
-
+    cfgs: select(release_flag("RELEASE_AVF_ENABLE_EARLY_VM"), {
+        true: ["early_vm"],
+        default: [],
+    }),
     rustlibs: [
         "android.hardware.security.rkp-V3-rust",
         "android.hardware.security.secureclock-V1-rust",
