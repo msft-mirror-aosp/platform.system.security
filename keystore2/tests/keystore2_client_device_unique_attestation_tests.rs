@@ -130,7 +130,7 @@ fn generate_device_unique_attested_key_with_device_attest_ids(
         let alias = "ks_test_device_unique_attest_id_test";
         match key_generations::map_ks_error(key_generations::generate_key(&sl, &gen_params, alias))
         {
-            Ok(key_metadata) => {
+            Ok(Some(key_metadata)) => {
                 let attest_id_value = get_value_from_attest_record(
                     key_metadata.certificate.as_ref().unwrap(),
                     attest_id,
@@ -140,6 +140,7 @@ fn generate_device_unique_attested_key_with_device_attest_ids(
                 assert_eq!(attest_id_value, value);
                 delete_app_key(&sl.keystore2, alias).unwrap();
             }
+            Ok(None) => {}
             Err(e) => {
                 assert_eq!(e, Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
             }
@@ -196,7 +197,7 @@ fn keystore2_gen_ec_key_device_unique_attest_with_strongbox_sec_level_test_succe
 
     let alias = "ks_device_unique_ec_key_attest_test";
     match key_generations::map_ks_error(key_generations::generate_key(&sl, &gen_params, alias)) {
-        Ok(key_metadata) => {
+        Ok(Some(key_metadata)) => {
             perform_sample_asym_sign_verify_op(
                 &sl.binder,
                 &key_metadata,
@@ -205,6 +206,7 @@ fn keystore2_gen_ec_key_device_unique_attest_with_strongbox_sec_level_test_succe
             );
             delete_app_key(&sl.keystore2, alias).unwrap();
         }
+        Ok(None) => {}
         Err(e) => {
             assert_eq!(e, Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
         }
@@ -235,7 +237,7 @@ fn keystore2_gen_rsa_key_device_unique_attest_with_strongbox_sec_level_test_succ
 
     let alias = "ks_device_unique_rsa_key_attest_test";
     match key_generations::map_ks_error(key_generations::generate_key(&sl, &gen_params, alias)) {
-        Ok(key_metadata) => {
+        Ok(Some(key_metadata)) => {
             perform_sample_asym_sign_verify_op(
                 &sl.binder,
                 &key_metadata,
@@ -244,6 +246,7 @@ fn keystore2_gen_rsa_key_device_unique_attest_with_strongbox_sec_level_test_succ
             );
             delete_app_key(&sl.keystore2, alias).unwrap();
         }
+        Ok(None) => {}
         Err(e) => {
             assert_eq!(e, Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
         }
@@ -285,7 +288,7 @@ fn keystore2_device_unique_attest_key_fails_with_invalid_attestation_id() {
         let result =
             key_generations::map_ks_error(key_generations::generate_key(&sl, &gen_params, alias));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::Km(ErrorCode::CANNOT_ATTEST_IDS)));
+        assert_eq!(result.unwrap_err(), Error::Km(ErrorCode::CANNOT_ATTEST_IDS));
     }
 }
 
