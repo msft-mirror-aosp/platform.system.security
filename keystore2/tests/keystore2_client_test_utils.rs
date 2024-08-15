@@ -40,7 +40,6 @@ use openssl::sign::Verifier;
 use openssl::x509::X509;
 use packagemanager_aidl::aidl::android::content::pm::IPackageManagerNative::IPackageManagerNative;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::process::{Command, Output};
 
 /// This enum is used to communicate between parent and child processes.
@@ -100,10 +99,7 @@ pub fn skip_device_id_attest_tests() -> bool {
     // (ro.product.*_for_attestation) reading logic would not be available for such devices
     // hence skipping this test for such scenario.
 
-    // This file is only present on GSI builds.
-    let gsi_marker = PathBuf::from("/system/system_ext/etc/init/init.gsi.rc");
-
-    get_vsr_api_level() < 34 && gsi_marker.as_path().is_file()
+    get_vsr_api_level() < 34 && key_generations::is_gsi()
 }
 
 #[macro_export]
