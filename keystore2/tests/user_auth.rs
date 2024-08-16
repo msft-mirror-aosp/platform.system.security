@@ -126,14 +126,22 @@ fn keystore2_test_unlocked_device_required() {
             Uid::from_raw(UID),
             Gid::from_raw(UID),
             move |reader, writer| -> Result<(), String> {
-                // Now we're in a new process, wait to be notified before starting.
-                reader.recv();
-
                 // Action A: create a new unlocked-device-required key (which thus requires
                 // super-encryption), while the device is unlocked.
                 let ks2 = get_keystore_service();
+                if ks2.getInterfaceVersion().unwrap() < 4 {
+                    // Assuming `IKeystoreAuthorization::onDeviceLocked` and
+                    // `IKeystoreAuthorization::onDeviceUnlocked` APIs will be supported on devices
+                    // with `IKeystoreService` >= 4.
+                    return Ok(());
+                }
+
+                // Now we're in a new process, wait to be notified before starting.
+                reader.recv();
+
                 let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
                 let params = AuthSetBuilder::new()
+                    .no_auth_required()
                     .unlocked_device_required()
                     .algorithm(Algorithm::EC)
                     .purpose(KeyPurpose::SIGN)
@@ -192,6 +200,14 @@ fn keystore2_test_unlocked_device_required() {
     }
     .unwrap();
 
+    let ks2 = get_keystore_service();
+    if ks2.getInterfaceVersion().unwrap() < 4 {
+        // Assuming `IKeystoreAuthorization::onDeviceLocked` and
+        // `IKeystoreAuthorization::onDeviceUnlocked` APIs will be supported on devices
+        // with `IKeystoreService` >= 4.
+        assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
+        return;
+    }
     // Now that the separate process has been forked off, it's safe to use binder.
     let user = TestUser::new();
     let user_id = user.id;
