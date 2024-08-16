@@ -40,14 +40,17 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     Authorization::Authorization, Domain::Domain, KeyDescriptor::KeyDescriptor,
 };
 use anyhow::{Context, Result};
-use binder::{Strong, ThreadState};
+use binder::{FromIBinder, StatusCode, Strong, ThreadState};
 use keystore2_apc_compat::{
     ApcCompatUiOptions, APC_COMPAT_ERROR_ABORTED, APC_COMPAT_ERROR_CANCELLED,
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
 use keystore2_crypto::{aes_gcm_decrypt, aes_gcm_encrypt, ZVec};
+use log::{info, warn};
 use std::iter::IntoIterator;
+use std::thread::sleep;
+use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
@@ -146,8 +149,7 @@ fn check_android_permission(permission: &str) -> anyhow::Result<()> {
         binder::get_interface("permission")?;
 
     let binder_result = {
-        let _wp =
-            watchdog::watch("In check_device_attestation_permissions: calling checkPermission.");
+        let _wp = watchdog::watch("check_android_permission: calling checkPermission");
         permission_controller.checkPermission(
             permission,
             ThreadState::get_calling_pid(),
@@ -264,7 +266,9 @@ where
     log::debug!("import parameters={import_params:?}");
 
     let creation_result = {
-        let _wp = watchdog::watch("In utils::import_keyblob_and_perform_op: calling importKey.");
+        let _wp = watchdog::watch(
+            "utils::import_keyblob_and_perform_op: calling IKeyMintDevice::importKey",
+        );
         map_km_error(km_dev.importKey(&import_params, format, &key_material, None))
     }
     .context(ks_err!("Upgrade failed."))?;
@@ -304,7 +308,9 @@ where
     NewBlobHandler: FnOnce(&[u8]) -> Result<()>,
 {
     let upgraded_blob = {
-        let _wp = watchdog::watch("In utils::upgrade_keyblob_and_perform_op: calling upgradeKey.");
+        let _wp = watchdog::watch(
+            "utils::upgrade_keyblob_and_perform_op: calling IKeyMintDevice::upgradeKey.",
+        );
         map_km_error(km_dev.upgradeKey(key_blob, upgrade_params))
     }
     .context(ks_err!("Upgrade failed."))?;
@@ -630,4 +636,26 @@ impl<T: AesGcmKey> AesGcm for T {
     fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         aes_gcm_encrypt(plaintext, self.key()).context(ks_err!("Encryption failed."))
     }
+}
+
+pub(crate) fn retry_get_interface<T: FromIBinder + ?Sized>(
+    name: &str,
+) -> Result<Strong<T>, StatusCode> {
+    let retry_count = if cfg!(early_vm) { 5 } else { 1 };
+
+    let mut wait_time = Duration::from_secs(5);
+    for i in 1..retry_count {
+        match binder::get_interface(name) {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                warn!("failed to get interface {name}. Retry {i}/{retry_count}: {e:?}");
+                sleep(wait_time);
+                wait_time *= 2;
+            }
+        }
+    }
+    if retry_count > 1 {
+        info!("{retry_count}-th (last) retry to get interface: {name}");
+    }
+    binder::get_interface(name)
 }
