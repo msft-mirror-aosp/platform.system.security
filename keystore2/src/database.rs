@@ -1902,6 +1902,7 @@ impl KeystoreDB {
     ///       `access_vector`.
     /// * Domain::KEY_ID: The keyentry table is queried for the owning `domain` and
     ///       `namespace`.
+    ///
     /// In each case the information returned is sufficient to perform the access
     /// check and the key id can be used to load further key artifacts.
     fn load_access_tuple(
