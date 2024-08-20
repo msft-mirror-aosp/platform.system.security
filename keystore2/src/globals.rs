@@ -23,7 +23,7 @@ use crate::ks_err;
 use crate::legacy_blob::LegacyBlobLoader;
 use crate::legacy_importer::LegacyImporter;
 use crate::super_key::SuperKeyManager;
-use crate::utils::watchdog as wd;
+use crate::utils::{retry_get_interface, watchdog as wd};
 use crate::{
     database::KeystoreDB,
     database::Uuid,
@@ -225,8 +225,12 @@ fn connect_keymint(
 
     let (keymint, hal_version) = if let Some(service_name) = service_name {
         let km: Strong<dyn IKeyMintDevice> =
-            map_binder_status_code(binder::get_interface(&service_name))
-                .context(ks_err!("Trying to connect to genuine KeyMint service."))?;
+            if SecurityLevel::TRUSTED_ENVIRONMENT == *security_level {
+                map_binder_status_code(retry_get_interface(&service_name))
+            } else {
+                map_binder_status_code(binder::get_interface(&service_name))
+            }
+            .context(ks_err!("Trying to connect to genuine KeyMint service."))?;
         // Map the HAL version code for KeyMint to be <AIDL version> * 100, so
         // - V1 is 100
         // - V2 is 200
