@@ -47,8 +47,12 @@ fn keystore2_attest_rsa_signing_key_success() {
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
-        let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
+        let Some(attestation_key_metadata) = key_generations::map_ks_error(
+            key_generations::generate_attestation_key(&sl, algo, att_challenge),
+        )
+        .unwrap() else {
+            return;
+        };
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -57,7 +61,7 @@ fn keystore2_attest_rsa_signing_key_success() {
 
         // Create RSA signing key and use attestation key to sign it.
         let sign_key_alias = format!("ks_attest_rsa_signing_key_{}", getuid());
-        let sign_key_metadata = key_generations::generate_rsa_key(
+        let Some(sign_key_metadata) = key_generations::generate_rsa_key(
             &sl,
             Domain::APP,
             -1,
@@ -73,7 +77,9 @@ fn keystore2_attest_rsa_signing_key_success() {
             },
             Some(&attestation_key_metadata.key),
         )
-        .unwrap();
+        .unwrap() else {
+            return;
+        };
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(sign_key_metadata.certificate.as_ref().unwrap());
@@ -94,8 +100,12 @@ fn keystore2_attest_rsa_encrypt_key_success() {
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
-        let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
+        let Some(attestation_key_metadata) = key_generations::map_ks_error(
+            key_generations::generate_attestation_key(&sl, algo, att_challenge),
+        )
+        .unwrap() else {
+            return;
+        };
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -104,7 +114,7 @@ fn keystore2_attest_rsa_encrypt_key_success() {
 
         // Create RSA encrypt/decrypt key and use attestation key to sign it.
         let decrypt_key_alias = format!("ks_attest_rsa_encrypt_key_{}", getuid());
-        let decrypt_key_metadata = key_generations::generate_rsa_key(
+        let Some(decrypt_key_metadata) = key_generations::generate_rsa_key(
             &sl,
             Domain::APP,
             -1,
@@ -120,7 +130,9 @@ fn keystore2_attest_rsa_encrypt_key_success() {
             },
             Some(&attestation_key_metadata.key),
         )
-        .unwrap();
+        .unwrap() else {
+            return;
+        };
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(decrypt_key_metadata.certificate.as_ref().unwrap());
@@ -142,8 +154,12 @@ fn keystore2_attest_ec_key_success() {
 
     for algo in [Algorithm::RSA, Algorithm::EC] {
         // Create attestation key.
-        let attestation_key_metadata =
-            key_generations::generate_attestation_key(&sl, algo, att_challenge).unwrap();
+        let Some(attestation_key_metadata) = key_generations::map_ks_error(
+            key_generations::generate_attestation_key(&sl, algo, att_challenge),
+        )
+        .unwrap() else {
+            return;
+        };
 
         let mut cert_chain: Vec<u8> = Vec::new();
         cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -187,13 +203,17 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
     let att_challenge: &[u8] = b"foo";
 
     // Create EcCurve::CURVE_25519 attestation key.
-    let attestation_key_metadata = key_generations::generate_ec_attestation_key(
-        &sl,
-        att_challenge,
-        Digest::NONE,
-        EcCurve::CURVE_25519,
-    )
-    .unwrap();
+    let Some(attestation_key_metadata) =
+        key_generations::map_ks_error(key_generations::generate_ec_attestation_key(
+            &sl,
+            att_challenge,
+            Digest::NONE,
+            EcCurve::CURVE_25519,
+        ))
+        .unwrap()
+    else {
+        return;
+    };
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -202,7 +222,7 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
 
     // Create RSA signing key and use attestation key to sign it.
     let sign_key_alias = format!("ksrsa_attested_sign_test_key_{}", getuid());
-    let sign_key_metadata = key_generations::generate_rsa_key(
+    let Some(sign_key_metadata) = key_generations::generate_rsa_key(
         &sl,
         Domain::APP,
         -1,
@@ -218,7 +238,9 @@ fn keystore2_attest_rsa_signing_key_with_ec_25519_key_success() {
         },
         Some(&attestation_key_metadata.key),
     )
-    .unwrap();
+    .unwrap() else {
+        return;
+    };
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(sign_key_metadata.certificate.as_ref().unwrap());
@@ -327,8 +349,12 @@ fn keystore2_attest_key_fails_missing_challenge() {
     let att_challenge: &[u8] = b"foo";
 
     // Create RSA attestation key.
-    let attestation_key_metadata =
-        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
+    let Some(attestation_key_metadata) = key_generations::map_ks_error(
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge),
+    )
+    .unwrap() else {
+        return;
+    };
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -448,8 +474,12 @@ fn keystore2_attest_symmetric_key_fail_sys_error() {
     let att_challenge: &[u8] = b"foo";
 
     // Create attestation key.
-    let attestation_key_metadata =
-        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
+    let Some(attestation_key_metadata) = key_generations::map_ks_error(
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge),
+    )
+    .unwrap() else {
+        return;
+    };
 
     let mut cert_chain: Vec<u8> = Vec::new();
     cert_chain.extend(attestation_key_metadata.certificate.as_ref().unwrap());
@@ -527,9 +557,12 @@ fn generate_attested_key_with_device_attest_ids(algorithm: Algorithm) {
     let sl = SecLevel::tee();
 
     let att_challenge: &[u8] = b"foo";
-
-    let attest_key_metadata =
-        key_generations::generate_attestation_key(&sl, algorithm, att_challenge).unwrap();
+    let Some(attest_key_metadata) = key_generations::map_ks_error(
+        key_generations::generate_attestation_key(&sl, algorithm, att_challenge),
+    )
+    .unwrap() else {
+        return;
+    };
 
     let attest_id_params = get_attestation_ids(&sl.keystore2);
 
@@ -589,9 +622,12 @@ fn keystore2_attest_key_fails_with_invalid_attestation_id() {
     let att_challenge: &[u8] = b"foo";
 
     // Create EC-Attestation key.
-    let attest_key_metadata =
-        key_generations::generate_ec_attestation_key(&sl, att_challenge, digest, EcCurve::P_256)
-            .unwrap();
+    let Some(attest_key_metadata) = key_generations::map_ks_error(
+        key_generations::generate_ec_attestation_key(&sl, att_challenge, digest, EcCurve::P_256),
+    )
+    .unwrap() else {
+        return;
+    };
 
     let attest_id_params = vec![
         (Tag::ATTESTATION_ID_BRAND, b"invalid-brand".to_vec()),
@@ -634,8 +670,12 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
     let sl = SecLevel::tee();
 
     let att_challenge: &[u8] = b"foo";
-    let attest_key_metadata =
-        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge).unwrap();
+    let Some(attest_key_metadata) = key_generations::map_ks_error(
+        key_generations::generate_attestation_key(&sl, Algorithm::RSA, att_challenge),
+    )
+    .unwrap() else {
+        return;
+    };
 
     let attest_id_params = get_attestation_ids(&sl.keystore2);
     for (attest_id, value) in attest_id_params {
