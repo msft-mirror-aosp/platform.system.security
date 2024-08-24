@@ -18,6 +18,7 @@
 //!  * getcon
 //!  * selinux_check_access
 //!  * selabel_lookup for the keystore2_key backend.
+//!
 //! And it provides an owning wrapper around context strings `Context`.
 
 // TODO(b/290018030): Remove this and add proper safety comments.
