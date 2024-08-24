@@ -376,6 +376,7 @@ fn keystore2_ops_prune_test() {
 ///   - untrusted_app
 ///   - system_server
 ///   - priv_app
+///
 /// `PERMISSION_DENIED` error response is expected.
 #[test]
 fn keystore2_forced_op_perm_denied_test() {

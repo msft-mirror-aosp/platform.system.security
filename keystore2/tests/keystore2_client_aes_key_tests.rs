@@ -75,6 +75,7 @@ fn create_aes_key_and_operation(
 /// Generate AES keys with various block modes and paddings.
 ///  - Block Modes: ECB, CBC
 ///  - Padding Modes: NONE, PKCS7
+///
 /// Test should generate keys and perform operation successfully.
 #[test]
 fn keystore2_aes_ecb_cbc_generate_key() {
@@ -106,6 +107,7 @@ fn keystore2_aes_ecb_cbc_generate_key() {
 /// Generate AES keys with -
 ///  - Block Modes: `CTR, GCM`
 ///  - Padding Modes: `NONE`
+///
 /// Test should generate keys and perform operation successfully.
 #[test]
 fn keystore2_aes_ctr_gcm_generate_key_success() {
@@ -133,6 +135,7 @@ fn keystore2_aes_ctr_gcm_generate_key_success() {
 /// Generate AES keys with -
 ///  - Block Modes: `CTR, GCM`
 ///  - Padding Modes: `PKCS7`
+///
 /// Try to create an operation using generated keys, test should fail to create an operation
 /// with an error code `INCOMPATIBLE_PADDING_MODE`.
 #[test]

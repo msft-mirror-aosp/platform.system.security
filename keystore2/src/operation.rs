@@ -31,6 +31,7 @@
 //!  * `abort` is called.
 //!  * The operation gets dropped.
 //!  * The operation gets pruned.
+//!
 //! `Operation` has an `Outcome` member. While the outcome is `Outcome::Unknown`,
 //! the operation is active and in a good state. Any of the above conditions may
 //! change the outcome to one of the defined outcomes Success, Abort, Dropped,
