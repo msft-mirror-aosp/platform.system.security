@@ -78,9 +78,12 @@ fn create_rsa_key_and_operation(
     key_params: &key_generations::KeyParams,
     op_purpose: KeyPurpose,
     forced_op: ForcedOp,
-) -> binder::Result<CreateOperationResponse> {
-    let key_metadata =
-        key_generations::generate_rsa_key(sl, domain, nspace, alias, key_params, None)?;
+) -> binder::Result<Option<CreateOperationResponse>> {
+    let Some(key_metadata) =
+        key_generations::generate_rsa_key(sl, domain, nspace, alias, key_params, None)?
+    else {
+        return Ok(None);
+    };
 
     let mut op_params = authorizations::AuthSetBuilder::new().purpose(op_purpose);
 
@@ -97,7 +100,7 @@ fn create_rsa_key_and_operation(
         op_params = op_params.block_mode(value)
     }
 
-    sl.binder.createOperation(&key_metadata.key, &op_params, forced_op.0)
+    sl.binder.createOperation(&key_metadata.key, &op_params, forced_op.0).map(Some)
 }
 
 /// Generate RSA signing key with given parameters and perform signing operation.
@@ -109,7 +112,7 @@ fn perform_rsa_sign_key_op_success(
 ) {
     let sl = SecLevel::tee();
 
-    let op_response = create_rsa_key_and_operation(
+    let Some(op_response) = create_rsa_key_and_operation(
         &sl,
         Domain::APP,
         -1,
@@ -126,7 +129,9 @@ fn perform_rsa_sign_key_op_success(
         KeyPurpose::SIGN,
         ForcedOp(false),
     )
-    .expect("Failed to create an operation.");
+    .expect("Failed to create an operation.") else {
+        return;
+    };
 
     assert!(op_response.iOperation.is_some());
     assert_eq!(
