@@ -56,6 +56,7 @@ rust_defaults {
         "libkeystore2_hal_names_rust",
         "libkeystore2_km_compat",
         "libkeystore2_selinux",
+        "liblazy_static",
         "liblibc",
         "liblog_rust",
         "libmessage_macro",

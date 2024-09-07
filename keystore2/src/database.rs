@@ -70,11 +70,12 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use anyhow::{anyhow, Context, Result};
 use keystore2_flags;
-use std::{convert::TryFrom, convert::TryInto, ops::Deref, sync::LazyLock, time::SystemTimeError};
+use std::{convert::TryFrom, convert::TryInto, ops::Deref, time::SystemTimeError};
 use utils as db_utils;
 use utils::SqlField;
 
 use keystore2_crypto::ZVec;
+use lazy_static::lazy_static;
 use log::error;
 #[cfg(not(test))]
 use rand::prelude::random;
@@ -528,7 +529,9 @@ impl KeyEntryLoadBits {
     }
 }
 
-static KEY_ID_LOCK: LazyLock<KeyIdLockDb> = LazyLock::new(KeyIdLockDb::new);
+lazy_static! {
+    static ref KEY_ID_LOCK: KeyIdLockDb = KeyIdLockDb::new();
+}
 
 struct KeyIdLockDb {
     locked_keys: Mutex<HashSet<i64>>,

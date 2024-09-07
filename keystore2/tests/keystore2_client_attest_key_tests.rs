@@ -562,8 +562,6 @@ fn keystore2_attest_rsa_attestation_id() {
 #[test]
 fn keystore2_attest_key_fails_with_invalid_attestation_id() {
     skip_test_if_no_device_id_attestation_feature!();
-    skip_device_id_attestation_tests!();
-    skip_test_if_no_app_attest_key_feature!();
 
     let sl = SecLevel::tee();
 

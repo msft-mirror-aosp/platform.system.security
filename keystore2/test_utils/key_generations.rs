@@ -466,19 +466,14 @@ pub fn check_key_authorizations(
             return true;
         }
 
-        // Don't check these parameters if the underlying device is a Keymaster implementation.
         if sl.is_keymaster() {
-            if matches!(
-                key_param.tag,
-                // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0.
-                Tag::USAGE_COUNT_LIMIT |
-                // Keymaster implementations may not consistently include `Tag::VENDOR_PATCHLEVEL`
-                // in generated key characteristics.
-                Tag::VENDOR_PATCHLEVEL
-            ) {
+            // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0, so don't check for it if the
+            // underlying device is a Keymaster implementation.
+            if matches!(key_param.tag, Tag::USAGE_COUNT_LIMIT) {
                 return true;
             }
-            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0.
+            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0, so don't check for it if the
+            // underlying device is a Keymaster implementation.
             if key_param.tag == Tag::PURPOSE
                 && key_param.value == KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)
             {
