@@ -38,6 +38,7 @@ use core::ops::Range;
 use nix::unistd::getuid;
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::path::PathBuf;
 
 /// Shell namespace.
 pub const SELINUX_SHELL_NAMESPACE: i64 = 1;
@@ -49,6 +50,10 @@ pub const TARGET_SU_CTX: &str = "u:r:su:s0";
 
 /// Vold context
 pub const TARGET_VOLD_CTX: &str = "u:r:vold:s0";
+
+const TEE_KEYMINT_RKP_ONLY: &str = "remote_provisioning.tee.rkp_only";
+
+const STRONGBOX_KEYMINT_RKP_ONLY: &str = "remote_provisioning.strongbox.rkp_only";
 
 /// Allowed tags in generated/imported key authorizations.
 /// See hardware/interfaces/security/keymint/aidl/android/hardware/security/keymint/Tag.aidl for the
@@ -387,6 +392,33 @@ pub fn map_ks_error<T>(r: BinderResult<T>) -> Result<T, Error> {
     })
 }
 
+/// Get the value of the given system property, if the given system property doesn't exist
+/// then returns an empty byte vector.
+pub fn get_system_prop(name: &str) -> Vec<u8> {
+    match rustutils::system_properties::read(name) {
+        Ok(Some(value)) => value.as_bytes().to_vec(),
+        _ => vec![],
+    }
+}
+
+/// Determines whether test is running on GSI.
+pub fn is_gsi() -> bool {
+    // This file is only present on GSI builds.
+    PathBuf::from("/system/system_ext/etc/init/init.gsi.rc").as_path().is_file()
+}
+
+/// Determines whether the test is on a GSI build where the rkp-only status of the device is
+/// unknown. GSI replaces the values for remote_prov_prop properties (since they’re
+/// system_internal_prop properties), so on GSI the properties are not reliable indicators of
+/// whether StrongBox/TEE is RKP-only or not.
+pub fn is_rkp_only_unknown_on_gsi(sec_level: SecurityLevel) -> bool {
+    if sec_level == SecurityLevel::TRUSTED_ENVIRONMENT {
+        is_gsi() && get_system_prop(TEE_KEYMINT_RKP_ONLY).is_empty()
+    } else {
+        is_gsi() && get_system_prop(STRONGBOX_KEYMINT_RKP_ONLY).is_empty()
+    }
+}
+
 /// Verify that given key param is listed in given authorizations list.
 pub fn check_key_param(authorizations: &[Authorization], key_param: &KeyParameter) -> bool {
     authorizations.iter().any(|auth| &auth.keyParameter == key_param)
@@ -401,9 +433,8 @@ pub fn check_key_authorizations(
 ) {
     // Make sure key authorizations contains only `ALLOWED_TAGS_IN_KEY_AUTHS`
     authorizations.iter().all(|auth| {
-        // Ignore `INVALID` tag if the backend is Keymaster and not KeyMint.
-        // Keymaster allows INVALID tag for unsupported key parameters.
-        if sl.is_keymaster() && auth.keyParameter.tag == Tag::INVALID {
+        // Ignore `INVALID` tag
+        if auth.keyParameter.tag == Tag::INVALID {
             return true;
         }
         assert!(
@@ -424,13 +455,30 @@ pub fn check_key_authorizations(
             return true;
         }
 
-        // Ignore below parameters if the backend is Keymaster and not KeyMint.
-        // Keymaster does not support these parameters. These key parameters are introduced in
-        // KeyMint1.0.
+        // `Tag::RSA_OAEP_MGF_DIGEST` was added in KeyMint 1.0, but the KeyMint VTS tests didn't
+        // originally check for its presence and so some implementations of early versions (< 3) of
+        // the KeyMint HAL don't include it (cf. b/297306437 and aosp/2758513).
+        //
+        // Given that Keymaster implementations will also omit this tag, skip the check for it
+        // altogether (and rely on the updated KeyMint VTS tests to ensure that up-level KeyMint
+        // implementations correctly populate this tag).
+        if matches!(key_param.tag, Tag::RSA_OAEP_MGF_DIGEST) {
+            return true;
+        }
+
+        // Don't check these parameters if the underlying device is a Keymaster implementation.
         if sl.is_keymaster() {
-            if matches!(key_param.tag, Tag::RSA_OAEP_MGF_DIGEST | Tag::USAGE_COUNT_LIMIT) {
+            if matches!(
+                key_param.tag,
+                // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0.
+                Tag::USAGE_COUNT_LIMIT |
+                // Keymaster implementations may not consistently include `Tag::VENDOR_PATCHLEVEL`
+                // in generated key characteristics.
+                Tag::VENDOR_PATCHLEVEL
+            ) {
                 return true;
             }
+            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0.
             if key_param.tag == Tag::PURPOSE
                 && key_param.value == KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)
             {
@@ -623,7 +671,7 @@ pub fn generate_rsa_key(
     alias: Option<String>,
     key_params: &KeyParams,
     attest_key: Option<&KeyDescriptor>,
-) -> binder::Result<KeyMetadata> {
+) -> binder::Result<Option<KeyMetadata>> {
     let mut gen_params = AuthSetBuilder::new()
         .no_auth_required()
         .algorithm(Algorithm::RSA)
@@ -649,13 +697,29 @@ pub fn generate_rsa_key(
         gen_params = gen_params.attestation_challenge(value.to_vec())
     }
 
-    let key_metadata = sl.binder.generateKey(
+    let key_metadata = match sl.binder.generateKey(
         &KeyDescriptor { domain, nspace, alias, blob: None },
         attest_key,
         &gen_params,
         0,
         b"entropy",
-    )?;
+    ) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return if is_rkp_only_unknown_on_gsi(sl.level)
+                && e.service_specific_error() == ErrorCode::ATTESTATION_KEYS_NOT_PROVISIONED.0
+            {
+                // GSI replaces the values for remote_prov_prop properties (since they’re
+                // system_internal_prop properties), so on GSI the properties are not
+                // reliable indicators of whether StrongBox/TEE are RKP-only or not.
+                // Test can be skipped if it generates a key with attestation but doesn't provide
+                // an ATTEST_KEY and rkp-only property is undetermined.
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+    };
 
     // Must have a public key.
     assert!(key_metadata.certificate.is_some());
@@ -686,7 +750,7 @@ pub fn generate_rsa_key(
             }
         ));
     }
-    Ok(key_metadata)
+    Ok(Some(key_metadata))
 }
 
 /// Generate AES/3DES key.
@@ -784,12 +848,12 @@ pub fn generate_attestation_key(
     sl: &SecLevel,
     algorithm: Algorithm,
     att_challenge: &[u8],
-) -> binder::Result<KeyMetadata> {
+) -> binder::Result<Option<KeyMetadata>> {
     assert!(algorithm == Algorithm::RSA || algorithm == Algorithm::EC);
 
     if algorithm == Algorithm::RSA {
         let alias = "ks_rsa_attest_test_key";
-        let metadata = generate_rsa_key(
+        generate_rsa_key(
             sl,
             Domain::APP,
             -1,
@@ -805,14 +869,8 @@ pub fn generate_attestation_key(
             },
             None,
         )
-        .unwrap();
-        Ok(metadata)
     } else {
-        let metadata =
-            generate_ec_attestation_key(sl, att_challenge, Digest::SHA_2_256, EcCurve::P_256)
-                .unwrap();
-
-        Ok(metadata)
+        generate_ec_attestation_key(sl, att_challenge, Digest::SHA_2_256, EcCurve::P_256)
     }
 }
 
@@ -823,7 +881,7 @@ pub fn generate_ec_attestation_key(
     att_challenge: &[u8],
     digest: Digest,
     ec_curve: EcCurve,
-) -> binder::Result<KeyMetadata> {
+) -> binder::Result<Option<KeyMetadata>> {
     let alias = "ks_attest_ec_test_key";
     let gen_params = AuthSetBuilder::new()
         .no_auth_required()
@@ -833,7 +891,7 @@ pub fn generate_ec_attestation_key(
         .digest(digest)
         .attestation_challenge(att_challenge.to_vec());
 
-    let attestation_key_metadata = sl.binder.generateKey(
+    let attestation_key_metadata = match sl.binder.generateKey(
         &KeyDescriptor {
             domain: Domain::APP,
             nspace: -1,
@@ -844,7 +902,23 @@ pub fn generate_ec_attestation_key(
         &gen_params,
         0,
         b"entropy",
-    )?;
+    ) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return if is_rkp_only_unknown_on_gsi(sl.level)
+                && e.service_specific_error() == ErrorCode::ATTESTATION_KEYS_NOT_PROVISIONED.0
+            {
+                // GSI replaces the values for remote_prov_prop properties (since they’re
+                // system_internal_prop properties), so on GSI the properties are not
+                // reliable indicators of whether StrongBox/TEE are RKP-only or not.
+                // Test can be skipped if it generates a key with attestation but doesn't provide
+                // an ATTEST_KEY and rkp-only property is undetermined.
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+    };
 
     // Should have public certificate.
     assert!(attestation_key_metadata.certificate.is_some());
@@ -857,7 +931,7 @@ pub fn generate_ec_attestation_key(
         &gen_params,
         KeyOrigin::GENERATED,
     );
-    Ok(attestation_key_metadata)
+    Ok(Some(attestation_key_metadata))
 }
 
 /// Generate EC-P-256 key and attest it with given attestation key.
@@ -1421,8 +1495,8 @@ pub fn generate_key(
     sl: &SecLevel,
     gen_params: &AuthSetBuilder,
     alias: &str,
-) -> binder::Result<KeyMetadata> {
-    let key_metadata = sl.binder.generateKey(
+) -> binder::Result<Option<KeyMetadata>> {
+    let key_metadata = match sl.binder.generateKey(
         &KeyDescriptor {
             domain: Domain::APP,
             nspace: -1,
@@ -1433,7 +1507,23 @@ pub fn generate_key(
         gen_params,
         0,
         b"entropy",
-    )?;
+    ) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return if is_rkp_only_unknown_on_gsi(sl.level)
+                && e.service_specific_error() == ErrorCode::ATTESTATION_KEYS_NOT_PROVISIONED.0
+            {
+                // GSI replaces the values for remote_prov_prop properties (since they’re
+                // system_internal_prop properties), so on GSI the properties are not
+                // reliable indicators of whether StrongBox/TEE are RKP-only or not.
+                // Test can be skipped if it generates a key with attestation but doesn't provide
+                // an ATTEST_KEY and rkp-only property is undetermined.
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+    };
 
     if gen_params.iter().any(|kp| {
         matches!(
@@ -1478,7 +1568,7 @@ pub fn generate_key(
     }
     check_key_authorizations(sl, &key_metadata.authorizations, gen_params, KeyOrigin::GENERATED);
 
-    Ok(key_metadata)
+    Ok(Some(key_metadata))
 }
 
 /// Generate a key using given authorizations and create an operation using the generated key.
@@ -1487,8 +1577,10 @@ pub fn create_key_and_operation(
     gen_params: &AuthSetBuilder,
     op_params: &AuthSetBuilder,
     alias: &str,
-) -> binder::Result<CreateOperationResponse> {
-    let key_metadata = generate_key(sl, gen_params, alias)?;
+) -> binder::Result<Option<CreateOperationResponse>> {
+    let Some(key_metadata) = generate_key(sl, gen_params, alias)? else {
+        return Ok(None);
+    };
 
-    sl.binder.createOperation(&key_metadata.key, op_params, false)
+    sl.binder.createOperation(&key_metadata.key, op_params, false).map(Some)
 }

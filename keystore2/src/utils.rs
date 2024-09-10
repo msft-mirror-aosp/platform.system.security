@@ -40,14 +40,20 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     Authorization::Authorization, Domain::Domain, KeyDescriptor::KeyDescriptor,
 };
 use anyhow::{Context, Result};
-use binder::{Strong, ThreadState};
+use binder::{FromIBinder, StatusCode, Strong, ThreadState};
 use keystore2_apc_compat::{
     ApcCompatUiOptions, APC_COMPAT_ERROR_ABORTED, APC_COMPAT_ERROR_CANCELLED,
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
 use keystore2_crypto::{aes_gcm_decrypt, aes_gcm_encrypt, ZVec};
+use log::{info, warn};
 use std::iter::IntoIterator;
+use std::thread::sleep;
+use std::time::Duration;
+
+#[cfg(test)]
+mod tests;
 
 /// Per RFC 5280 4.1.2.5, an undefined expiration (not-after) field should be set to GeneralizedTime
 /// 999912312359559, which is 253402300799000 ms from Jan 1, 1970.
@@ -143,8 +149,7 @@ fn check_android_permission(permission: &str) -> anyhow::Result<()> {
         binder::get_interface("permission")?;
 
     let binder_result = {
-        let _wp =
-            watchdog::watch("In check_device_attestation_permissions: calling checkPermission.");
+        let _wp = watchdog::watch("check_android_permission: calling checkPermission");
         permission_controller.checkPermission(
             permission,
             ThreadState::get_calling_pid(),
@@ -261,7 +266,9 @@ where
     log::debug!("import parameters={import_params:?}");
 
     let creation_result = {
-        let _wp = watchdog::watch("In utils::import_keyblob_and_perform_op: calling importKey.");
+        let _wp = watchdog::watch(
+            "utils::import_keyblob_and_perform_op: calling IKeyMintDevice::importKey",
+        );
         map_km_error(km_dev.importKey(&import_params, format, &key_material, None))
     }
     .context(ks_err!("Upgrade failed."))?;
@@ -301,7 +308,9 @@ where
     NewBlobHandler: FnOnce(&[u8]) -> Result<()>,
 {
     let upgraded_blob = {
-        let _wp = watchdog::watch("In utils::upgrade_keyblob_and_perform_op: calling upgradeKey.");
+        let _wp = watchdog::watch(
+            "utils::upgrade_keyblob_and_perform_op: calling IKeyMintDevice::upgradeKey.",
+        );
         map_km_error(km_dev.upgradeKey(key_blob, upgrade_params))
     }
     .context(ks_err!("Upgrade failed."))?;
@@ -629,129 +638,24 @@ impl<T: AesGcmKey> AesGcm for T {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
+pub(crate) fn retry_get_interface<T: FromIBinder + ?Sized>(
+    name: &str,
+) -> Result<Strong<T>, StatusCode> {
+    let retry_count = if cfg!(early_vm) { 5 } else { 1 };
 
-    #[test]
-    fn check_device_attestation_permissions_test() -> Result<()> {
-        check_device_attestation_permissions().or_else(|error| {
-            match error.root_cause().downcast_ref::<Error>() {
-                // Expected: the context for this test might not be allowed to attest device IDs.
-                Some(Error::Km(ErrorCode::CANNOT_ATTEST_IDS)) => Ok(()),
-                // Other errors are unexpected
-                _ => Err(error),
+    let mut wait_time = Duration::from_secs(5);
+    for i in 1..retry_count {
+        match binder::get_interface(name) {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                warn!("failed to get interface {name}. Retry {i}/{retry_count}: {e:?}");
+                sleep(wait_time);
+                wait_time *= 2;
             }
-        })
+        }
     }
-
-    fn create_key_descriptors_from_aliases(key_aliases: &[&str]) -> Vec<KeyDescriptor> {
-        key_aliases
-            .iter()
-            .map(|key_alias| KeyDescriptor {
-                domain: Domain::APP,
-                nspace: 0,
-                alias: Some(key_alias.to_string()),
-                blob: None,
-            })
-            .collect::<Vec<KeyDescriptor>>()
+    if retry_count > 1 {
+        info!("{retry_count}-th (last) retry to get interface: {name}");
     }
-
-    fn aliases_from_key_descriptors(key_descriptors: &[KeyDescriptor]) -> Vec<String> {
-        key_descriptors
-            .iter()
-            .map(
-                |kd| {
-                    if let Some(alias) = &kd.alias {
-                        String::from(alias)
-                    } else {
-                        String::from("")
-                    }
-                },
-            )
-            .collect::<Vec<String>>()
-    }
-
-    #[test]
-    fn test_safe_amount_to_return() -> Result<()> {
-        let key_aliases = vec!["key1", "key2", "key3"];
-        let key_descriptors = create_key_descriptors_from_aliases(&key_aliases);
-
-        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 20), 1);
-        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 50), 2);
-        assert_eq!(estimate_safe_amount_to_return(Domain::APP, 1017, &key_descriptors, 100), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_without_filtering() -> Result<()> {
-        let legacy_key_aliases = vec!["key_c", "key_a", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_a", "key_d"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result =
-            merge_and_filter_key_entry_lists(&legacy_key_descriptors, &db_key_descriptors, None);
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_a", "key_b", "key_c", "key_d"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_with_filtering() -> Result<()> {
-        let legacy_key_aliases = vec!["key_f", "key_a", "key_e", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_c", "key_g"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result = merge_and_filter_key_entry_lists(
-            &legacy_key_descriptors,
-            &db_key_descriptors,
-            Some("key_b"),
-        );
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_c", "key_e", "key_f", "key_g"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_with_filtering_and_dups() -> Result<()> {
-        let legacy_key_aliases = vec!["key_f", "key_a", "key_e", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_d", "key_e", "key_g"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result = merge_and_filter_key_entry_lists(
-            &legacy_key_descriptors,
-            &db_key_descriptors,
-            Some("key_c"),
-        );
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_d", "key_e", "key_f", "key_g"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_list_key_parameters_with_filter_on_security_sensitive_info() -> Result<()> {
-        let params = vec![
-            KmKeyParameter { tag: Tag::APPLICATION_ID, value: KeyParameterValue::Integer(0) },
-            KmKeyParameter { tag: Tag::APPLICATION_DATA, value: KeyParameterValue::Integer(0) },
-            KmKeyParameter {
-                tag: Tag::CERTIFICATE_NOT_AFTER,
-                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
-            },
-            KmKeyParameter {
-                tag: Tag::CERTIFICATE_NOT_BEFORE,
-                value: KeyParameterValue::DateTime(0),
-            },
-        ];
-        let wanted = vec![
-            KmKeyParameter {
-                tag: Tag::CERTIFICATE_NOT_AFTER,
-                value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
-            },
-            KmKeyParameter {
-                tag: Tag::CERTIFICATE_NOT_BEFORE,
-                value: KeyParameterValue::DateTime(0),
-            },
-        ];
-
-        assert_eq!(log_security_safe_params(&params), wanted);
-        Ok(())
-    }
+    binder::get_interface(name)
 }
