@@ -2415,6 +2415,81 @@ fn find_auth_token_entry_returns_latest() -> Result<()> {
     Ok(())
 }
 
+fn blob_count(db: &mut KeystoreDB, sc_type: SubComponentType) -> usize {
+    db.with_transaction(TransactionBehavior::Deferred, |tx| {
+        tx.query_row(
+            "SELECT COUNT(*) FROM persistent.blobentry
+                     WHERE subcomponent_type = ?;",
+            params![sc_type],
+            |row| row.get(0),
+        )
+        .context(ks_err!("Failed to count number of {sc_type:?} blobs"))
+        .no_gc()
+    })
+    .unwrap()
+}
+
+#[test]
+fn test_blobentry_gc() -> Result<()> {
+    let mut db = new_test_db()?;
+    let _key_id1 = make_test_key_entry(&mut db, Domain::APP, 1, "key1", None)?.0;
+    let key_guard2 = make_test_key_entry(&mut db, Domain::APP, 2, "key2", None)?;
+    let key_guard3 = make_test_key_entry(&mut db, Domain::APP, 3, "key3", None)?;
+    let key_id4 = make_test_key_entry(&mut db, Domain::APP, 4, "key4", None)?.0;
+    let key_id5 = make_test_key_entry(&mut db, Domain::APP, 5, "key5", None)?.0;
+
+    assert_eq!(5, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    // Replace the keyblobs for keys 2 and 3.  The previous blobs will still exist.
+    db.set_blob(&key_guard2, SubComponentType::KEY_BLOB, Some(&[1, 2, 3]), None)?;
+    db.set_blob(&key_guard3, SubComponentType::KEY_BLOB, Some(&[1, 2, 3]), None)?;
+
+    assert_eq!(7, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    // Delete keys 4 and 5.  The keyblobs aren't removed yet.
+    db.with_transaction(Immediate("TX_delete_test_keys"), |tx| {
+        KeystoreDB::mark_unreferenced(tx, key_id4)?;
+        KeystoreDB::mark_unreferenced(tx, key_id5)?;
+        Ok(()).no_gc()
+    })
+    .unwrap();
+
+    assert_eq!(7, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    // First garbage collection should return all 4 blobentry rows that are no longer current for
+    // their key.
+    let superseded = db.handle_next_superseded_blobs(&[], 20).unwrap();
+    let superseded_ids: Vec<i64> = superseded.iter().map(|v| v.blob_id).collect();
+    assert_eq!(4, superseded.len());
+    assert_eq!(7, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(5, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    // Feed the superseded blob IDs back in, to trigger removal of the old KEY_BLOB entries.  As no
+    // new superseded KEY_BLOBs are found, the unreferenced CERT/CERT_CHAIN blobs are removed.
+    let superseded = db.handle_next_superseded_blobs(&superseded_ids, 20).unwrap();
+    let superseded_ids: Vec<i64> = superseded.iter().map(|v| v.blob_id).collect();
+    assert_eq!(0, superseded.len());
+    assert_eq!(3, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(3, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(3, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    // Nothing left to garbage collect.
+    let superseded = db.handle_next_superseded_blobs(&superseded_ids, 20).unwrap();
+    assert_eq!(0, superseded.len());
+    assert_eq!(3, blob_count(&mut db, SubComponentType::KEY_BLOB));
+    assert_eq!(3, blob_count(&mut db, SubComponentType::CERT));
+    assert_eq!(3, blob_count(&mut db, SubComponentType::CERT_CHAIN));
+
+    Ok(())
+}
+
 #[test]
 fn test_load_key_descriptor() -> Result<()> {
     let mut db = new_test_db()?;
