@@ -49,6 +49,9 @@ use keystore2_apc_compat::{
 use keystore2_crypto::{aes_gcm_decrypt, aes_gcm_encrypt, ZVec};
 use std::iter::IntoIterator;
 
+#[cfg(test)]
+mod tests;
+
 /// Per RFC 5280 4.1.2.5, an undefined expiration (not-after) field should be set to GeneralizedTime
 /// 999912312359559, which is 253402300799000 ms from Jan 1, 1970.
 pub const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
@@ -514,6 +517,8 @@ fn merge_and_filter_key_entry_lists(
 }
 
 fn estimate_safe_amount_to_return(
+    domain: Domain,
+    namespace: i64,
     key_descriptors: &[KeyDescriptor],
     response_size_limit: usize,
 ) -> usize {
@@ -538,11 +543,9 @@ fn estimate_safe_amount_to_return(
         // 350KB and return a partial list.
         if returned_bytes > response_size_limit {
             log::warn!(
-                "Key descriptors list ({} items) may exceed binder \
-                       size, returning {} items est {} bytes.",
+                "{domain:?}:{namespace}: Key descriptors list ({} items) may exceed binder \
+                       size, returning {items_to_return} items est {returned_bytes} bytes.",
                 key_descriptors.len(),
-                items_to_return,
-                returned_bytes
             );
             break;
         }
@@ -576,7 +579,7 @@ pub fn list_key_entries(
 
     const RESPONSE_SIZE_LIMIT: usize = 358400;
     let safe_amount_to_return =
-        estimate_safe_amount_to_return(&merged_key_entries, RESPONSE_SIZE_LIMIT);
+        estimate_safe_amount_to_return(domain, namespace, &merged_key_entries, RESPONSE_SIZE_LIMIT);
     Ok(merged_key_entries[..safe_amount_to_return].to_vec())
 }
 
@@ -589,6 +592,15 @@ pub fn count_key_entries(db: &mut KeystoreDB, domain: Domain, namespace: i64) ->
     let num_keys_in_db = db.count_keys(domain, namespace, KeyType::Client)?;
 
     Ok((legacy_keys.len() + num_keys_in_db) as i32)
+}
+
+/// For params remove sensitive data before returning a string for logging
+pub fn log_security_safe_params(params: &[KmKeyParameter]) -> Vec<KmKeyParameter> {
+    params
+        .iter()
+        .filter(|kp| (kp.tag != Tag::APPLICATION_ID && kp.tag != Tag::APPLICATION_DATA))
+        .cloned()
+        .collect::<Vec<KmKeyParameter>>()
 }
 
 /// Trait implemented by objects that can be used to decrypt cipher text using AES-GCM.
@@ -617,103 +629,5 @@ impl<T: AesGcmKey> AesGcm for T {
 
     fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         aes_gcm_encrypt(plaintext, self.key()).context(ks_err!("Encryption failed."))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
-
-    #[test]
-    fn check_device_attestation_permissions_test() -> Result<()> {
-        check_device_attestation_permissions().or_else(|error| {
-            match error.root_cause().downcast_ref::<Error>() {
-                // Expected: the context for this test might not be allowed to attest device IDs.
-                Some(Error::Km(ErrorCode::CANNOT_ATTEST_IDS)) => Ok(()),
-                // Other errors are unexpected
-                _ => Err(error),
-            }
-        })
-    }
-
-    fn create_key_descriptors_from_aliases(key_aliases: &[&str]) -> Vec<KeyDescriptor> {
-        key_aliases
-            .iter()
-            .map(|key_alias| KeyDescriptor {
-                domain: Domain::APP,
-                nspace: 0,
-                alias: Some(key_alias.to_string()),
-                blob: None,
-            })
-            .collect::<Vec<KeyDescriptor>>()
-    }
-
-    fn aliases_from_key_descriptors(key_descriptors: &[KeyDescriptor]) -> Vec<String> {
-        key_descriptors
-            .iter()
-            .map(
-                |kd| {
-                    if let Some(alias) = &kd.alias {
-                        String::from(alias)
-                    } else {
-                        String::from("")
-                    }
-                },
-            )
-            .collect::<Vec<String>>()
-    }
-
-    #[test]
-    fn test_safe_amount_to_return() -> Result<()> {
-        let key_aliases = vec!["key1", "key2", "key3"];
-        let key_descriptors = create_key_descriptors_from_aliases(&key_aliases);
-
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 20), 1);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 50), 2);
-        assert_eq!(estimate_safe_amount_to_return(&key_descriptors, 100), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_without_filtering() -> Result<()> {
-        let legacy_key_aliases = vec!["key_c", "key_a", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_a", "key_d"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result =
-            merge_and_filter_key_entry_lists(&legacy_key_descriptors, &db_key_descriptors, None);
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_a", "key_b", "key_c", "key_d"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_with_filtering() -> Result<()> {
-        let legacy_key_aliases = vec!["key_f", "key_a", "key_e", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_c", "key_g"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result = merge_and_filter_key_entry_lists(
-            &legacy_key_descriptors,
-            &db_key_descriptors,
-            Some("key_b"),
-        );
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_c", "key_e", "key_f", "key_g"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_and_sort_lists_with_filtering_and_dups() -> Result<()> {
-        let legacy_key_aliases = vec!["key_f", "key_a", "key_e", "key_b"];
-        let legacy_key_descriptors = create_key_descriptors_from_aliases(&legacy_key_aliases);
-        let db_key_aliases = vec!["key_d", "key_e", "key_g"];
-        let db_key_descriptors = create_key_descriptors_from_aliases(&db_key_aliases);
-        let result = merge_and_filter_key_entry_lists(
-            &legacy_key_descriptors,
-            &db_key_descriptors,
-            Some("key_c"),
-        );
-        assert_eq!(aliases_from_key_descriptors(&result), vec!["key_d", "key_e", "key_f", "key_g"]);
-        Ok(())
     }
 }
