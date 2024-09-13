@@ -70,12 +70,11 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use anyhow::{anyhow, Context, Result};
 use keystore2_flags;
-use std::{convert::TryFrom, convert::TryInto, ops::Deref, time::SystemTimeError};
+use std::{convert::TryFrom, convert::TryInto, ops::Deref, sync::LazyLock, time::SystemTimeError};
 use utils as db_utils;
 use utils::SqlField;
 
 use keystore2_crypto::ZVec;
-use lazy_static::lazy_static;
 use log::error;
 #[cfg(not(test))]
 use rand::prelude::random;
@@ -529,9 +528,7 @@ impl KeyEntryLoadBits {
     }
 }
 
-lazy_static! {
-    static ref KEY_ID_LOCK: KeyIdLockDb = KeyIdLockDb::new();
-}
+static KEY_ID_LOCK: LazyLock<KeyIdLockDb> = LazyLock::new(KeyIdLockDb::new);
 
 struct KeyIdLockDb {
     locked_keys: Mutex<HashSet<i64>>,
@@ -1200,7 +1197,7 @@ impl KeystoreDB {
 
             // Find up to `max_blobs` more superseded key blobs, load their metadata and return it.
             let result: Vec<(i64, Vec<u8>)> = {
-                let _wp = wd::watch("handle_next_superseded_blob find_next");
+                let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob find_next");
                 let mut stmt = tx
                     .prepare(
                         "SELECT id, blob FROM persistent.blobentry
@@ -1231,7 +1228,7 @@ impl KeystoreDB {
                     .context("Trying to extract superseded blobs.")?
             };
 
-            let _wp = wd::watch("handle_next_superseded_blob load_metadata");
+            let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob load_metadata");
             let result = result
                 .into_iter()
                 .map(|(blob_id, blob)| {
@@ -1249,7 +1246,7 @@ impl KeystoreDB {
 
             // We did not find any superseded key blob, so let's remove other superseded blob in
             // one transaction.
-            let _wp = wd::watch("handle_next_superseded_blob delete");
+            let _wp = wd::watch("KeystoreDB::handle_next_superseded_blob delete");
             tx.execute(
                 "DELETE FROM persistent.blobentry
                  WHERE NOT subcomponent_type = ?
@@ -1902,6 +1899,7 @@ impl KeystoreDB {
     ///       `access_vector`.
     /// * Domain::KEY_ID: The keyentry table is queried for the owning `domain` and
     ///       `namespace`.
+    ///
     /// In each case the information returned is sufficient to perform the access
     /// check and the key id can be used to load further key artifacts.
     fn load_access_tuple(
