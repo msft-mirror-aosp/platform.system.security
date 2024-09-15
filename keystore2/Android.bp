@@ -56,7 +56,6 @@ rust_defaults {
         "libkeystore2_hal_names_rust",
         "libkeystore2_km_compat",
         "libkeystore2_selinux",
-        "liblazy_static",
         "liblibc",
         "liblog_rust",
         "libmessage_macro",
@@ -114,6 +113,7 @@ rust_test {
         "liblibsqlite3_sys",
         "libnix",
         "librusqlite",
+        "libtempfile",
     ],
     // The test should always include watchdog.
     features: [
