@@ -14,7 +14,7 @@
 
 //! Tests for user authentication interactions (via `IKeystoreAuthorization`).
 
-use crate::keystore2_client_test_utils::BarrierReached;
+use crate::keystore2_client_test_utils::{BarrierReached, BarrierReachedWithData};
 use android_security_authorization::aidl::android::security::authorization::{
     IKeystoreAuthorization::IKeystoreAuthorization
 };
@@ -22,9 +22,9 @@ use android_security_maintenance::aidl::android::security::maintenance::IKeystor
      IKeystoreMaintenance,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    Algorithm::Algorithm, Digest::Digest, EcCurve::EcCurve, HardwareAuthToken::HardwareAuthToken,
-    HardwareAuthenticatorType::HardwareAuthenticatorType, SecurityLevel::SecurityLevel,
-    KeyPurpose::KeyPurpose
+    Algorithm::Algorithm, Digest::Digest, EcCurve::EcCurve, ErrorCode::ErrorCode,
+    HardwareAuthToken::HardwareAuthToken, HardwareAuthenticatorType::HardwareAuthenticatorType,
+    KeyPurpose::KeyPurpose, SecurityLevel::SecurityLevel,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     CreateOperationResponse::CreateOperationResponse, Domain::Domain, KeyDescriptor::KeyDescriptor,
@@ -35,26 +35,32 @@ use android_hardware_security_secureclock::aidl::android::hardware::security::se
 };
 use keystore2_test_utils::{
     get_keystore_service, run_as, authorizations::AuthSetBuilder,
+    key_generations::assert_km_error, run_as::{ChannelReader,ChannelWriter},
 };
 use log::{warn, info};
 use nix::unistd::{Gid, Uid};
 use rustutils::users::AID_USER_OFFSET;
+use std::{time::Duration, thread::sleep};
 
+/// SELinux context.
+const CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 /// Test user ID.
 const TEST_USER_ID: i32 = 100;
-/// Fake password blob.
-static PASSWORD: &[u8] = &[
+/// Corresponding uid value.
+const UID: u32 = TEST_USER_ID as u32 * AID_USER_OFFSET + 1001;
+/// Fake synthetic password blob.
+static SYNTHETIC_PASSWORD: &[u8] = &[
     0x42, 0x39, 0x30, 0x37, 0x44, 0x37, 0x32, 0x37, 0x39, 0x39, 0x43, 0x42, 0x39, 0x41, 0x42, 0x30,
     0x34, 0x31, 0x30, 0x38, 0x46, 0x44, 0x33, 0x45, 0x39, 0x42, 0x32, 0x38, 0x36, 0x35, 0x41, 0x36,
     0x33, 0x44, 0x42, 0x42, 0x43, 0x36, 0x33, 0x42, 0x34, 0x39, 0x37, 0x33, 0x35, 0x45, 0x41, 0x41,
     0x32, 0x45, 0x31, 0x35, 0x43, 0x43, 0x46, 0x32, 0x39, 0x36, 0x33, 0x34, 0x31, 0x32, 0x41, 0x39,
 ];
 /// Fake SID value corresponding to Gatekeeper.
-static GK_SID: i64 = 123456;
+static GK_FAKE_SID: i64 = 123456;
 /// Fake SID value corresponding to a biometric authenticator.
-static BIO_SID1: i64 = 345678;
+static BIO_FAKE_SID1: i64 = 345678;
 /// Fake SID value corresponding to a biometric authenticator.
-static BIO_SID2: i64 = 456789;
+static BIO_FAKE_SID2: i64 = 456789;
 
 const WEAK_UNLOCK_ENABLED: bool = true;
 const WEAK_UNLOCK_DISABLED: bool = false;
@@ -90,7 +96,7 @@ struct TestUser {
 
 impl TestUser {
     fn new() -> Self {
-        Self::new_user(TEST_USER_ID, PASSWORD)
+        Self::new_user(TEST_USER_ID, SYNTHETIC_PASSWORD)
     }
     fn new_user(user_id: i32, password: &[u8]) -> Self {
         let maint = get_maintenance();
@@ -109,94 +115,352 @@ impl Drop for TestUser {
 }
 
 #[test]
-fn keystore2_test_unlocked_device_required() {
+fn test_auth_bound_timeout_failure() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_tag("keystore2_client_tests")
             .with_max_level(log::LevelFilter::Debug),
     );
-    static CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-    const UID: u32 = TEST_USER_ID as u32 * AID_USER_OFFSET + 1001;
 
-    // Safety: only one thread at this point, and nothing yet done with binder.
+    let child_fn = move |reader: &mut ChannelReader<BarrierReached>,
+                         writer: &mut ChannelWriter<BarrierReached>|
+          -> Result<(), String> {
+        // Now we're in a new process, wait to be notified before starting.
+        reader.recv();
+
+        // Action A: create a new auth-bound key which requires auth in the last 3 seconds,
+        // and fail to start an operation using it.
+        let ks2 = get_keystore_service();
+
+        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let params = AuthSetBuilder::new()
+            .user_secure_id(BIO_FAKE_SID1)
+            .user_secure_id(BIO_FAKE_SID2)
+            .user_auth_type(HardwareAuthenticatorType::ANY)
+            .auth_timeout(3)
+            .algorithm(Algorithm::EC)
+            .purpose(KeyPurpose::SIGN)
+            .purpose(KeyPurpose::VERIFY)
+            .digest(Digest::SHA_2_256)
+            .ec_curve(EcCurve::P_256);
+
+        let KeyMetadata { key, .. } = sec_level
+            .generateKey(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some("auth-bound-timeout".to_string()),
+                    blob: None,
+                },
+                None,
+                &params,
+                0,
+                b"entropy",
+            )
+            .expect("key generation failed");
+        info!("A: created auth-timeout key {key:?}");
+
+        // No HATs so cannot create an operation using the key.
+        let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("A: failed auth-bound operation (no HAT) as expected {result:?}");
+
+        writer.send(&BarrierReached {}); // A done.
+
+        // Action B: fail again when an invalid HAT is available.
+        reader.recv();
+
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("B: failed auth-bound operation (HAT is invalid) as expected {result:?}");
+
+        writer.send(&BarrierReached {}); // B done.
+
+        // Action C: fail again when the HAT is old enough to not even be checked.
+        reader.recv();
+        info!("C: wait so that any HAT times out");
+        sleep(Duration::from_secs(4));
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("C: failed auth-bound operation (HAT is too old) as expected {result:?}");
+        writer.send(&BarrierReached {}); // C done.
+
+        Ok(())
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut child_handle = unsafe {
         // Perform keystore actions while running as the test user.
-        run_as::run_as_child(
-            CTX,
-            Uid::from_raw(UID),
-            Gid::from_raw(UID),
-            move |reader, writer| -> Result<(), String> {
-                // Action A: create a new unlocked-device-required key (which thus requires
-                // super-encryption), while the device is unlocked.
-                let ks2 = get_keystore_service();
-                if ks2.getInterfaceVersion().unwrap() < 4 {
-                    // Assuming `IKeystoreAuthorization::onDeviceLocked` and
-                    // `IKeystoreAuthorization::onDeviceUnlocked` APIs will be supported on devices
-                    // with `IKeystoreService` >= 4.
-                    return Ok(());
-                }
+        run_as::run_as_child(CTX, Uid::from_raw(UID), Gid::from_raw(UID), child_fn)
+    }
+    .unwrap();
 
-                // Now we're in a new process, wait to be notified before starting.
-                reader.recv();
+    // Now that the separate process has been forked off, it's safe to use binder to setup a test
+    // user.
+    let _ks2 = get_keystore_service();
+    let user = TestUser::new();
+    let user_id = user.id;
+    let auth_service = get_authorization();
 
-                let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
-                let params = AuthSetBuilder::new()
-                    .no_auth_required()
-                    .unlocked_device_required()
-                    .algorithm(Algorithm::EC)
-                    .purpose(KeyPurpose::SIGN)
-                    .purpose(KeyPurpose::VERIFY)
-                    .digest(Digest::SHA_2_256)
-                    .ec_curve(EcCurve::P_256);
+    // Lock and unlock to ensure super keys are already created.
+    auth_service
+        .onDeviceLocked(user_id, &[BIO_FAKE_SID1, BIO_FAKE_SID2], WEAK_UNLOCK_DISABLED)
+        .unwrap();
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_lskf_token(GK_FAKE_SID)).unwrap();
 
-                let KeyMetadata { key, .. } = sec_level
-                    .generateKey(
-                        &KeyDescriptor {
-                            domain: Domain::APP,
-                            nspace: -1,
-                            alias: Some("unlocked-device-required".to_string()),
-                            blob: None,
-                        },
-                        None,
-                        &params,
-                        0,
-                        b"entropy",
-                    )
-                    .expect("key generation failed");
-                info!("A: created unlocked-device-required key while unlocked {key:?}");
-                writer.send(&BarrierReached {}); // A done.
+    info!("trigger child process action A and wait for completion");
+    child_handle.send(&BarrierReached {});
+    child_handle.recv();
 
-                // Action B: fail to use the unlocked-device-required key while locked.
-                reader.recv();
-                let params =
-                    AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
-                let result = sec_level.createOperation(&key, &params, UNFORCED);
-                info!("B: use unlocked-device-required key while locked => {result:?}");
-                assert!(result.is_err());
-                writer.send(&BarrierReached {}); // B done.
+    // Unlock with password and a fake auth token that matches the key
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_bio_lskf_token(GK_FAKE_SID, BIO_FAKE_SID1)).unwrap();
 
-                // Action C: try to use the unlocked-device-required key while unlocked with a
-                // password.
-                reader.recv();
-                let result = sec_level.createOperation(&key, &params, UNFORCED);
-                info!("C: use unlocked-device-required key while lskf-unlocked => {result:?}");
-                assert!(result.is_ok(), "failed with {result:?}");
-                abort_op(result);
-                writer.send(&BarrierReached {}); // C done.
+    info!("trigger child process action B and wait for completion");
+    child_handle.send(&BarrierReached {});
+    child_handle.recv();
 
-                // Action D: try to use the unlocked-device-required key while unlocked with a weak
-                // biometric.
-                reader.recv();
-                let result = sec_level.createOperation(&key, &params, UNFORCED);
-                info!("D: use unlocked-device-required key while weak-locked => {result:?}");
-                assert!(result.is_ok(), "createOperation failed: {result:?}");
-                abort_op(result);
-                writer.send(&BarrierReached {}); // D done.
+    info!("trigger child process action C and wait for completion");
+    child_handle.send(&BarrierReached {});
+    child_handle.recv();
 
-                let _ = sec_level.deleteKey(&key);
-                Ok(())
-            },
-        )
+    assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
+}
+
+#[test]
+fn test_auth_bound_per_op_failure() {
+    type Barrier = BarrierReachedWithData<i64>;
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("keystore2_client_tests")
+            .with_max_level(log::LevelFilter::Debug),
+    );
+
+    let child_fn = move |reader: &mut ChannelReader<Barrier>,
+                         writer: &mut ChannelWriter<Barrier>|
+          -> Result<(), String> {
+        // Now we're in a new process, wait to be notified before starting.
+        reader.recv();
+
+        // Action A: create a new auth-bound key which requires auth-per-operation (because
+        // AUTH_TIMEOUT is not specified), and fail to finish an operation using it.
+        let ks2 = get_keystore_service();
+
+        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let params = AuthSetBuilder::new()
+            .user_secure_id(GK_FAKE_SID)
+            .user_secure_id(BIO_FAKE_SID1)
+            .user_auth_type(HardwareAuthenticatorType::ANY)
+            .algorithm(Algorithm::EC)
+            .purpose(KeyPurpose::SIGN)
+            .purpose(KeyPurpose::VERIFY)
+            .digest(Digest::SHA_2_256)
+            .ec_curve(EcCurve::P_256);
+
+        let KeyMetadata { key, .. } = sec_level
+            .generateKey(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some("auth-per-op".to_string()),
+                    blob: None,
+                },
+                None,
+                &params,
+                0,
+                b"entropy",
+            )
+            .expect("key generation failed");
+        info!("A: created auth-per-op key {key:?}");
+
+        // We can create an operation using the key...
+        let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
+        let result = sec_level
+            .createOperation(&key, &params, UNFORCED)
+            .expect("failed to create auth-per-op operation");
+        let op = result.iOperation.expect("no operation in result");
+        info!("A: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
+
+        // .. but attempting to finish the operation fails because Keystore can't find a HAT.
+        let result = op.finish(Some(b"data"), None);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("A: failed auth-per-op op (no HAT) as expected {result:?}");
+
+        writer.send(&Barrier::new(0)); // A done.
+
+        // Action B: fail again when an irrelevant HAT is available.
+        reader.recv();
+
+        let result = sec_level
+            .createOperation(&key, &params, UNFORCED)
+            .expect("failed to create auth-per-op operation");
+        let op = result.iOperation.expect("no operation in result");
+        info!("B: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
+        // The operation fails because the HAT that Keystore received is not related to the
+        // challenge.
+        let result = op.finish(Some(b"data"), None);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("B: failed auth-per-op op (HAT is not per-op) as expected {result:?}");
+
+        writer.send(&Barrier::new(0)); // B done.
+
+        // Action C: start an operation and pass out the challenge
+        reader.recv();
+        let result = sec_level
+            .createOperation(&key, &params, UNFORCED)
+            .expect("failed to create auth-per-op operation");
+        let op = result.iOperation.expect("no operation in result");
+        info!("C: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
+        writer.send(&Barrier::new(result.operationChallenge.unwrap().challenge)); // C done.
+
+        // Action D: finishing the operation still fails because the per-op HAT
+        // is invalid (the HMAC signature is faked and so the secure world
+        // rejects the HAT).
+        reader.recv();
+        let result = op.finish(Some(b"data"), None);
+        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        info!("D: failed auth-per-op op (HAT is per-op but invalid) as expected {result:?}");
+        writer.send(&Barrier::new(0)); // D done.
+
+        Ok(())
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
+    let mut child_handle = unsafe {
+        // Perform keystore actions while running as the test user.
+        run_as::run_as_child(CTX, Uid::from_raw(UID), Gid::from_raw(UID), child_fn)
+    }
+    .unwrap();
+
+    // Now that the separate process has been forked off, it's safe to use binder to setup a test
+    // user.
+    let _ks2 = get_keystore_service();
+    let user = TestUser::new();
+    let user_id = user.id;
+    let auth_service = get_authorization();
+
+    // Lock and unlock to ensure super keys are already created.
+    auth_service
+        .onDeviceLocked(user_id, &[BIO_FAKE_SID1, BIO_FAKE_SID2], WEAK_UNLOCK_DISABLED)
+        .unwrap();
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_lskf_token(GK_FAKE_SID)).unwrap();
+
+    info!("trigger child process action A and wait for completion");
+    child_handle.send(&Barrier::new(0));
+    child_handle.recv();
+
+    // Unlock with password and a fake auth token.
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_lskf_token(GK_FAKE_SID)).unwrap();
+
+    info!("trigger child process action B and wait for completion");
+    child_handle.send(&Barrier::new(0));
+    child_handle.recv();
+
+    info!("trigger child process action C and wait for completion");
+    child_handle.send(&Barrier::new(0));
+    let challenge = child_handle.recv().0;
+
+    // Add a fake auth token with the challenge value.
+    auth_service.addAuthToken(&fake_lskf_token_with_challenge(GK_FAKE_SID, challenge)).unwrap();
+
+    info!("trigger child process action D and wait for completion");
+    child_handle.send(&Barrier::new(0));
+    child_handle.recv();
+
+    assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
+}
+
+#[test]
+fn test_unlocked_device_required() {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("keystore2_client_tests")
+            .with_max_level(log::LevelFilter::Debug),
+    );
+
+    let child_fn = move |reader: &mut ChannelReader<BarrierReached>,
+                         writer: &mut ChannelWriter<BarrierReached>|
+          -> Result<(), String> {
+        let ks2 = get_keystore_service();
+        if ks2.getInterfaceVersion().unwrap() < 4 {
+            // Assuming `IKeystoreAuthorization::onDeviceLocked` and
+            // `IKeystoreAuthorization::onDeviceUnlocked` APIs will be supported on devices
+            // with `IKeystoreService` >= 4.
+            return Ok(());
+        }
+
+        // Now we're in a new process, wait to be notified before starting.
+        reader.recv();
+
+        // Action A: create a new unlocked-device-required key (which thus requires
+        // super-encryption), while the device is unlocked.
+        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let params = AuthSetBuilder::new()
+            .no_auth_required()
+            .unlocked_device_required()
+            .algorithm(Algorithm::EC)
+            .purpose(KeyPurpose::SIGN)
+            .purpose(KeyPurpose::VERIFY)
+            .digest(Digest::SHA_2_256)
+            .ec_curve(EcCurve::P_256);
+
+        let KeyMetadata { key, .. } = sec_level
+            .generateKey(
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: -1,
+                    alias: Some("unlocked-device-required".to_string()),
+                    blob: None,
+                },
+                None,
+                &params,
+                0,
+                b"entropy",
+            )
+            .expect("key generation failed");
+        info!("A: created unlocked-device-required key while unlocked {key:?}");
+        writer.send(&BarrierReached {}); // A done.
+
+        // Action B: fail to use the unlocked-device-required key while locked.
+        reader.recv();
+        let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        info!("B: use unlocked-device-required key while locked => {result:?}");
+        assert_km_error(&result, ErrorCode::DEVICE_LOCKED);
+        writer.send(&BarrierReached {}); // B done.
+
+        // Action C: try to use the unlocked-device-required key while unlocked with a
+        // password.
+        reader.recv();
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        info!("C: use unlocked-device-required key while lskf-unlocked => {result:?}");
+        assert!(result.is_ok(), "failed with {result:?}");
+        abort_op(result);
+        writer.send(&BarrierReached {}); // C done.
+
+        // Action D: try to use the unlocked-device-required key while unlocked with a weak
+        // biometric.
+        reader.recv();
+        let result = sec_level.createOperation(&key, &params, UNFORCED);
+        info!("D: use unlocked-device-required key while weak-locked => {result:?}");
+        assert!(result.is_ok(), "createOperation failed: {result:?}");
+        abort_op(result);
+        writer.send(&BarrierReached {}); // D done.
+
+        Ok(())
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
+    let mut child_handle = unsafe {
+        // Perform keystore actions while running as the test user.
+        run_as::run_as_child(CTX, Uid::from_raw(UID), Gid::from_raw(UID), child_fn)
     }
     .unwrap();
 
@@ -214,31 +478,37 @@ fn keystore2_test_unlocked_device_required() {
     let auth_service = get_authorization();
 
     // Lock and unlock to ensure super keys are already created.
-    auth_service.onDeviceLocked(user_id, &[BIO_SID1, BIO_SID2], WEAK_UNLOCK_DISABLED).unwrap();
-    auth_service.onDeviceUnlocked(user_id, Some(PASSWORD)).unwrap();
-    auth_service.addAuthToken(&fake_lskf_token(GK_SID)).unwrap();
+    auth_service
+        .onDeviceLocked(user_id, &[BIO_FAKE_SID1, BIO_FAKE_SID2], WEAK_UNLOCK_DISABLED)
+        .unwrap();
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_lskf_token(GK_FAKE_SID)).unwrap();
 
     info!("trigger child process action A while unlocked and wait for completion");
     child_handle.send(&BarrierReached {});
     child_handle.recv();
 
     // Move to locked and don't allow weak unlock, so super keys are wiped.
-    auth_service.onDeviceLocked(user_id, &[BIO_SID1, BIO_SID2], WEAK_UNLOCK_DISABLED).unwrap();
+    auth_service
+        .onDeviceLocked(user_id, &[BIO_FAKE_SID1, BIO_FAKE_SID2], WEAK_UNLOCK_DISABLED)
+        .unwrap();
 
     info!("trigger child process action B while locked and wait for completion");
     child_handle.send(&BarrierReached {});
     child_handle.recv();
 
     // Unlock with password => loads super key from database.
-    auth_service.onDeviceUnlocked(user_id, Some(PASSWORD)).unwrap();
-    auth_service.addAuthToken(&fake_lskf_token(GK_SID)).unwrap();
+    auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
+    auth_service.addAuthToken(&fake_lskf_token(GK_FAKE_SID)).unwrap();
 
     info!("trigger child process action C while lskf-unlocked and wait for completion");
     child_handle.send(&BarrierReached {});
     child_handle.recv();
 
     // Move to locked and allow weak unlock, then do a weak unlock.
-    auth_service.onDeviceLocked(user_id, &[BIO_SID1, BIO_SID2], WEAK_UNLOCK_ENABLED).unwrap();
+    auth_service
+        .onDeviceLocked(user_id, &[BIO_FAKE_SID1, BIO_FAKE_SID2], WEAK_UNLOCK_ENABLED)
+        .unwrap();
     auth_service.onDeviceUnlocked(user_id, None).unwrap();
 
     info!("trigger child process action D while weak-unlocked and wait for completion");
@@ -250,10 +520,27 @@ fn keystore2_test_unlocked_device_required() {
 
 /// Generate a fake [`HardwareAuthToken`] for the given sid.
 fn fake_lskf_token(gk_sid: i64) -> HardwareAuthToken {
+    fake_lskf_token_with_challenge(gk_sid, 0)
+}
+
+/// Generate a fake [`HardwareAuthToken`] for the given sid and challenge.
+fn fake_lskf_token_with_challenge(gk_sid: i64, challenge: i64) -> HardwareAuthToken {
+    HardwareAuthToken {
+        challenge,
+        userId: gk_sid,
+        authenticatorId: 0,
+        authenticatorType: HardwareAuthenticatorType::PASSWORD,
+        timestamp: Timestamp { milliSeconds: 123 },
+        mac: vec![1, 2, 3],
+    }
+}
+
+/// Generate a fake [`HardwareAuthToken`] for the given sids
+fn fake_bio_lskf_token(gk_sid: i64, bio_sid: i64) -> HardwareAuthToken {
     HardwareAuthToken {
         challenge: 0,
         userId: gk_sid,
-        authenticatorId: 0,
+        authenticatorId: bio_sid,
         authenticatorType: HardwareAuthenticatorType::PASSWORD,
         timestamp: Timestamp { milliSeconds: 123 },
         mac: vec![1, 2, 3],

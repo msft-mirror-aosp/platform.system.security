@@ -392,6 +392,25 @@ pub fn map_ks_error<T>(r: BinderResult<T>) -> Result<T, Error> {
     })
 }
 
+/// Check for a specific KeyMint error.
+pub fn assert_km_error<T: std::fmt::Debug>(result: &BinderResult<T>, want: ErrorCode) {
+    match result {
+        Ok(_) => panic!("Expected KeyMint error {want:?}, found success"),
+        Err(s) => {
+            assert_eq!(
+                s.exception_code(),
+                ExceptionCode::SERVICE_SPECIFIC,
+                "Expected KeyMint service-specific error {want:?}, got {result:?}"
+            );
+            assert_eq!(
+                s.service_specific_error(),
+                want.0,
+                "Expected KeyMint service-specific error {want:?}, got {result:?}"
+            );
+        }
+    }
+}
+
 /// Get the value of the given system property, if the given system property doesn't exist
 /// then returns an empty byte vector.
 pub fn get_system_prop(name: &str) -> Vec<u8> {
