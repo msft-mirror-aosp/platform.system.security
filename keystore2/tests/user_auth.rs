@@ -37,9 +37,10 @@ use android_system_keystore2::binder::{ExceptionCode, Result as BinderResult};
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
     Timestamp::Timestamp,
 };
+use anyhow::Context;
 use keystore2_test_utils::{
-    authorizations::AuthSetBuilder, get_keystore_service, run_as,
-    run_as::{ChannelReader, ChannelWriter}, key_generations::assert_km_error,
+    authorizations::AuthSetBuilder, expect, get_keystore_service, run_as,
+    run_as::{ChannelReader, ChannelWriter}, expect_km_error,
 };
 use log::{warn, info};
 use nix::unistd::{Gid, Uid};
@@ -182,7 +183,7 @@ fn test_auth_bound_timeout_with_gk() {
 
     let child_fn = move |reader: &mut ChannelReader<Barrier>,
                          writer: &mut ChannelWriter<Barrier>|
-          -> Result<(), String> {
+          -> Result<(), run_as::Error> {
         // Now we're in a new process, wait to be notified before starting.
         let gk_sid: i64 = match reader.recv().0 {
             Some(sid) => sid,
@@ -197,7 +198,8 @@ fn test_auth_bound_timeout_with_gk() {
         // Action A: create a new auth-bound key which requires auth in the last 3 seconds,
         // and fail to start an operation using it.
         let ks2 = get_keystore_service();
-        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let sec_level =
+            ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).context("no TEE")?;
         let params = AuthSetBuilder::new()
             .user_secure_id(gk_sid)
             .user_secure_id(BIO_FAKE_SID1)
@@ -223,13 +225,13 @@ fn test_auth_bound_timeout_with_gk() {
                 0,
                 b"entropy",
             )
-            .expect("key generation failed");
+            .context("key generation failed")?;
         info!("A: created auth-timeout key {key:?}");
 
         // No HATs so cannot create an operation using the key.
         let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
         let result = sec_level.createOperation(&key, &params, UNFORCED);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("A: failed auth-bound operation (no HAT) as expected {result:?}");
 
         writer.send(&Barrier::new(None)); // A done.
@@ -238,10 +240,10 @@ fn test_auth_bound_timeout_with_gk() {
         reader.recv();
 
         let result = sec_level.createOperation(&key, &params, UNFORCED);
-        assert!(result.is_ok());
-        let op = result.unwrap().iOperation.expect("no operation in result");
+        expect!(result.is_ok());
+        let op = result.unwrap().iOperation.context("no operation in result")?;
         let result = op.finish(Some(b"data"), None);
-        assert!(result.is_ok());
+        expect!(result.is_ok());
         info!("B: performed auth-bound operation (with valid GK HAT) as expected");
 
         writer.send(&Barrier::new(None)); // B done.
@@ -286,7 +288,7 @@ fn test_auth_bound_timeout_with_gk() {
 
     info!("trigger child process action A and wait for completion");
     child_handle.send(&Barrier::new(Some(user.gk_sid.unwrap())));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Unlock with GK password to get a genuine auth token.
     let real_hat = user.gk_verify(0).expect("failed to perform GK verify");
@@ -294,11 +296,11 @@ fn test_auth_bound_timeout_with_gk() {
 
     info!("trigger child process action B and wait for completion");
     child_handle.send(&Barrier::new(None));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     info!("trigger child process action C and wait for completion");
     child_handle.send(&Barrier::new(None));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
 }
@@ -313,7 +315,7 @@ fn test_auth_bound_timeout_failure() {
 
     let child_fn = move |reader: &mut ChannelReader<BarrierReached>,
                          writer: &mut ChannelWriter<BarrierReached>|
-          -> Result<(), String> {
+          -> Result<(), run_as::Error> {
         // Now we're in a new process, wait to be notified before starting.
         reader.recv();
 
@@ -321,7 +323,8 @@ fn test_auth_bound_timeout_failure() {
         // and fail to start an operation using it.
         let ks2 = get_keystore_service();
 
-        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let sec_level =
+            ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).context("no TEE")?;
         let params = AuthSetBuilder::new()
             .user_secure_id(BIO_FAKE_SID1)
             .user_secure_id(BIO_FAKE_SID2)
@@ -346,13 +349,13 @@ fn test_auth_bound_timeout_failure() {
                 0,
                 b"entropy",
             )
-            .expect("key generation failed");
+            .context("key generation failed")?;
         info!("A: created auth-timeout key {key:?}");
 
         // No HATs so cannot create an operation using the key.
         let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
         let result = sec_level.createOperation(&key, &params, UNFORCED);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("A: failed auth-bound operation (no HAT) as expected {result:?}");
 
         writer.send(&BarrierReached {}); // A done.
@@ -361,7 +364,7 @@ fn test_auth_bound_timeout_failure() {
         reader.recv();
 
         let result = sec_level.createOperation(&key, &params, UNFORCED);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("B: failed auth-bound operation (HAT is invalid) as expected {result:?}");
 
         writer.send(&BarrierReached {}); // B done.
@@ -371,7 +374,7 @@ fn test_auth_bound_timeout_failure() {
         info!("C: wait so that any HAT times out");
         sleep(Duration::from_secs(4));
         let result = sec_level.createOperation(&key, &params, UNFORCED);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("C: failed auth-bound operation (HAT is too old) as expected {result:?}");
         writer.send(&BarrierReached {}); // C done.
 
@@ -402,7 +405,7 @@ fn test_auth_bound_timeout_failure() {
 
     info!("trigger child process action A and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Unlock with password and a fake auth token that matches the key
     auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
@@ -410,11 +413,11 @@ fn test_auth_bound_timeout_failure() {
 
     info!("trigger child process action B and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     info!("trigger child process action C and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
 }
@@ -430,7 +433,7 @@ fn test_auth_bound_per_op_with_gk() {
 
     let child_fn = move |reader: &mut ChannelReader<Barrier>,
                          writer: &mut ChannelWriter<Barrier>|
-          -> Result<(), String> {
+          -> Result<(), run_as::Error> {
         // Now we're in a new process, wait to be notified before starting.
         let gk_sid: i64 = match reader.recv().0 {
             Some(sid) => sid,
@@ -445,7 +448,8 @@ fn test_auth_bound_per_op_with_gk() {
         // Action A: create a new auth-bound key which requires auth-per-operation (because
         // AUTH_TIMEOUT is not specified), and fail to finish an operation using it.
         let ks2 = get_keystore_service();
-        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let sec_level =
+            ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).context("no TEE")?;
         let params = AuthSetBuilder::new()
             .user_secure_id(gk_sid)
             .user_secure_id(BIO_FAKE_SID1)
@@ -469,7 +473,7 @@ fn test_auth_bound_per_op_with_gk() {
                 0,
                 b"entropy",
             )
-            .expect("key generation failed");
+            .context("key generation failed")?;
         info!("A: created auth-per-op key {key:?}");
 
         // We can create an operation using the key...
@@ -477,12 +481,12 @@ fn test_auth_bound_per_op_with_gk() {
         let result = sec_level
             .createOperation(&key, &params, UNFORCED)
             .expect("failed to create auth-per-op operation");
-        let op = result.iOperation.expect("no operation in result");
+        let op = result.iOperation.context("no operation in result")?;
         info!("A: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
 
         // .. but attempting to finish the operation fails because Keystore can't find a HAT.
         let result = op.finish(Some(b"data"), None);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("A: failed auth-per-op op (no HAT) as expected {result:?}");
 
         writer.send(&Barrier::new(None)); // A done.
@@ -492,14 +496,14 @@ fn test_auth_bound_per_op_with_gk() {
         let result = sec_level
             .createOperation(&key, &params, UNFORCED)
             .expect("failed to create auth-per-op operation");
-        let op = result.iOperation.expect("no operation in result");
+        let op = result.iOperation.context("no operation in result")?;
         info!("B: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
         writer.send(&Barrier::new(Some(result.operationChallenge.unwrap().challenge))); // B done.
 
         // Action C: finishing the operation succeeds now there's a per-op HAT.
         reader.recv();
         let result = op.finish(Some(b"data"), None);
-        assert!(result.is_ok());
+        expect!(result.is_ok());
         info!("C: performed auth-per-op op expected");
         writer.send(&Barrier::new(None)); // D done.
 
@@ -535,11 +539,11 @@ fn test_auth_bound_per_op_with_gk() {
 
     info!("trigger child process action A and wait for completion");
     child_handle.send(&Barrier::new(Some(user.gk_sid.unwrap())));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     info!("trigger child process action B and wait for completion");
     child_handle.send(&Barrier::new(None));
-    let challenge = child_handle.recv().0.expect("no challenge");
+    let challenge = child_handle.recv_or_die().0.expect("no challenge");
 
     // Unlock with GK and the challenge to get a genuine per-op auth token
     let real_hat = user.gk_verify(challenge).expect("failed to perform GK verify");
@@ -547,7 +551,7 @@ fn test_auth_bound_per_op_with_gk() {
 
     info!("trigger child process action C and wait for completion");
     child_handle.send(&Barrier::new(None));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
 }
@@ -563,7 +567,7 @@ fn test_auth_bound_per_op_failure() {
 
     let child_fn = move |reader: &mut ChannelReader<Barrier>,
                          writer: &mut ChannelWriter<Barrier>|
-          -> Result<(), String> {
+          -> Result<(), run_as::Error> {
         // Now we're in a new process, wait to be notified before starting.
         reader.recv();
 
@@ -571,7 +575,8 @@ fn test_auth_bound_per_op_failure() {
         // AUTH_TIMEOUT is not specified), and fail to finish an operation using it.
         let ks2 = get_keystore_service();
 
-        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let sec_level =
+            ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).context("no TEE")?;
         let params = AuthSetBuilder::new()
             .user_secure_id(GK_FAKE_SID)
             .user_secure_id(BIO_FAKE_SID1)
@@ -595,7 +600,7 @@ fn test_auth_bound_per_op_failure() {
                 0,
                 b"entropy",
             )
-            .expect("key generation failed");
+            .context("key generation failed")?;
         info!("A: created auth-per-op key {key:?}");
 
         // We can create an operation using the key...
@@ -603,12 +608,12 @@ fn test_auth_bound_per_op_failure() {
         let result = sec_level
             .createOperation(&key, &params, UNFORCED)
             .expect("failed to create auth-per-op operation");
-        let op = result.iOperation.expect("no operation in result");
+        let op = result.iOperation.context("no operation in result")?;
         info!("A: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
 
         // .. but attempting to finish the operation fails because Keystore can't find a HAT.
         let result = op.finish(Some(b"data"), None);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("A: failed auth-per-op op (no HAT) as expected {result:?}");
 
         writer.send(&Barrier::new(0)); // A done.
@@ -619,12 +624,12 @@ fn test_auth_bound_per_op_failure() {
         let result = sec_level
             .createOperation(&key, &params, UNFORCED)
             .expect("failed to create auth-per-op operation");
-        let op = result.iOperation.expect("no operation in result");
+        let op = result.iOperation.context("no operation in result")?;
         info!("B: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
         // The operation fails because the HAT that Keystore received is not related to the
         // challenge.
         let result = op.finish(Some(b"data"), None);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("B: failed auth-per-op op (HAT is not per-op) as expected {result:?}");
 
         writer.send(&Barrier::new(0)); // B done.
@@ -634,7 +639,7 @@ fn test_auth_bound_per_op_failure() {
         let result = sec_level
             .createOperation(&key, &params, UNFORCED)
             .expect("failed to create auth-per-op operation");
-        let op = result.iOperation.expect("no operation in result");
+        let op = result.iOperation.context("no operation in result")?;
         info!("C: created auth-per-op operation, got challenge {:?}", result.operationChallenge);
         writer.send(&Barrier::new(result.operationChallenge.unwrap().challenge)); // C done.
 
@@ -643,7 +648,7 @@ fn test_auth_bound_per_op_failure() {
         // rejects the HAT).
         reader.recv();
         let result = op.finish(Some(b"data"), None);
-        assert_km_error(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
+        expect_km_error!(&result, ErrorCode::KEY_USER_NOT_AUTHENTICATED);
         info!("D: failed auth-per-op op (HAT is per-op but invalid) as expected {result:?}");
         writer.send(&Barrier::new(0)); // D done.
 
@@ -674,7 +679,7 @@ fn test_auth_bound_per_op_failure() {
 
     info!("trigger child process action A and wait for completion");
     child_handle.send(&Barrier::new(0));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Unlock with password and a fake auth token.
     auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
@@ -682,18 +687,18 @@ fn test_auth_bound_per_op_failure() {
 
     info!("trigger child process action B and wait for completion");
     child_handle.send(&Barrier::new(0));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     info!("trigger child process action C and wait for completion");
     child_handle.send(&Barrier::new(0));
-    let challenge = child_handle.recv().0;
+    let challenge = child_handle.recv_or_die().0;
 
     // Add a fake auth token with the challenge value.
     auth_service.addAuthToken(&fake_lskf_token_with_challenge(GK_FAKE_SID, challenge)).unwrap();
 
     info!("trigger child process action D and wait for completion");
     child_handle.send(&Barrier::new(0));
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
 }
@@ -708,7 +713,7 @@ fn test_unlocked_device_required() {
 
     let child_fn = move |reader: &mut ChannelReader<BarrierReached>,
                          writer: &mut ChannelWriter<BarrierReached>|
-          -> Result<(), String> {
+          -> Result<(), run_as::Error> {
         let ks2 = get_keystore_service();
         if ks2.getInterfaceVersion().unwrap() < 4 {
             // Assuming `IKeystoreAuthorization::onDeviceLocked` and
@@ -722,7 +727,8 @@ fn test_unlocked_device_required() {
 
         // Action A: create a new unlocked-device-required key (which thus requires
         // super-encryption), while the device is unlocked.
-        let sec_level = ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+        let sec_level =
+            ks2.getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT).context("no TEE")?;
         let params = AuthSetBuilder::new()
             .no_auth_required()
             .unlocked_device_required()
@@ -745,7 +751,7 @@ fn test_unlocked_device_required() {
                 0,
                 b"entropy",
             )
-            .expect("key generation failed");
+            .context("key generation failed")?;
         info!("A: created unlocked-device-required key while unlocked {key:?}");
         writer.send(&BarrierReached {}); // A done.
 
@@ -754,7 +760,7 @@ fn test_unlocked_device_required() {
         let params = AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256);
         let result = sec_level.createOperation(&key, &params, UNFORCED);
         info!("B: use unlocked-device-required key while locked => {result:?}");
-        assert_km_error(&result, ErrorCode::DEVICE_LOCKED);
+        expect_km_error!(&result, ErrorCode::DEVICE_LOCKED);
         writer.send(&BarrierReached {}); // B done.
 
         // Action C: try to use the unlocked-device-required key while unlocked with a
@@ -762,7 +768,7 @@ fn test_unlocked_device_required() {
         reader.recv();
         let result = sec_level.createOperation(&key, &params, UNFORCED);
         info!("C: use unlocked-device-required key while lskf-unlocked => {result:?}");
-        assert!(result.is_ok(), "failed with {result:?}");
+        expect!(result.is_ok(), "failed with {result:?}");
         abort_op(result);
         writer.send(&BarrierReached {}); // C done.
 
@@ -771,7 +777,7 @@ fn test_unlocked_device_required() {
         reader.recv();
         let result = sec_level.createOperation(&key, &params, UNFORCED);
         info!("D: use unlocked-device-required key while weak-locked => {result:?}");
-        assert!(result.is_ok(), "createOperation failed: {result:?}");
+        expect!(result.is_ok(), "createOperation failed: {result:?}");
         abort_op(result);
         writer.send(&BarrierReached {}); // D done.
 
@@ -808,7 +814,7 @@ fn test_unlocked_device_required() {
 
     info!("trigger child process action A while unlocked and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Move to locked and don't allow weak unlock, so super keys are wiped.
     auth_service
@@ -817,7 +823,7 @@ fn test_unlocked_device_required() {
 
     info!("trigger child process action B while locked and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Unlock with password => loads super key from database.
     auth_service.onDeviceUnlocked(user_id, Some(SYNTHETIC_PASSWORD)).unwrap();
@@ -825,7 +831,7 @@ fn test_unlocked_device_required() {
 
     info!("trigger child process action C while lskf-unlocked and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     // Move to locked and allow weak unlock, then do a weak unlock.
     auth_service
@@ -835,7 +841,7 @@ fn test_unlocked_device_required() {
 
     info!("trigger child process action D while weak-unlocked and wait for completion");
     child_handle.send(&BarrierReached {});
-    child_handle.recv();
+    child_handle.recv_or_die();
 
     assert_eq!(child_handle.get_result(), Ok(()), "child process failed");
 }

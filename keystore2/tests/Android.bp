@@ -49,6 +49,7 @@ rust_test {
         "libaconfig_android_hardware_biometrics_rust",
         "libandroid_logger",
         "libandroid_security_flags_rust",
+        "libanyhow",
         "libbinder_rs",
         "libkeystore2_test_utils",
         "liblog_rust",

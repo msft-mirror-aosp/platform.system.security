@@ -393,22 +393,27 @@ pub fn map_ks_error<T>(r: BinderResult<T>) -> Result<T, Error> {
 }
 
 /// Check for a specific KeyMint error.
-pub fn assert_km_error<T: std::fmt::Debug>(result: &BinderResult<T>, want: ErrorCode) {
-    match result {
-        Ok(_) => panic!("Expected KeyMint error {want:?}, found success"),
-        Err(s) => {
-            assert_eq!(
-                s.exception_code(),
-                ExceptionCode::SERVICE_SPECIFIC,
-                "Expected KeyMint service-specific error {want:?}, got {result:?}"
-            );
-            assert_eq!(
-                s.service_specific_error(),
-                want.0,
-                "Expected KeyMint service-specific error {want:?}, got {result:?}"
-            );
+#[macro_export]
+macro_rules! expect_km_error {
+    { $result:expr, $want:expr } => {
+        match $result {
+            Ok(_) => return Err(format!(
+                "{}:{}: Expected KeyMint error {:?}, found success",
+                file!(),
+                line!(),
+                $want
+            ).into()),
+            Err(s) if s.exception_code() == ExceptionCode::SERVICE_SPECIFIC
+                    && s.service_specific_error() == $want.0 => {}
+            Err(e) => return Err(format!(
+                "{}:{}: Expected KeyMint service-specific error {:?}, got {e:?}",
+                file!(),
+                line!(),
+                $want
+            ).into()),
         }
-    }
+
+    };
 }
 
 /// Get the value of the given system property, if the given system property doesn't exist
