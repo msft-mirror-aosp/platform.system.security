@@ -42,6 +42,7 @@ rust_test {
     test_config: "AndroidTest.xml",
 
     rustlibs: [
+        "android.hardware.gatekeeper-V1-rust",
         "android.hardware.security.secureclock-V1-rust",
         "android.security.authorization-rust",
         "android.security.maintenance-rust",
