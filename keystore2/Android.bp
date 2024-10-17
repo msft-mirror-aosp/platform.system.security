@@ -175,6 +175,12 @@ java_aconfig_library {
     aconfig_declarations: "keystore2_flags",
 }
 
+java_aconfig_library {
+    name: "keystore2_flags_java-host",
+    aconfig_declarations: "keystore2_flags",
+    host_supported: true,
+}
+
 rust_aconfig_library {
     name: "libkeystore2_flags_rust",
     crate_name: "keystore2_flags",
