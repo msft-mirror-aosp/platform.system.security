@@ -129,7 +129,6 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
     let auid = 99 * AID_USER_OFFSET + 10001;
     let agid = 99 * AID_USER_OFFSET + 10001;
     static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
 
     // Cleanup user directory if it exists
     let path_buf = PathBuf::from("/data/misc/keystore/user_99");
@@ -240,8 +239,7 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let mut gen_key_result =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), gen_key_fn) };
+    let mut gen_key_result = unsafe { run_as::run_as_root(gen_key_fn) };
 
     let use_key_fn = move || {
         println!("UID: {}", getuid());
@@ -375,7 +373,6 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
     let auid = 98 * AID_USER_OFFSET + 10001;
     let agid = 98 * AID_USER_OFFSET + 10001;
     static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
 
     // Cleanup user directory if it exists
     let path_buf = PathBuf::from("/data/misc/keystore/user_98");
@@ -489,8 +486,7 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let gen_key_result =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), gen_key_fn) };
+    let gen_key_result = unsafe { run_as::run_as_root(gen_key_fn) };
 
     let use_key_fn = move || {
         println!("UID: {}", getuid());

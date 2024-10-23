@@ -153,8 +153,6 @@ fn perform_crypto_op_using_granted_key(
 
 #[test]
 fn keystore2_perofrm_crypto_op_using_keystore2_engine_rsa_key_success() {
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
-
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -170,8 +168,7 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_rsa_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // In grantee context load the key and try to perform crypto operation.
     let grantee_fn = move || {
@@ -193,8 +190,6 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_rsa_key_success() {
 
 #[test]
 fn keystore2_perofrm_crypto_op_using_keystore2_engine_ec_key_success() {
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
-
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -210,8 +205,7 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_ec_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // In grantee context load the key and try to perform crypto operation.
     let grantee_fn = move || {
@@ -233,8 +227,6 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_ec_key_success() {
 
 #[test]
 fn keystore2_perofrm_crypto_op_using_keystore2_engine_pem_pub_key_success() {
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
-
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -271,8 +263,7 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_pem_pub_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // In grantee context load the key and try to perform crypto operation.
     let grantee_fn = move || {

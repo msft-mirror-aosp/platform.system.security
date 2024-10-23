@@ -153,7 +153,6 @@ fn keystore2_update_subcomponent_no_key_entry_cert_chain_success() {
 /// permissions, test should be able to update public certificate and cert-chain successfully.
 #[test]
 fn keystore2_update_subcomponent_fails_permission_denied() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     const USER_ID_1: u32 = 99;
@@ -198,8 +197,7 @@ fn keystore2_update_subcomponent_fails_permission_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let mut granted_keys =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let mut granted_keys = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Grantee context, try to update the key public certs, permission denied error is expected.
     let granted_key1_nspace = granted_keys.remove(0);

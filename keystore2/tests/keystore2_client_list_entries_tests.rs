@@ -51,7 +51,6 @@ fn key_alias_exists(
 ///    context. GRANT keys shouldn't be part of this list.
 #[test]
 fn keystore2_list_entries_success() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     const USER_ID: u32 = 91;
@@ -110,7 +109,7 @@ fn keystore2_list_entries_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), gen_key_fn) };
+    unsafe { run_as::run_as_root(gen_key_fn) };
 
     // In user context validate list of key entries associated with it.
     let list_keys_fn = move || {

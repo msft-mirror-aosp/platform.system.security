@@ -100,8 +100,6 @@ fn keystore2_grant_key_with_invalid_perm_expecting_syserror() {
 /// should fail to load the key with permission denied error.
 #[test]
 fn keystore2_grant_key_with_perm_none() {
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
-
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -124,8 +122,7 @@ fn keystore2_grant_key_with_perm_none() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // In grantee context try to load the key, it should fail to load the granted key as it is
     // granted with empty access vector.
@@ -161,8 +158,6 @@ fn keystore2_grant_key_with_perm_none() {
 /// delete it as `DELETE` permission is not granted.
 #[test]
 fn keystore2_grant_get_info_use_key_perm() {
-    static TARGET_SU_CTX: &str = "u:r:su:s0";
-
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -185,8 +180,7 @@ fn keystore2_grant_get_info_use_key_perm() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(TARGET_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // In grantee context load the key and try to perform crypto operation.
     let grantee_fn = move || {
@@ -250,7 +244,6 @@ fn keystore2_grant_get_info_use_key_perm() {
 /// should fail to find the key with error response `KEY_NOT_FOUND`.
 #[test]
 fn keystore2_grant_delete_key_success() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -275,8 +268,7 @@ fn keystore2_grant_delete_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Grantee context, delete the key.
     let grantee_fn = move || {
@@ -317,7 +309,7 @@ fn keystore2_grant_delete_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    unsafe { run_as::run_as_root(grantor_fn) };
 }
 
 /// Grant a key to the user. In grantee context load the granted key and try to grant it to second
@@ -327,7 +319,6 @@ fn keystore2_grant_delete_key_success() {
 #[test]
 #[ignore]
 fn keystore2_grant_key_fails_with_permission_denied() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -356,8 +347,7 @@ fn keystore2_grant_key_fails_with_permission_denied() {
     };
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Grantee context, load the granted key and try to grant it to `SEC_GRANTEE_UID` grantee.
     let grantee_fn = move || {
@@ -470,7 +460,6 @@ fn keystore2_grant_fails_with_non_existing_key_expect_key_not_found_err() {
 /// the key. Grantee should fail to load the ungranted key with `KEY_NOT_FOUND` error response.
 #[test]
 fn keystore2_ungrant_key_success() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
@@ -505,8 +494,7 @@ fn keystore2_ungrant_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Grantee context, try to load the ungranted key.
     let grantee_fn = move || {
@@ -540,7 +528,6 @@ fn keystore2_ungrant_key_success() {
 /// associated key is deleted from grantor context.
 #[test]
 fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     const APPLICATION_ID: u32 = 10001;
@@ -594,8 +581,7 @@ fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let grant_key_nspace =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let grant_key_nspace = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Make sure grant did not persist, try to access the earlier granted key in grantee context.
     // Grantee context should fail to load the granted key as its associated key is deleted in
@@ -629,7 +615,6 @@ fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
 /// use it for performing an operation successfully.
 #[test]
 fn keystore2_grant_key_to_multi_users_success() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     const APPLICATION_ID: u32 = 10001;
@@ -658,8 +643,7 @@ fn keystore2_grant_key_to_multi_users_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let mut grant_keys =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let mut grant_keys = unsafe { run_as::run_as_root(grantor_fn) };
 
     for (grantee_uid, grantee_gid) in
         &[(GRANTEE_1_UID, GRANTEE_1_GID), (GRANTEE_2_UID, GRANTEE_2_GID)]
@@ -694,7 +678,6 @@ fn keystore2_grant_key_to_multi_users_success() {
 /// fail to load the granted key with `KEY_NOT_FOUND` error response.
 #[test]
 fn keystore2_grant_key_to_multi_users_delete_fails_with_key_not_found_error() {
-    static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     const USER_ID_1: u32 = 99;
@@ -724,8 +707,7 @@ fn keystore2_grant_key_to_multi_users_delete_fails_with_key_not_found_error() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    let mut grant_keys =
-        unsafe { run_as::run_as(GRANTOR_SU_CTX, Uid::from_raw(0), Gid::from_raw(0), grantor_fn) };
+    let mut grant_keys = unsafe { run_as::run_as_root(grantor_fn) };
 
     // Grantee #1 context
     let grant_key1_nspace = grant_keys.remove(0);
