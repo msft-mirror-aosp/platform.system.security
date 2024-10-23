@@ -661,41 +661,44 @@ fn keystore2_generate_attested_key_fail_to_get_aaid() {
     static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
     static APP_GID: u32 = APP_UID;
 
-    // SAFETY: The test is run in a separate process with no other threads.
+    let gen_key_fn = || {
+        skip_test_if_no_app_attest_key_feature!();
+        let sl = SecLevel::tee();
+        if sl.keystore2.getInterfaceVersion().unwrap() < 4 {
+            // `GET_ATTESTATION_APPLICATION_ID_FAILED` is supported on devices with
+            // `IKeystoreService` version >= 4.
+            return;
+        }
+        let att_challenge: &[u8] = b"foo";
+        let alias = format!("ks_attest_rsa_encrypt_key_aaid_fail{}", getuid());
+
+        let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
+            &sl,
+            Domain::APP,
+            -1,
+            Some(alias),
+            &key_generations::KeyParams {
+                key_size: 2048,
+                purpose: vec![KeyPurpose::ATTEST_KEY],
+                padding: Some(PaddingMode::RSA_PKCS1_1_5_SIGN),
+                digest: Some(Digest::SHA_2_256),
+                mgf_digest: None,
+                block_mode: None,
+                att_challenge: Some(att_challenge.to_vec()),
+            },
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED)
+        );
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
-        run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), || {
-            skip_test_if_no_app_attest_key_feature!();
-            let sl = SecLevel::tee();
-            if sl.keystore2.getInterfaceVersion().unwrap() < 4 {
-                // `GET_ATTESTATION_APPLICATION_ID_FAILED` is supported on devices with
-                // `IKeystoreService` version >= 4.
-                return;
-            }
-            let att_challenge: &[u8] = b"foo";
-            let alias = format!("ks_attest_rsa_encrypt_key_aaid_fail{}", getuid());
-
-            let result = key_generations::map_ks_error(key_generations::generate_rsa_key(
-                &sl,
-                Domain::APP,
-                -1,
-                Some(alias),
-                &key_generations::KeyParams {
-                    key_size: 2048,
-                    purpose: vec![KeyPurpose::ATTEST_KEY],
-                    padding: Some(PaddingMode::RSA_PKCS1_1_5_SIGN),
-                    digest: Some(Digest::SHA_2_256),
-                    mgf_digest: None,
-                    block_mode: None,
-                    att_challenge: Some(att_challenge.to_vec()),
-                },
-                None,
-            ));
-
-            assert!(result.is_err());
-            assert_eq!(
-                result.unwrap_err(),
-                Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED)
-            );
-        })
+        run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), gen_key_fn)
     };
 }
