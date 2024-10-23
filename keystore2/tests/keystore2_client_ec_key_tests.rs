@@ -464,7 +464,7 @@ fn keystore2_key_owner_validation() {
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
-        run_as::run_as(TARGET_CTX, Uid::from_raw(uid2), Gid::from_raw(gid2), get_key_fn);
+        run_as::run_as_app(uid2, gid2, get_key_fn);
     };
 
     // Notify the child process (client#1) to resume and finish.

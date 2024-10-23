@@ -20,7 +20,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 use keystore2_test_utils::{
     get_keystore_service, key_generations, key_generations::Error, run_as, SecLevel,
 };
-use nix::unistd::{getuid, Gid, Uid};
+use nix::unistd::getuid;
 use rustutils::users::AID_USER_OFFSET;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -51,8 +51,6 @@ fn key_alias_exists(
 ///    context. GRANT keys shouldn't be part of this list.
 #[test]
 fn keystore2_list_entries_success() {
-    static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 91;
     const APPLICATION_ID: u32 = 10006;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -143,14 +141,7 @@ fn keystore2_list_entries_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_UID),
-            Gid::from_raw(GRANTEE_GID),
-            list_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, list_keys_fn) };
 }
 
 /// Try to list the key entries with domain SELINUX from user context where user doesn't possesses
@@ -160,8 +151,6 @@ fn keystore2_list_entries_success() {
 fn keystore2_list_entries_fails_perm_denied() {
     let auid = 91 * AID_USER_OFFSET + 10001;
     let agid = 91 * AID_USER_OFFSET + 10001;
-    static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     let list_keys_fn = move || {
         let keystore2 = get_keystore_service();
 
@@ -174,7 +163,7 @@ fn keystore2_list_entries_fails_perm_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(TARGET_CTX, Uid::from_raw(auid), Gid::from_raw(agid), list_keys_fn) };
+    unsafe { run_as::run_as_app(auid, agid, list_keys_fn) };
 }
 
 /// Try to list key entries with domain BLOB. Test should fail with error repose code
@@ -194,8 +183,6 @@ fn keystore2_list_entries_fails_invalid_arg() {
 /// of all the entries in the keystore.
 #[test]
 fn keystore2_list_entries_with_long_aliases_success() {
-    static CLIENT_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 92;
     const APPLICATION_ID: u32 = 10002;
     static CLIENT_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -252,14 +239,7 @@ fn keystore2_list_entries_with_long_aliases_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            import_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, import_keys_fn) };
 }
 
 /// Import large number of Keystore entries with long aliases such that the
@@ -267,8 +247,6 @@ fn keystore2_list_entries_with_long_aliases_success() {
 /// Try to list aliases of all the entries in the keystore using `listEntriesBatched` API.
 #[test]
 fn keystore2_list_entries_batched_with_long_aliases_success() {
-    static CLIENT_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 92;
     const APPLICATION_ID: u32 = 10002;
     static CLIENT_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -319,14 +297,7 @@ fn keystore2_list_entries_batched_with_long_aliases_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            import_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, import_keys_fn) };
 }
 
 /// Import keys from multiple processes with same user context and try to list the keystore entries
@@ -341,8 +312,6 @@ fn keystore2_list_entries_batched_with_long_aliases_success() {
 ///    `startingPastAlias` as None. It should list all the keys imported in process-1 and process-2.
 #[test]
 fn keystore2_list_entries_batched_with_multi_procs_success() {
-    static CLIENT_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 92;
     const APPLICATION_ID: u32 = 10002;
     static CLIENT_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -377,14 +346,7 @@ fn keystore2_list_entries_batched_with_multi_procs_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            import_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, import_keys_fn) };
 
     let import_more_fn = || {
         let sl = SecLevel::tee();
@@ -442,20 +404,11 @@ fn keystore2_list_entries_batched_with_multi_procs_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            import_more_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, import_more_fn) };
 }
 
 #[test]
 fn keystore2_list_entries_batched_with_empty_keystore_success() {
-    static CLIENT_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 92;
     const APPLICATION_ID: u32 = 10002;
     static CLIENT_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -479,14 +432,7 @@ fn keystore2_list_entries_batched_with_empty_keystore_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            list_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, list_keys_fn) };
 }
 
 /// Import a key with SELINUX as domain, list aliases using `listEntriesBatched`.
@@ -546,8 +492,6 @@ fn keystore2_list_entries_batched_with_selinux_domain_success() {
 
 #[test]
 fn keystore2_list_entries_batched_validate_count_and_order_success() {
-    static CLIENT_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID: u32 = 92;
     const APPLICATION_ID: u32 = 10002;
     static CLIENT_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -676,14 +620,7 @@ fn keystore2_list_entries_batched_validate_count_and_order_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            CLIENT_CTX,
-            Uid::from_raw(CLIENT_UID),
-            Gid::from_raw(CLIENT_GID),
-            list_keys_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(CLIENT_UID, CLIENT_GID, list_keys_fn) };
 }
 
 /// Try to list the key entries with domain SELINUX from user context where user doesn't possesses
@@ -693,8 +630,6 @@ fn keystore2_list_entries_batched_validate_count_and_order_success() {
 fn keystore2_list_entries_batched_fails_perm_denied() {
     let auid = 91 * AID_USER_OFFSET + 10001;
     let agid = 91 * AID_USER_OFFSET + 10001;
-    static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     let list_keys_fn = move || {
         let keystore2 = get_keystore_service();
 
@@ -709,7 +644,7 @@ fn keystore2_list_entries_batched_fails_perm_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(TARGET_CTX, Uid::from_raw(auid), Gid::from_raw(agid), list_keys_fn) };
+    unsafe { run_as::run_as_app(auid, agid, list_keys_fn) };
 }
 
 /// Try to list key entries with domain BLOB. Test should fail with error response code
@@ -734,8 +669,6 @@ fn keystore2_list_entries_batched_fails_invalid_arg() {
 fn keystore2_get_number_of_entries_fails_perm_denied() {
     let auid = 91 * AID_USER_OFFSET + 10001;
     let agid = 91 * AID_USER_OFFSET + 10001;
-    static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     let get_num_fn = move || {
         let keystore2 = get_keystore_service();
 
@@ -748,7 +681,7 @@ fn keystore2_get_number_of_entries_fails_perm_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(TARGET_CTX, Uid::from_raw(auid), Gid::from_raw(agid), get_num_fn) };
+    unsafe { run_as::run_as_app(auid, agid, get_num_fn) };
 }
 
 /// Try to get number of key entries with domain BLOB. Test should fail with error response code

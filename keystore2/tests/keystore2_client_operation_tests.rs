@@ -430,7 +430,7 @@ fn keystore2_forced_op_perm_denied_test() {
 /// Should be able to create forced operation with `vold` context successfully.
 #[test]
 fn keystore2_forced_op_success_test() {
-    static TARGET_CTX: &str = "u:r:vold:s0";
+    static TARGET_VOLD_CTX: &str = "u:r:vold:s0";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10601;
 
@@ -452,7 +452,7 @@ fn keystore2_forced_op_success_test() {
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
-        run_as::run_as(TARGET_CTX, Uid::from_raw(uid), Gid::from_raw(gid), forced_op_fn);
+        run_as::run_as(TARGET_VOLD_CTX, Uid::from_raw(uid), Gid::from_raw(gid), forced_op_fn);
     }
 }
 

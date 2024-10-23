@@ -22,7 +22,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 use keystore2_test_utils::{
     get_keystore_service, key_generations, key_generations::Error, run_as, SecLevel,
 };
-use nix::unistd::{getuid, Gid, Uid};
+use nix::unistd::getuid;
 use rustutils::users::AID_USER_OFFSET;
 
 /// Generate a key and update its public certificate and certificate chain. Test should be able to
@@ -153,8 +153,6 @@ fn keystore2_update_subcomponent_no_key_entry_cert_chain_success() {
 /// permissions, test should be able to update public certificate and cert-chain successfully.
 #[test]
 fn keystore2_update_subcomponent_fails_permission_denied() {
-    static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
-
     const USER_ID_1: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_1_UID: u32 = USER_ID_1 * AID_USER_OFFSET + APPLICATION_ID;
@@ -223,14 +221,7 @@ fn keystore2_update_subcomponent_fails_permission_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_1_UID),
-            Gid::from_raw(GRANTEE_1_GID),
-            grantee1_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_1_UID, GRANTEE_1_GID, grantee1_fn) };
 
     // Grantee context, update granted key public certs. Update should happen successfully.
     let granted_key2_nspace = granted_keys.remove(0);
@@ -267,14 +258,7 @@ fn keystore2_update_subcomponent_fails_permission_denied() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_2_UID),
-            Gid::from_raw(GRANTEE_2_GID),
-            grantee2_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_2_UID, GRANTEE_2_GID, grantee2_fn) };
 }
 
 #[test]

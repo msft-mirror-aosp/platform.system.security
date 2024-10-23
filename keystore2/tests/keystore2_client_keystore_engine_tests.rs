@@ -24,7 +24,6 @@ use keystore2_test_utils::ffi_test_utils::perform_crypto_op_using_keystore_engin
 use keystore2_test_utils::{
     authorizations::AuthSetBuilder, get_keystore_service, run_as, SecLevel,
 };
-use nix::unistd::{Gid, Uid};
 use openssl::x509::X509;
 use rustutils::users::AID_USER_OFFSET;
 
@@ -152,8 +151,7 @@ fn perform_crypto_op_using_granted_key(
 }
 
 #[test]
-fn keystore2_perofrm_crypto_op_using_keystore2_engine_rsa_key_success() {
-    static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
+fn keystore2_perform_crypto_op_using_keystore2_engine_rsa_key_success() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -178,19 +176,11 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_rsa_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_UID),
-            Gid::from_raw(GRANTEE_GID),
-            grantee_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, grantee_fn) };
 }
 
 #[test]
-fn keystore2_perofrm_crypto_op_using_keystore2_engine_ec_key_success() {
-    static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
+fn keystore2_perform_crypto_op_using_keystore2_engine_ec_key_success() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -215,19 +205,11 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_ec_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_UID),
-            Gid::from_raw(GRANTEE_GID),
-            grantee_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, grantee_fn) };
 }
 
 #[test]
-fn keystore2_perofrm_crypto_op_using_keystore2_engine_pem_pub_key_success() {
-    static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
+fn keystore2_perform_crypto_op_using_keystore2_engine_pem_pub_key_success() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -273,12 +255,5 @@ fn keystore2_perofrm_crypto_op_using_keystore2_engine_pem_pub_key_success() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(
-            GRANTEE_CTX,
-            Uid::from_raw(GRANTEE_UID),
-            Gid::from_raw(GRANTEE_GID),
-            grantee_fn,
-        )
-    };
+    unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, grantee_fn) };
 }

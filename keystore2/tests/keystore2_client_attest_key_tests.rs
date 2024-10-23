@@ -33,7 +33,7 @@ use keystore2_test_utils::ffi_test_utils::{get_value_from_attest_record, validat
 use keystore2_test_utils::{
     authorizations, key_generations, key_generations::Error, run_as, SecLevel,
 };
-use nix::unistd::{getuid, Gid, Uid};
+use nix::unistd::getuid;
 use rustutils::users::AID_USER_OFFSET;
 
 /// Generate RSA and EC attestation keys and use them for signing RSA-signing keys.
@@ -655,7 +655,6 @@ fn keystore2_attest_key_without_attestation_id_support_fails_with_cannot_attest_
 /// should return error response code - `GET_ATTESTATION_APPLICATION_ID_FAILED`.
 #[test]
 fn keystore2_generate_attested_key_fail_to_get_aaid() {
-    static APP_USER_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 19901;
     static APP_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -698,7 +697,5 @@ fn keystore2_generate_attested_key_fail_to_get_aaid() {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe {
-        run_as::run_as(APP_USER_CTX, Uid::from_raw(APP_UID), Gid::from_raw(APP_GID), gen_key_fn)
-    };
+    unsafe { run_as::run_as_app(APP_UID, APP_GID, gen_key_fn) };
 }

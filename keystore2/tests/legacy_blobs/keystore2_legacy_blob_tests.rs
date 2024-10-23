@@ -27,7 +27,7 @@ use keystore2::legacy_blob::LegacyKeyCharacteristics;
 use keystore2::utils::AesGcm;
 use keystore2_crypto::{Password, ZVec};
 use keystore2_test_utils::{get_keystore_service, key_generations, run_as, SecLevel};
-use nix::unistd::{getuid, Gid, Uid};
+use nix::unistd::getuid;
 use rustutils::users::AID_USER_OFFSET;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -128,7 +128,6 @@ fn keystore2_restart_service() {
 fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
     let auid = 99 * AID_USER_OFFSET + 10001;
     let agid = 99 * AID_USER_OFFSET + 10001;
-    static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     // Cleanup user directory if it exists
     let path_buf = PathBuf::from("/data/misc/keystore/user_99");
@@ -330,7 +329,7 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(TARGET_CTX, Uid::from_raw(auid), Gid::from_raw(agid), use_key_fn) };
+    unsafe { run_as::run_as_app(auid, agid, use_key_fn) };
 
     // Make sure keystore2 clean up imported legacy db.
     let path_buf = PathBuf::from("/data/misc/keystore/user_99");
@@ -372,7 +371,6 @@ fn keystore2_encrypted_characteristics() -> anyhow::Result<()> {
 fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
     let auid = 98 * AID_USER_OFFSET + 10001;
     let agid = 98 * AID_USER_OFFSET + 10001;
-    static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     // Cleanup user directory if it exists
     let path_buf = PathBuf::from("/data/misc/keystore/user_98");
@@ -543,7 +541,7 @@ fn keystore2_encrypted_certificates() -> anyhow::Result<()> {
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
     // `--test-threads=1`), and nothing yet done with binder.
-    unsafe { run_as::run_as(TARGET_CTX, Uid::from_raw(auid), Gid::from_raw(agid), use_key_fn) };
+    unsafe { run_as::run_as_app(auid, agid, use_key_fn) };
 
     // Make sure keystore2 clean up imported legacy db.
     let path_buf = PathBuf::from("/data/misc/keystore/user_98");
