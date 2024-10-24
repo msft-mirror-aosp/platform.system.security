@@ -392,6 +392,30 @@ pub fn map_ks_error<T>(r: BinderResult<T>) -> Result<T, Error> {
     })
 }
 
+/// Check for a specific KeyMint error.
+#[macro_export]
+macro_rules! expect_km_error {
+    { $result:expr, $want:expr } => {
+        match $result {
+            Ok(_) => return Err(format!(
+                "{}:{}: Expected KeyMint error {:?}, found success",
+                file!(),
+                line!(),
+                $want
+            ).into()),
+            Err(s) if s.exception_code() == ExceptionCode::SERVICE_SPECIFIC
+                    && s.service_specific_error() == $want.0 => {}
+            Err(e) => return Err(format!(
+                "{}:{}: Expected KeyMint service-specific error {:?}, got {e:?}",
+                file!(),
+                line!(),
+                $want
+            ).into()),
+        }
+
+    };
+}
+
 /// Get the value of the given system property, if the given system property doesn't exist
 /// then returns an empty byte vector.
 pub fn get_system_prop(name: &str) -> Vec<u8> {
@@ -466,14 +490,19 @@ pub fn check_key_authorizations(
             return true;
         }
 
+        // Don't check these parameters if the underlying device is a Keymaster implementation.
         if sl.is_keymaster() {
-            // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0, so don't check for it if the
-            // underlying device is a Keymaster implementation.
-            if matches!(key_param.tag, Tag::USAGE_COUNT_LIMIT) {
+            if matches!(
+                key_param.tag,
+                // `Tag::USAGE_COUNT_LIMIT` was added in KeyMint 1.0.
+                Tag::USAGE_COUNT_LIMIT |
+                // Keymaster implementations may not consistently include `Tag::VENDOR_PATCHLEVEL`
+                // in generated key characteristics.
+                Tag::VENDOR_PATCHLEVEL
+            ) {
                 return true;
             }
-            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0, so don't check for it if the
-            // underlying device is a Keymaster implementation.
+            // `KeyPurpose::ATTEST_KEY` was added in KeyMint 1.0.
             if key_param.tag == Tag::PURPOSE
                 && key_param.value == KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)
             {
@@ -515,18 +544,6 @@ fn check_common_auths(
         }
     ));
 
-    // Access denied for finding vendor-patch-level ("ro.vendor.build.security_patch") property
-    // in a test running with `untrusted_app` context. Keeping this check to verify
-    // vendor-patch-level in tests running with `su` context.
-    if getuid().is_root() {
-        assert!(check_key_param(
-            authorizations,
-            &KeyParameter {
-                tag: Tag::VENDOR_PATCHLEVEL,
-                value: KeyParameterValue::Integer(get_vendor_patchlevel().try_into().unwrap())
-            }
-        ));
-    }
     assert!(check_key_param(
         authorizations,
         &KeyParameter { tag: Tag::ORIGIN, value: KeyParameterValue::Origin(expected_key_origin) }
@@ -548,6 +565,22 @@ fn check_common_auths(
             .iter()
             .map(|auth| &auth.keyParameter)
             .any(|key_param| key_param.tag == Tag::CREATION_DATETIME));
+
+        // Access denied for finding vendor-patch-level ("ro.vendor.build.security_patch") property
+        // in a test running with `untrusted_app` context. Keeping this check to verify
+        // vendor-patch-level in tests running with `su` context.
+        if getuid().is_root() {
+            // Keymaster implementations may not consistently include `Tag::VENDOR_PATCHLEVEL`
+            // in generated key characteristics. So, checking this if the underlying device is a
+            // KeyMint implementation.
+            assert!(check_key_param(
+                authorizations,
+                &KeyParameter {
+                    tag: Tag::VENDOR_PATCHLEVEL,
+                    value: KeyParameterValue::Integer(get_vendor_patchlevel().try_into().unwrap())
+                }
+            ));
+        }
     }
 }
 
