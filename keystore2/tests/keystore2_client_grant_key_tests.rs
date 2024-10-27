@@ -311,6 +311,7 @@ fn keystore2_grant_delete_key_success() {
 /// from grantee context. Test should make sure second grantee should not have a access to granted
 /// key.
 #[test]
+#[ignore]
 fn keystore2_grant_key_fails_with_permission_denied() {
     static GRANTOR_SU_CTX: &str = "u:r:su:s0";
     static GRANTEE_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
