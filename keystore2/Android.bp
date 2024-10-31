@@ -13,6 +13,7 @@
 // limitations under the License.
 
 package {
+    default_team: "trendy_team_android_hardware_backed_security",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "system_security_license"
@@ -56,10 +57,10 @@ rust_defaults {
         "libkeystore2_hal_names_rust",
         "libkeystore2_km_compat",
         "libkeystore2_selinux",
-        "liblazy_static",
         "liblibc",
         "liblog_rust",
         "libmessage_macro",
+        "libpostprocessor_client",
         "librand",
         "librkpd_client",
         "librustutils",
@@ -114,6 +115,7 @@ rust_test {
         "liblibsqlite3_sys",
         "libnix",
         "librusqlite",
+        "libtempfile",
     ],
     // The test should always include watchdog.
     features: [
@@ -121,6 +123,11 @@ rust_test {
         "watchdog",
     ],
     require_root: true,
+}
+
+vintf_fragment {
+    name: "android.system.keystore2-service.xml",
+    src: "android.system.keystore2-service.xml",
 }
 
 rust_defaults {
@@ -141,7 +148,7 @@ rust_defaults {
     // selection available in the build system.
     prefer_rlib: true,
 
-    vintf_fragments: ["android.system.keystore2-service.xml"],
+    vintf_fragment_modules: ["android.system.keystore2-service.xml"],
 
     required: ["keystore_cli_v2"],
 }
@@ -168,6 +175,12 @@ aconfig_declarations {
 java_aconfig_library {
     name: "keystore2_flags_java",
     aconfig_declarations: "keystore2_flags",
+}
+
+java_aconfig_library {
+    name: "keystore2_flags_java-host",
+    aconfig_declarations: "keystore2_flags",
+    host_supported: true,
 }
 
 rust_aconfig_library {
