@@ -19,20 +19,35 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     Digest::Digest, KeyPurpose::KeyPurpose,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
-    Domain::Domain, KeyDescriptor::KeyDescriptor, KeyPermission::KeyPermission,
-    ResponseCode::ResponseCode,
+    Domain::Domain, IKeystoreService::IKeystoreService, KeyDescriptor::KeyDescriptor,
+    KeyEntryResponse::KeyEntryResponse, KeyPermission::KeyPermission, ResponseCode::ResponseCode,
 };
 use keystore2_test_utils::{
-    authorizations, get_keystore_service, key_generations, key_generations::Error, run_as, SecLevel,
+    authorizations, get_keystore_service, key_generations,
+    key_generations::{map_ks_error, Error},
+    run_as, SecLevel,
 };
 use nix::unistd::getuid;
 use rustutils::users::AID_USER_OFFSET;
 
-/// Generate an EC signing key and grant it to the user with given access vector.
-fn generate_ec_key_and_grant_to_user(
-    grantee_uid: i32,
+/// Produce a [`KeyDescriptor`] for a granted key.
+fn granted_key_descriptor(nspace: i64) -> KeyDescriptor {
+    KeyDescriptor { domain: Domain::GRANT, nspace, alias: None, blob: None }
+}
+
+fn get_granted_key(
+    ks2: &binder::Strong<dyn IKeystoreService>,
+    nspace: i64,
+) -> Result<KeyEntryResponse, Error> {
+    map_ks_error(ks2.getKeyEntry(&granted_key_descriptor(nspace)))
+}
+
+/// Generate an EC signing key in the SELINUX domain and grant it to the user with given access
+/// vector.
+fn generate_and_grant_selinux_key(
+    grantee_uid: u32,
     access_vector: i32,
-) -> binder::Result<KeyDescriptor> {
+) -> Result<KeyDescriptor, Error> {
     let sl = SecLevel::tee();
     let alias = format!("{}{}", "ks_grant_test_key_1", getuid());
 
@@ -45,61 +60,54 @@ fn generate_ec_key_and_grant_to_user(
     )
     .unwrap();
 
-    sl.keystore2.grant(&key_metadata.key, grantee_uid, access_vector)
+    map_ks_error(sl.keystore2.grant(
+        &key_metadata.key,
+        grantee_uid.try_into().unwrap(),
+        access_vector,
+    ))
 }
 
-fn load_grant_key_and_perform_sign_operation(
-    sl: &SecLevel,
-    grant_key_nspace: i64,
-) -> Result<(), binder::Status> {
-    let key_entry_response = sl.keystore2.getKeyEntry(&KeyDescriptor {
-        domain: Domain::GRANT,
-        nspace: grant_key_nspace,
-        alias: None,
-        blob: None,
-    })?;
+/// Use a granted key to perform a signing operation.
+fn sign_with_granted_key(grant_key_nspace: i64) -> Result<(), Error> {
+    let sl = SecLevel::tee();
+    let key_entry_response = get_granted_key(&sl.keystore2, grant_key_nspace)?;
 
     // Perform sample crypto operation using granted key.
-    let op_response = sl.binder.createOperation(
+    let op_response = map_ks_error(sl.binder.createOperation(
         &key_entry_response.metadata.key,
         &authorizations::AuthSetBuilder::new().purpose(KeyPurpose::SIGN).digest(Digest::SHA_2_256),
         false,
-    )?;
+    ))?;
 
     assert!(op_response.iOperation.is_some());
     assert_eq!(
         Ok(()),
-        key_generations::map_ks_error(perform_sample_sign_operation(
-            &op_response.iOperation.unwrap()
-        ))
+        map_ks_error(perform_sample_sign_operation(&op_response.iOperation.unwrap()))
     );
 
     Ok(())
 }
 
-/// Try to grant a key with permission that does not map to any of the `KeyPermission` values.
-/// An error is expected with values that does not map to set of permissions listed in
+/// Try to grant an SELINUX key with permission that does not map to any of the `KeyPermission`
+/// values.  An error is expected with values that does not map to set of permissions listed in
 /// `KeyPermission`.
 #[test]
-fn keystore2_grant_key_with_invalid_perm_expecting_syserror() {
+fn grant_selinux_key_with_invalid_perm() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     let grantee_uid = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
     let invalid_access_vector = KeyPermission::CONVERT_STORAGE_KEY_TO_EPHEMERAL.0 << 19;
 
-    let result = key_generations::map_ks_error(generate_ec_key_and_grant_to_user(
-        grantee_uid.try_into().unwrap(),
-        invalid_access_vector,
-    ));
+    let result = generate_and_grant_selinux_key(grantee_uid, invalid_access_vector);
     assert!(result.is_err());
     assert_eq!(Error::Rc(ResponseCode::SYSTEM_ERROR), result.unwrap_err());
 }
 
-/// Try to grant a key with empty access vector `KeyPermission::NONE`, should be able to grant a
-/// key with empty access vector successfully. In grantee context try to use the granted key, it
-/// should fail to load the key with permission denied error.
+/// Try to grant an SELINUX key with empty access vector `KeyPermission::NONE`, should be able to
+/// grant a key with empty access vector successfully. In grantee context try to use the granted
+/// key, it should fail to load the key with permission denied error.
 #[test]
-fn keystore2_grant_key_with_perm_none() {
+fn grant_selinux_key_with_perm_none() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -108,11 +116,7 @@ fn keystore2_grant_key_with_perm_none() {
     let grantor_fn = || {
         let empty_access_vector = KeyPermission::NONE.0;
 
-        let grant_key = key_generations::map_ks_error(generate_ec_key_and_grant_to_user(
-            GRANTEE_UID.try_into().unwrap(),
-            empty_access_vector,
-        ))
-        .unwrap();
+        let grant_key = generate_and_grant_selinux_key(GRANTEE_UID, empty_access_vector).unwrap();
 
         assert_eq!(grant_key.domain, Domain::GRANT);
 
@@ -128,12 +132,7 @@ fn keystore2_grant_key_with_perm_none() {
     let grantee_fn = move || {
         let keystore2 = get_keystore_service();
 
-        let result = key_generations::map_ks_error(keystore2.getKeyEntry(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key_nspace,
-            alias: None,
-            blob: None,
-        }));
+        let result = get_granted_key(&keystore2, grant_key_nspace);
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::PERMISSION_DENIED), result.unwrap_err());
     };
@@ -143,13 +142,13 @@ fn keystore2_grant_key_with_perm_none() {
     unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, grantee_fn) };
 }
 
-/// Grant a key to the user (grantee) with `GET_INFO|USE` key permissions. Verify whether grantee
-/// can succeed in loading the granted key and try to perform simple operation using this granted
-/// key. Grantee should be able to load the key and use the key to perform crypto operation
+/// Grant an SELINUX key to the user (grantee) with `GET_INFO|USE` key permissions. Verify whether
+/// grantee can succeed in loading the granted key and try to perform simple operation using this
+/// granted key. Grantee should be able to load the key and use the key to perform crypto operation
 /// successfully. Try to delete the granted key in grantee context where it is expected to fail to
 /// delete it as `DELETE` permission is not granted.
 #[test]
-fn keystore2_grant_get_info_use_key_perm() {
+fn grant_selinux_key_get_info_use_perms() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -158,11 +157,7 @@ fn keystore2_grant_get_info_use_key_perm() {
     // Generate a key and grant it to a user with GET_INFO|USE key permissions.
     let grantor_fn = || {
         let access_vector = KeyPermission::GET_INFO.0 | KeyPermission::USE.0;
-        let grant_key = key_generations::map_ks_error(generate_ec_key_and_grant_to_user(
-            GRANTEE_UID.try_into().unwrap(),
-            access_vector,
-        ))
-        .unwrap();
+        let grant_key = generate_and_grant_selinux_key(GRANTEE_UID, access_vector).unwrap();
 
         assert_eq!(grant_key.domain, Domain::GRANT);
 
@@ -178,15 +173,7 @@ fn keystore2_grant_get_info_use_key_perm() {
         let sl = SecLevel::tee();
 
         // Load the granted key.
-        let key_entry_response = sl
-            .keystore2
-            .getKeyEntry(&KeyDescriptor {
-                domain: Domain::GRANT,
-                nspace: grant_key_nspace,
-                alias: None,
-                blob: None,
-            })
-            .unwrap();
+        let key_entry_response = get_granted_key(&sl.keystore2, grant_key_nspace).unwrap();
 
         // Perform sample crypto operation using granted key.
         let op_response = sl
@@ -202,18 +189,12 @@ fn keystore2_grant_get_info_use_key_perm() {
         assert!(op_response.iOperation.is_some());
         assert_eq!(
             Ok(()),
-            key_generations::map_ks_error(perform_sample_sign_operation(
-                &op_response.iOperation.unwrap()
-            ))
+            map_ks_error(perform_sample_sign_operation(&op_response.iOperation.unwrap()))
         );
 
         // Try to delete the key, it is expected to be fail with permission denied error.
-        let result = key_generations::map_ks_error(sl.keystore2.deleteKey(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key_nspace,
-            alias: None,
-            blob: None,
-        }));
+        let result =
+            map_ks_error(sl.keystore2.deleteKey(&granted_key_descriptor(grant_key_nspace)));
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::PERMISSION_DENIED), result.unwrap_err());
     };
@@ -223,11 +204,11 @@ fn keystore2_grant_get_info_use_key_perm() {
     unsafe { run_as::run_as_app(GRANTEE_UID, GRANTEE_GID, grantee_fn) };
 }
 
-/// Grant a key to the user with DELETE access. In grantee context load the key and delete it.
+/// Grant an APP key to the user with DELETE access. In grantee context load the key and delete it.
 /// Verify that grantee should succeed in deleting the granted key and in grantor context test
 /// should fail to find the key with error response `KEY_NOT_FOUND`.
 #[test]
-fn keystore2_grant_delete_key_success() {
+fn grant_delete_key_success() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -256,14 +237,7 @@ fn keystore2_grant_delete_key_success() {
     // Grantee context, delete the key.
     let grantee_fn = move || {
         let keystore2 = get_keystore_service();
-        keystore2
-            .deleteKey(&KeyDescriptor {
-                domain: Domain::GRANT,
-                nspace: grant_key_nspace,
-                alias: None,
-                blob: None,
-            })
-            .unwrap();
+        keystore2.deleteKey(&granted_key_descriptor(grant_key_nspace)).unwrap();
     };
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
@@ -273,7 +247,7 @@ fn keystore2_grant_delete_key_success() {
     // Verify whether key got deleted in grantor's context.
     let grantor_fn = move || {
         let keystore2_inst = get_keystore_service();
-        let result = key_generations::map_ks_error(keystore2_inst.getKeyEntry(&KeyDescriptor {
+        let result = map_ks_error(keystore2_inst.getKeyEntry(&KeyDescriptor {
             domain: Domain::APP,
             nspace: -1,
             alias: Some(ALIAS.to_string()),
@@ -288,13 +262,13 @@ fn keystore2_grant_delete_key_success() {
     unsafe { run_as::run_as_root(grantor_fn) };
 }
 
-/// Grant a key to the user. In grantee context load the granted key and try to grant it to second
-/// user. Test should fail with a response code `PERMISSION_DENIED` to grant a key to second user
-/// from grantee context. Test should make sure second grantee should not have a access to granted
-/// key.
+/// Grant an APP key to the user. In grantee context load the granted key and try to grant it to
+/// second user. Test should fail with a response code `PERMISSION_DENIED` to grant a key to second
+/// user from grantee context. Test should make sure second grantee should not have a access to
+/// granted key.
 #[test]
 #[ignore]
-fn keystore2_grant_key_fails_with_permission_denied() {
+fn grant_granted_key_fails() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -329,16 +303,9 @@ fn keystore2_grant_key_fails_with_permission_denied() {
         let keystore2 = get_keystore_service();
         let access_vector = KeyPermission::GET_INFO.0;
 
-        let key_entry_response = keystore2
-            .getKeyEntry(&KeyDescriptor {
-                domain: Domain::GRANT,
-                nspace: grant_key_nspace,
-                alias: None,
-                blob: None,
-            })
-            .unwrap();
+        let key_entry_response = get_granted_key(&keystore2, grant_key_nspace).unwrap();
 
-        let result = key_generations::map_ks_error(keystore2.grant(
+        let result = map_ks_error(keystore2.grant(
             &key_entry_response.metadata.key,
             SEC_GRANTEE_UID.try_into().unwrap(),
             access_vector,
@@ -354,14 +321,7 @@ fn keystore2_grant_key_fails_with_permission_denied() {
     // Make sure second grantee shouldn't have access to the above granted key.
     let grantee2_fn = move || {
         let keystore2 = get_keystore_service();
-
-        let result = key_generations::map_ks_error(keystore2.getKeyEntry(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key_nspace,
-            alias: None,
-            blob: None,
-        }));
-
+        let result = get_granted_key(&keystore2, grant_key_nspace);
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
     };
@@ -371,10 +331,11 @@ fn keystore2_grant_key_fails_with_permission_denied() {
     unsafe { run_as::run_as_app(SEC_GRANTEE_UID, SEC_GRANTEE_GID, grantee2_fn) };
 }
 
-/// Try to grant a key with `GRANT` access. Keystore2 system shouldn't allow to grant a key with
-/// `GRANT` access. Test should fail to grant a key with `PERMISSION_DENIED` error response code.
+/// Try to grant an APP key with `GRANT` access. Keystore2 system shouldn't allow to grant a key
+/// with `GRANT` access. Test should fail to grant a key with `PERMISSION_DENIED` error response
+/// code.
 #[test]
-fn keystore2_grant_key_fails_with_grant_perm_expect_perm_denied() {
+fn grant_key_with_grant_perm_fails() {
     let sl = SecLevel::tee();
     let access_vector = KeyPermission::GRANT.0;
     let alias = format!("ks_grant_access_vec_key_{}", getuid());
@@ -382,7 +343,7 @@ fn keystore2_grant_key_fails_with_grant_perm_expect_perm_denied() {
     let application_id = 10001;
     let grantee_uid = user_id * AID_USER_OFFSET + application_id;
 
-    let result = key_generations::map_ks_error(generate_ec_key_and_grant_to_users(
+    let result = map_ks_error(generate_ec_key_and_grant_to_users(
         &sl,
         Some(alias),
         vec![grantee_uid.try_into().unwrap()],
@@ -392,10 +353,10 @@ fn keystore2_grant_key_fails_with_grant_perm_expect_perm_denied() {
     assert_eq!(Error::Rc(ResponseCode::PERMISSION_DENIED), result.unwrap_err());
 }
 
-/// Try to grant a non-existing key to the user. Test should fail with `KEY_NOT_FOUND` error
+/// Try to grant a non-existing SELINUX key to the user. Test should fail with `KEY_NOT_FOUND` error
 /// response.
 #[test]
-fn keystore2_grant_fails_with_non_existing_key_expect_key_not_found_err() {
+fn grant_fails_with_non_existing_selinux_key() {
     let keystore2 = get_keystore_service();
     let alias = format!("ks_grant_test_non_existing_key_5_{}", getuid());
     let user_id = 98;
@@ -403,7 +364,7 @@ fn keystore2_grant_fails_with_non_existing_key_expect_key_not_found_err() {
     let grantee_uid = user_id * AID_USER_OFFSET + application_id;
     let access_vector = KeyPermission::GET_INFO.0;
 
-    let result = key_generations::map_ks_error(keystore2.grant(
+    let result = map_ks_error(keystore2.grant(
         &KeyDescriptor {
             domain: Domain::SELINUX,
             nspace: key_generations::SELINUX_SHELL_NAMESPACE,
@@ -417,10 +378,10 @@ fn keystore2_grant_fails_with_non_existing_key_expect_key_not_found_err() {
     assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
 }
 
-/// Grant a key to the user and immediately ungrant the granted key. In grantee context try to load
+/// Grant an APP key to the user and immediately ungrant the granted key. In grantee context try to load
 /// the key. Grantee should fail to load the ungranted key with `KEY_NOT_FOUND` error response.
 #[test]
-fn keystore2_ungrant_key_success() {
+fn ungrant_key_success() {
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -459,12 +420,7 @@ fn keystore2_ungrant_key_success() {
     // Grantee context, try to load the ungranted key.
     let grantee_fn = move || {
         let keystore2 = get_keystore_service();
-        let result = key_generations::map_ks_error(keystore2.getKeyEntry(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key_nspace,
-            alias: None,
-            blob: None,
-        }));
+        let result = get_granted_key(&keystore2, grant_key_nspace);
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
     };
@@ -480,7 +436,7 @@ fn keystore2_ungrant_key_success() {
 /// key in grantee context. Test should fail to load the granted key in grantee context as the
 /// associated key is deleted from grantor context.
 #[test]
-fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
+fn ungrant_deleted_key_fails() {
     const APPLICATION_ID: u32 = 10001;
     const USER_ID: u32 = 99;
     static GRANTEE_UID: u32 = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
@@ -510,9 +466,8 @@ fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
         sl.keystore2.deleteKey(&key_metadata.key).unwrap();
 
         // Try to ungrant above granted key.
-        let result = key_generations::map_ks_error(
-            sl.keystore2.ungrant(&key_metadata.key, GRANTEE_UID.try_into().unwrap()),
-        );
+        let result =
+            map_ks_error(sl.keystore2.ungrant(&key_metadata.key, GRANTEE_UID.try_into().unwrap()));
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
 
@@ -539,13 +494,7 @@ fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
     // grantor context.
     let grantee_fn = move || {
         let keystore2 = get_keystore_service();
-
-        let result = key_generations::map_ks_error(keystore2.getKeyEntry(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key_nspace,
-            alias: None,
-            blob: None,
-        }));
+        let result = get_granted_key(&keystore2, grant_key_nspace);
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
     };
@@ -558,7 +507,7 @@ fn keystore2_ungrant_fails_with_non_existing_key_expect_key_not_found_error() {
 /// Grant a key to multiple users. Verify that all grantees should succeed in loading the key and
 /// use it for performing an operation successfully.
 #[test]
-fn keystore2_grant_key_to_multi_users_success() {
+fn grant_key_to_multi_users_success() {
     const APPLICATION_ID: u32 = 10001;
     const USER_ID_1: u32 = 99;
     static GRANTEE_1_UID: u32 = USER_ID_1 * AID_USER_OFFSET + APPLICATION_ID;
@@ -592,15 +541,7 @@ fn keystore2_grant_key_to_multi_users_success() {
     {
         let grant_key_nspace = grant_keys.remove(0);
         let grantee_fn = move || {
-            let sl = SecLevel::tee();
-
-            assert_eq!(
-                Ok(()),
-                key_generations::map_ks_error(load_grant_key_and_perform_sign_operation(
-                    &sl,
-                    grant_key_nspace
-                ))
-            );
+            assert_eq!(Ok(()), sign_with_granted_key(grant_key_nspace));
         };
         // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
         // `--test-threads=1`), and nothing yet done with binder.
@@ -612,7 +553,7 @@ fn keystore2_grant_key_to_multi_users_success() {
 /// use the key and delete it. Try to load the granted key in another grantee context. Test should
 /// fail to load the granted key with `KEY_NOT_FOUND` error response.
 #[test]
-fn keystore2_grant_key_to_multi_users_delete_fails_with_key_not_found_error() {
+fn grant_key_to_multi_users_delete_then_key_not_found() {
     const USER_ID_1: u32 = 99;
     const APPLICATION_ID: u32 = 10001;
     static GRANTEE_1_UID: u32 = USER_ID_1 * AID_USER_OFFSET + APPLICATION_ID;
@@ -645,25 +586,10 @@ fn keystore2_grant_key_to_multi_users_delete_fails_with_key_not_found_error() {
     // Grantee #1 context
     let grant_key1_nspace = grant_keys.remove(0);
     let grantee1_fn = move || {
-        let sl = SecLevel::tee();
-
-        assert_eq!(
-            Ok(()),
-            key_generations::map_ks_error(load_grant_key_and_perform_sign_operation(
-                &sl,
-                grant_key1_nspace
-            ))
-        );
+        assert_eq!(Ok(()), sign_with_granted_key(grant_key1_nspace));
 
         // Delete the granted key.
-        sl.keystore2
-            .deleteKey(&KeyDescriptor {
-                domain: Domain::GRANT,
-                nspace: grant_key1_nspace,
-                alias: None,
-                blob: None,
-            })
-            .unwrap();
+        get_keystore_service().deleteKey(&granted_key_descriptor(grant_key1_nspace)).unwrap();
     };
 
     // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
@@ -675,12 +601,8 @@ fn keystore2_grant_key_to_multi_users_delete_fails_with_key_not_found_error() {
     let grantee2_fn = move || {
         let keystore2 = get_keystore_service();
 
-        let result = key_generations::map_ks_error(keystore2.getKeyEntry(&KeyDescriptor {
-            domain: Domain::GRANT,
-            nspace: grant_key2_nspace,
-            alias: None,
-            blob: None,
-        }));
+        let result =
+            map_ks_error(keystore2.getKeyEntry(&granted_key_descriptor(grant_key2_nspace)));
         assert!(result.is_err());
         assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
     };
