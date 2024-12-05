@@ -46,6 +46,7 @@ rust_defaults {
         "android.security.maintenance-rust",
         "android.security.metrics-rust",
         "android.security.rkp_aidl-rust",
+        "apex_aidl_interface-rust",
         "libaconfig_android_hardware_biometrics_rust",
         "libandroid_security_flags_rust",
         "libanyhow",
