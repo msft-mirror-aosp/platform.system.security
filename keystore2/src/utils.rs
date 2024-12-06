@@ -38,6 +38,7 @@ use android_security_apc::aidl::android::security::apc::{
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     Authorization::Authorization, Domain::Domain, KeyDescriptor::KeyDescriptor,
+    ResponseCode::ResponseCode,
 };
 use anyhow::{Context, Result};
 use binder::{FromIBinder, StatusCode, Strong, ThreadState};
@@ -79,6 +80,7 @@ pub fn check_keystore_permission(perm: KeystorePerm) -> anyhow::Result<()> {
 pub fn check_grant_permission(access_vec: KeyPermSet, key: &KeyDescriptor) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_grant_permission(
+            ThreadState::get_calling_uid(),
             calling_sid
                 .ok_or_else(Error::sys)
                 .context(ks_err!("Cannot check permission without calling_sid."))?,
@@ -125,14 +127,20 @@ pub fn is_device_id_attestation_tag(tag: Tag) -> bool {
 /// identifiers. It throws an error if the permissions cannot be verified or if the caller doesn't
 /// have the right permissions. Otherwise it returns silently.
 pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
-    check_android_permission("android.permission.READ_PRIVILEGED_PHONE_STATE")
+    check_android_permission(
+        "android.permission.READ_PRIVILEGED_PHONE_STATE",
+        Error::Km(ErrorCode::CANNOT_ATTEST_IDS),
+    )
 }
 
 /// This function checks whether the calling app has the Android permissions needed to attest the
 /// device-unique identifier. It throws an error if the permissions cannot be verified or if the
 /// caller doesn't have the right permissions. Otherwise it returns silently.
 pub fn check_unique_id_attestation_permissions() -> anyhow::Result<()> {
-    check_android_permission("android.permission.REQUEST_UNIQUE_ID_ATTESTATION")
+    check_android_permission(
+        "android.permission.REQUEST_UNIQUE_ID_ATTESTATION",
+        Error::Km(ErrorCode::CANNOT_ATTEST_IDS),
+    )
 }
 
 /// This function checks whether the calling app has the Android permissions needed to manage
@@ -141,10 +149,19 @@ pub fn check_unique_id_attestation_permissions() -> anyhow::Result<()> {
 /// It throws an error if the permissions cannot be verified or if the caller doesn't
 /// have the right permissions. Otherwise it returns silently.
 pub fn check_get_app_uids_affected_by_sid_permissions() -> anyhow::Result<()> {
-    check_android_permission("android.permission.MANAGE_USERS")
+    check_android_permission(
+        "android.permission.MANAGE_USERS",
+        Error::Km(ErrorCode::CANNOT_ATTEST_IDS),
+    )
 }
 
-fn check_android_permission(permission: &str) -> anyhow::Result<()> {
+/// This function checks whether the calling app has the Android permission needed to dump
+/// Keystore state to logcat.
+pub fn check_dump_permission() -> anyhow::Result<()> {
+    check_android_permission("android.permission.DUMP", Error::Rc(ResponseCode::PERMISSION_DENIED))
+}
+
+fn check_android_permission(permission: &str, err: Error) -> anyhow::Result<()> {
     let permission_controller: Strong<dyn IPermissionController::IPermissionController> =
         binder::get_interface("permission")?;
 
@@ -160,8 +177,7 @@ fn check_android_permission(permission: &str) -> anyhow::Result<()> {
         map_binder_status(binder_result).context(ks_err!("checkPermission failed"))?;
     match has_permissions {
         true => Ok(()),
-        false => Err(Error::Km(ErrorCode::CANNOT_ATTEST_IDS))
-            .context(ks_err!("caller does not have the permission to attest device IDs")),
+        false => Err(err).context(ks_err!("caller does not have the '{permission}' permission")),
     }
 }
 
@@ -522,43 +538,47 @@ fn merge_and_filter_key_entry_lists(
     result
 }
 
-fn estimate_safe_amount_to_return(
+pub(crate) fn estimate_safe_amount_to_return(
     domain: Domain,
     namespace: i64,
+    start_past_alias: Option<&str>,
     key_descriptors: &[KeyDescriptor],
     response_size_limit: usize,
 ) -> usize {
-    let mut items_to_return = 0;
-    let mut returned_bytes: usize = 0;
+    let mut count = 0;
+    let mut bytes: usize = 0;
     // Estimate the transaction size to avoid returning more items than what
     // could fit in a binder transaction.
     for kd in key_descriptors.iter() {
         // 4 bytes for the Domain enum
         // 8 bytes for the Namespace long.
-        returned_bytes += 4 + 8;
+        bytes += 4 + 8;
         // Size of the alias string. Includes 4 bytes for length encoding.
         if let Some(alias) = &kd.alias {
-            returned_bytes += 4 + alias.len();
+            bytes += 4 + alias.len();
         }
         // Size of the blob. Includes 4 bytes for length encoding.
         if let Some(blob) = &kd.blob {
-            returned_bytes += 4 + blob.len();
+            bytes += 4 + blob.len();
         }
         // The binder transaction size limit is 1M. Empirical measurements show
         // that the binder overhead is 60% (to be confirmed). So break after
         // 350KB and return a partial list.
-        if returned_bytes > response_size_limit {
+        if bytes > response_size_limit {
             log::warn!(
-                "{domain:?}:{namespace}: Key descriptors list ({} items) may exceed binder \
-                       size, returning {items_to_return} items est {returned_bytes} bytes.",
+                "{domain:?}:{namespace}: Key descriptors list ({} items after {start_past_alias:?}) \
+                 may exceed binder size, returning {count} items est. {bytes} bytes",
                 key_descriptors.len(),
             );
             break;
         }
-        items_to_return += 1;
+        count += 1;
     }
-    items_to_return
+    count
 }
+
+/// Estimate for maximum size of a Binder response in bytes.
+pub(crate) const RESPONSE_SIZE_LIMIT: usize = 358400;
 
 /// List all key aliases for a given domain + namespace. whose alias is greater
 /// than start_past_alias (if provided).
@@ -583,9 +603,13 @@ pub fn list_key_entries(
         start_past_alias,
     );
 
-    const RESPONSE_SIZE_LIMIT: usize = 358400;
-    let safe_amount_to_return =
-        estimate_safe_amount_to_return(domain, namespace, &merged_key_entries, RESPONSE_SIZE_LIMIT);
+    let safe_amount_to_return = estimate_safe_amount_to_return(
+        domain,
+        namespace,
+        start_past_alias,
+        &merged_key_entries,
+        RESPONSE_SIZE_LIMIT,
+    );
     Ok(merged_key_entries[..safe_amount_to_return].to_vec())
 }
 
