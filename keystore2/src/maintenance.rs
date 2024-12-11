@@ -19,7 +19,7 @@ use crate::error::into_logged_binder;
 use crate::error::map_km_error;
 use crate::error::Error;
 use crate::globals::get_keymint_device;
-use crate::globals::{DB, LEGACY_IMPORTER, SUPER_KEY, ENCODED_MODULE_INFO};
+use crate::globals::{DB, ENCODED_MODULE_INFO, LEGACY_IMPORTER, SUPER_KEY};
 use crate::ks_err;
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::super_key::SuperKeyManager;
@@ -325,6 +325,19 @@ impl Maintenance {
             writeln!(f, "  Timestamp token required: {}", hw_info.timestampTokenRequired)?;
         }
         writeln!(f)?;
+
+        // Display module attestation information
+        {
+            let info = ENCODED_MODULE_INFO.read().unwrap();
+            if let Some(info) = info.as_ref() {
+                writeln!(f, "Attested module information (DER-encoded):")?;
+                writeln!(f, "  {}", hex::encode(info))?;
+                writeln!(f)?;
+            } else {
+                writeln!(f, "Attested module information not set")?;
+                writeln!(f)?;
+            }
+        }
 
         // Display database size information.
         match crate::metrics_store::pull_storage_stats() {

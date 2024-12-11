@@ -52,6 +52,7 @@ rust_defaults {
         "libbinder_rs",
         "libbssl_crypto",
         "libder",
+        "libhex",
         "libkeystore2_aaid-rust",
         "libkeystore2_apc_compat-rust",
         "libkeystore2_crypto_rust",
@@ -111,7 +112,6 @@ rust_test {
     defaults: ["libkeystore2_defaults"],
     rustlibs: [
         "libandroid_logger",
-        "libhex",
         "libkeystore2_test_utils",
         "libkeystore2_with_test_utils",
         "liblibsqlite3_sys",
