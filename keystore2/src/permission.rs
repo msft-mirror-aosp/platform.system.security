@@ -26,11 +26,11 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use anyhow::Context as AnyhowContext;
 use keystore2_selinux as selinux;
-use lazy_static::lazy_static;
 use selinux::{implement_class, Backend, ClassPermission};
 use std::cmp::PartialEq;
 use std::convert::From;
 use std::ffi::CStr;
+use std::sync::LazyLock;
 
 // Replace getcon with a mock in the test situation
 #[cfg(not(test))]
@@ -41,12 +41,10 @@ use tests::test_getcon as getcon;
 #[cfg(test)]
 mod tests;
 
-lazy_static! {
-    // Panicking here is allowed because keystore cannot function without this backend
-    // and it would happen early and indicate a gross misconfiguration of the device.
-    static ref KEYSTORE2_KEY_LABEL_BACKEND: selinux::KeystoreKeyBackend =
-            selinux::KeystoreKeyBackend::new().unwrap();
-}
+// Panicking here is allowed because keystore cannot function without this backend
+// and it would happen early and indicate a gross misconfiguration of the device.
+static KEYSTORE2_KEY_LABEL_BACKEND: LazyLock<selinux::KeystoreKeyBackend> =
+    LazyLock::new(|| selinux::KeystoreKeyBackend::new().unwrap());
 
 fn lookup_keystore2_key_context(namespace: i64) -> anyhow::Result<selinux::Context> {
     KEYSTORE2_KEY_LABEL_BACKEND.lookup(&namespace.to_string())
@@ -284,12 +282,19 @@ pub fn check_keystore_permission(caller_ctx: &CStr, perm: KeystorePerm) -> anyho
 ///                      SELinux keystore key backend, and the result is used
 ///                      as target context.
 pub fn check_grant_permission(
+    caller_uid: u32,
     caller_ctx: &CStr,
     access_vec: KeyPermSet,
     key: &KeyDescriptor,
 ) -> anyhow::Result<()> {
     let target_context = match key.domain {
-        Domain::APP => getcon().context("check_grant_permission: getcon failed.")?,
+        Domain::APP => {
+            if caller_uid as i64 != key.nspace {
+                return Err(selinux::Error::perm())
+                    .context("Trying to access key without ownership.");
+            }
+            getcon().context("check_grant_permission: getcon failed.")?
+        }
         Domain::SELINUX => lookup_keystore2_key_context(key.nspace)
             .context("check_grant_permission: Domain::SELINUX: Failed to lookup namespace.")?,
         _ => return Err(KsError::sys()).context(format!("Cannot grant {:?}.", key.domain)),

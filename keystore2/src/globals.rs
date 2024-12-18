@@ -46,8 +46,7 @@ use android_security_compat::aidl::android::security::compat::IKeystoreCompatSer
 use anyhow::{Context, Result};
 use binder::FromIBinder;
 use binder::{get_declared_instances, is_declared};
-use lazy_static::lazy_static;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::{cell::RefCell, sync::Once};
 use std::{collections::HashMap, path::Path, path::PathBuf};
 
@@ -139,32 +138,38 @@ impl<T: FromIBinder + ?Sized> Default for DevicesMap<T> {
     }
 }
 
-lazy_static! {
-    /// The path where keystore stores all its keys.
-    pub static ref DB_PATH: RwLock<PathBuf> = RwLock::new(
-        Path::new("/data/misc/keystore").to_path_buf());
-    /// Runtime database of unwrapped super keys.
-    pub static ref SUPER_KEY: Arc<RwLock<SuperKeyManager>> = Default::default();
-    /// Map of KeyMint devices.
-    static ref KEY_MINT_DEVICES: Mutex<DevicesMap<dyn IKeyMintDevice>> = Default::default();
-    /// Timestamp service.
-    static ref TIME_STAMP_DEVICE: Mutex<Option<Strong<dyn ISecureClock>>> = Default::default();
-    /// A single on-demand worker thread that handles deferred tasks with two different
-    /// priorities.
-    pub static ref ASYNC_TASK: Arc<AsyncTask> = Default::default();
-    /// Singleton for enforcements.
-    pub static ref ENFORCEMENTS: Enforcements = Default::default();
-    /// LegacyBlobLoader is initialized and exists globally.
-    /// The same directory used by the database is used by the LegacyBlobLoader as well.
-    pub static ref LEGACY_BLOB_LOADER: Arc<LegacyBlobLoader> = Arc::new(LegacyBlobLoader::new(
-        &DB_PATH.read().expect("Could not determine database path for legacy blob loader")));
-    /// Legacy migrator. Atomically migrates legacy blobs to the database.
-    pub static ref LEGACY_IMPORTER: Arc<LegacyImporter> =
-        Arc::new(LegacyImporter::new(Arc::new(Default::default())));
-    /// Background thread which handles logging via statsd and logd
-    pub static ref LOGS_HANDLER: Arc<AsyncTask> = Default::default();
+/// The path where keystore stores all its keys.
+pub static DB_PATH: LazyLock<RwLock<PathBuf>> =
+    LazyLock::new(|| RwLock::new(Path::new("/data/misc/keystore").to_path_buf()));
+/// Runtime database of unwrapped super keys.
+pub static SUPER_KEY: LazyLock<Arc<RwLock<SuperKeyManager>>> = LazyLock::new(Default::default);
+/// Map of KeyMint devices.
+static KEY_MINT_DEVICES: LazyLock<Mutex<DevicesMap<dyn IKeyMintDevice>>> =
+    LazyLock::new(Default::default);
+/// Timestamp service.
+static TIME_STAMP_DEVICE: Mutex<Option<Strong<dyn ISecureClock>>> = Mutex::new(None);
+/// A single on-demand worker thread that handles deferred tasks with two different
+/// priorities.
+pub static ASYNC_TASK: LazyLock<Arc<AsyncTask>> = LazyLock::new(Default::default);
+/// Singleton for enforcements.
+pub static ENFORCEMENTS: LazyLock<Enforcements> = LazyLock::new(Default::default);
+/// LegacyBlobLoader is initialized and exists globally.
+/// The same directory used by the database is used by the LegacyBlobLoader as well.
+pub static LEGACY_BLOB_LOADER: LazyLock<Arc<LegacyBlobLoader>> = LazyLock::new(|| {
+    Arc::new(LegacyBlobLoader::new(
+        &DB_PATH.read().expect("Could not determine database path for legacy blob loader"),
+    ))
+});
+/// Legacy migrator. Atomically migrates legacy blobs to the database.
+pub static LEGACY_IMPORTER: LazyLock<Arc<LegacyImporter>> =
+    LazyLock::new(|| Arc::new(LegacyImporter::new(Arc::new(Default::default()))));
+/// Background thread which handles logging via statsd and logd
+pub static LOGS_HANDLER: LazyLock<Arc<AsyncTask>> = LazyLock::new(Default::default);
+/// DER-encoded module information returned by `getSupplementaryAttestationInfo(Tag.MODULE_HASH)`.
+pub static ENCODED_MODULE_INFO: RwLock<Option<Vec<u8>>> = RwLock::new(None);
 
-    static ref GC: Arc<Gc> = Arc::new(Gc::new_init_with(ASYNC_TASK.clone(), || {
+static GC: LazyLock<Arc<Gc>> = LazyLock::new(|| {
+    Arc::new(Gc::new_init_with(ASYNC_TASK.clone(), || {
         (
             Box::new(|uuid, blob| {
                 let km_dev = get_keymint_dev_by_uuid(uuid).map(|(dev, _)| dev)?;
@@ -172,12 +177,15 @@ lazy_static! {
                 map_km_error(km_dev.deleteKey(blob))
                     .context(ks_err!("Trying to invalidate key blob."))
             }),
-            KeystoreDB::new(&DB_PATH.read().expect("Could not determine database path for GC"), None)
-                .expect("Failed to open database"),
+            KeystoreDB::new(
+                &DB_PATH.read().expect("Could not determine database path for GC"),
+                None,
+            )
+            .expect("Failed to open database"),
             SUPER_KEY.clone(),
         )
-    }));
-}
+    }))
+});
 
 /// Determine the service name for a KeyMint device of the given security level
 /// gotten by binder service from the device and determining what services
@@ -265,17 +273,8 @@ fn connect_keymint(
     // If the KeyMint device is back-level, use a wrapper that intercepts and
     // emulates things that are not supported by the hardware.
     let keymint = match hal_version {
-        Some(300) => {
-            // Current KeyMint version: use as-is as v3 Keymint is current version
-            log::info!(
-                "KeyMint device is current version ({:?}) for security level: {:?}",
-                hal_version,
-                security_level
-            );
-            keymint
-        }
-        Some(200) => {
-            // Previous KeyMint version: use as-is as we don't have any software emulation of v3-specific KeyMint features.
+        Some(400) | Some(300) | Some(200) => {
+            // KeyMint v2+: use as-is (we don't have any software emulation of v3 or v4-specific KeyMint features).
             log::info!(
                 "KeyMint device is current version ({:?}) for security level: {:?}",
                 hal_version,
