@@ -211,7 +211,7 @@ fn keystore2_get_key_entry_blob_fail() {
     assert_eq!(Error::Rc(ResponseCode::INVALID_ARGUMENT), result.unwrap_err());
 
     // Delete the generated key blob.
-    sl.binder.deleteKey(&key_metadata.key).unwrap();
+    sl.delete_key(&key_metadata.key).unwrap();
 }
 
 /// Try to generate a key with invalid Domain. `INVALID_ARGUMENT` error response is expected.
@@ -425,7 +425,9 @@ fn keystore2_key_owner_validation() {
     // Client#1: Generate a key and create an operation using generated key.
     // Wait until the parent notifies to continue. Once the parent notifies, this operation
     // is expected to be completed successfully.
-    // SAFETY: The test is run in a separate process with no other threads.
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut child_handle = unsafe {
         execute_op_run_as_child(
             TARGET_CTX,
@@ -446,20 +448,23 @@ fn keystore2_key_owner_validation() {
     const APPLICATION_ID_2: u32 = 10602;
     let uid2 = USER_ID * AID_USER_OFFSET + APPLICATION_ID_2;
     let gid2 = USER_ID * AID_USER_OFFSET + APPLICATION_ID_2;
-    // SAFETY: The test is run in a separate process with no other threads.
+
+    let get_key_fn = move || {
+        let keystore2_inst = get_keystore_service();
+        let result = key_generations::map_ks_error(keystore2_inst.getKeyEntry(&KeyDescriptor {
+            domain: Domain::APP,
+            nspace: -1,
+            alias: Some(alias.to_string()),
+            blob: None,
+        }));
+        assert!(result.is_err());
+        assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
-        run_as::run_as(TARGET_CTX, Uid::from_raw(uid2), Gid::from_raw(gid2), move || {
-            let keystore2_inst = get_keystore_service();
-            let result =
-                key_generations::map_ks_error(keystore2_inst.getKeyEntry(&KeyDescriptor {
-                    domain: Domain::APP,
-                    nspace: -1,
-                    alias: Some(alias.to_string()),
-                    blob: None,
-                }));
-            assert!(result.is_err());
-            assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
-        });
+        run_as::run_as_app(uid2, gid2, get_key_fn);
     };
 
     // Notify the child process (client#1) to resume and finish.
@@ -509,5 +514,5 @@ fn keystore2_generate_key_with_blob_domain() {
     );
 
     // Delete the generated key blob.
-    sl.binder.deleteKey(&key_metadata.key).unwrap();
+    sl.delete_key(&key_metadata.key).unwrap();
 }

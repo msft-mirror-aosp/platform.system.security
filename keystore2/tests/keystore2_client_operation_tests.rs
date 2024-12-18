@@ -28,6 +28,10 @@ use keystore2_test_utils::{
 };
 use nix::unistd::{getuid, Gid, Uid};
 use rustutils::users::AID_USER_OFFSET;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::thread::JoinHandle;
 
@@ -36,7 +40,8 @@ use std::thread::JoinHandle;
 ///
 /// # Safety
 ///
-/// Must be called from a process with no other threads.
+/// Must only be called from a single-threaded process (e.g. as enforced by `AndroidTest.xml`
+/// setting `--test-threads=1`).
 pub unsafe fn create_operations(
     target_ctx: &'static str,
     forced_op: ForcedOp,
@@ -46,7 +51,7 @@ pub unsafe fn create_operations(
     let base_gid = 99 * AID_USER_OFFSET + 10001;
     let base_uid = 99 * AID_USER_OFFSET + 10001;
     (0..max_ops)
-        // SAFETY: The caller guarantees that there are no other threads.
+        // Safety: The caller guarantees that there are no other threads.
         .map(|i| unsafe {
             execute_op_run_as_child(
                 target_ctx,
@@ -89,7 +94,8 @@ fn keystore2_backend_busy_test() {
     const MAX_OPS: i32 = 100;
     static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
-    // SAFETY: The test is run in a separate process with no other threads.
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut child_handles = unsafe { create_operations(TARGET_CTX, ForcedOp(false), MAX_OPS) };
 
     // Wait until all child procs notifies us to continue,
@@ -123,7 +129,8 @@ fn keystore2_forced_op_after_backendbusy_test() {
     static TARGET_CTX: &str = "u:r:untrusted_app:s0:c91,c256,c10,c20";
 
     // Create regular operations.
-    // SAFETY: The test is run in a separate process with no other threads.
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut child_handles = unsafe { create_operations(TARGET_CTX, ForcedOp(false), MAX_OPS) };
 
     // Wait until all child procs notifies us to continue, so that there are enough
@@ -135,28 +142,31 @@ fn keystore2_forced_op_after_backendbusy_test() {
     // Create a forced operation.
     let auid = 99 * AID_USER_OFFSET + 10604;
     let agid = 99 * AID_USER_OFFSET + 10604;
-    // SAFETY: The test is run in a separate process with no other threads.
+    let force_op_fn = move || {
+        let alias = format!("ks_prune_forced_op_key_{}", getuid());
+
+        // To make room for this forced op, system should be able to prune one of the
+        // above created regular operations and create a slot for this forced operation
+        // successfully.
+        create_signing_operation(
+            ForcedOp(true),
+            KeyPurpose::SIGN,
+            Digest::SHA_2_256,
+            Domain::SELINUX,
+            100,
+            Some(alias),
+        )
+        .expect("Client failed to create forced operation after BACKEND_BUSY state.");
+    };
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
         run_as::run_as(
             key_generations::TARGET_VOLD_CTX,
             Uid::from_raw(auid),
             Gid::from_raw(agid),
-            move || {
-                let alias = format!("ks_prune_forced_op_key_{}", getuid());
-
-                // To make room for this forced op, system should be able to prune one of the
-                // above created regular operations and create a slot for this forced operation
-                // successfully.
-                create_signing_operation(
-                    ForcedOp(true),
-                    KeyPurpose::SIGN,
-                    Digest::SHA_2_256,
-                    Domain::SELINUX,
-                    100,
-                    Some(alias),
-                )
-                .expect("Client failed to create forced operation after BACKEND_BUSY state.");
-            },
+            force_op_fn,
         );
     };
 
@@ -208,7 +218,9 @@ fn keystore2_max_forced_ops_test() {
     // Create initial forced operation in a child process
     // and wait for the parent to notify to perform operation.
     let alias = format!("ks_forced_op_key_{}", getuid());
-    // SAFETY: The test is run in a separate process with no other threads.
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut first_op_handle = unsafe {
         execute_op_run_as_child(
             key_generations::TARGET_SU_CTX,
@@ -227,7 +239,8 @@ fn keystore2_max_forced_ops_test() {
 
     // Create MAX_OPS number of forced operations.
     let mut child_handles =
-    // SAFETY: The test is run in a separate process with no other threads.
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
         unsafe { create_operations(key_generations::TARGET_SU_CTX, ForcedOp(true), MAX_OPS) };
 
     // Wait until all child procs notifies us to continue, so that  there are enough operations
@@ -291,7 +304,9 @@ fn keystore2_ops_prune_test() {
     // Create an operation in an untrusted_app context. Wait until the parent notifies to continue.
     // Once the parent notifies, this operation is expected to be completed successfully.
     let alias = format!("ks_reg_op_key_{}", getuid());
-    // SAFETY: The test is run in a separate process with no other threads.
+
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     let mut child_handle = unsafe {
         execute_op_run_as_child(
             TARGET_CTX,
@@ -389,21 +404,24 @@ fn keystore2_forced_op_perm_denied_test() {
     let gid = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
 
     for context in TARGET_CTXS.iter() {
-        // SAFETY: The test is run in a separate process with no other threads.
+        let forced_op_fn = move || {
+            let alias = format!("ks_app_forced_op_test_key_{}", getuid());
+            let result = key_generations::map_ks_error(create_signing_operation(
+                ForcedOp(true),
+                KeyPurpose::SIGN,
+                Digest::SHA_2_256,
+                Domain::APP,
+                -1,
+                Some(alias),
+            ));
+            assert!(result.is_err());
+            assert_eq!(Error::Rc(ResponseCode::PERMISSION_DENIED), result.unwrap_err());
+        };
+
+        // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+        // `--test-threads=1`), and nothing yet done with binder.
         unsafe {
-            run_as::run_as(context, Uid::from_raw(uid), Gid::from_raw(gid), move || {
-                let alias = format!("ks_app_forced_op_test_key_{}", getuid());
-                let result = key_generations::map_ks_error(create_signing_operation(
-                    ForcedOp(true),
-                    KeyPurpose::SIGN,
-                    Digest::SHA_2_256,
-                    Domain::APP,
-                    -1,
-                    Some(alias),
-                ));
-                assert!(result.is_err());
-                assert_eq!(Error::Rc(ResponseCode::PERMISSION_DENIED), result.unwrap_err());
-            });
+            run_as::run_as(context, Uid::from_raw(uid), Gid::from_raw(gid), forced_op_fn);
         }
     }
 }
@@ -412,27 +430,29 @@ fn keystore2_forced_op_perm_denied_test() {
 /// Should be able to create forced operation with `vold` context successfully.
 #[test]
 fn keystore2_forced_op_success_test() {
-    static TARGET_CTX: &str = "u:r:vold:s0";
+    static TARGET_VOLD_CTX: &str = "u:r:vold:s0";
     const USER_ID: u32 = 99;
     const APPLICATION_ID: u32 = 10601;
 
     let uid = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
     let gid = USER_ID * AID_USER_OFFSET + APPLICATION_ID;
+    let forced_op_fn = move || {
+        let alias = format!("ks_vold_forced_op_key_{}", getuid());
+        create_signing_operation(
+            ForcedOp(true),
+            KeyPurpose::SIGN,
+            Digest::SHA_2_256,
+            Domain::SELINUX,
+            key_generations::SELINUX_VOLD_NAMESPACE,
+            Some(alias),
+        )
+        .expect("Client with vold context failed to create forced operation.");
+    };
 
-    // SAFETY: The test is run in a separate process with no other threads.
+    // Safety: only one thread at this point (enforced by `AndroidTest.xml` setting
+    // `--test-threads=1`), and nothing yet done with binder.
     unsafe {
-        run_as::run_as(TARGET_CTX, Uid::from_raw(uid), Gid::from_raw(gid), move || {
-            let alias = format!("ks_vold_forced_op_key_{}", getuid());
-            create_signing_operation(
-                ForcedOp(true),
-                KeyPurpose::SIGN,
-                Digest::SHA_2_256,
-                Domain::SELINUX,
-                key_generations::SELINUX_VOLD_NAMESPACE,
-                Some(alias),
-            )
-            .expect("Client with vold context failed to create forced operation.");
-        });
+        run_as::run_as(TARGET_VOLD_CTX, Uid::from_raw(uid), Gid::from_raw(gid), forced_op_fn);
     }
 }
 
@@ -460,4 +480,121 @@ fn keystore2_op_fails_operation_busy() {
     let result2 = th_handle_2.join().unwrap();
 
     assert!(result1 || result2);
+}
+
+/// Create an operation and use it for performing sign operation. After completing the operation
+/// try to abort the operation. Test should fail to abort already finalized operation with error
+/// code `INVALID_OPERATION_HANDLE`.
+#[test]
+fn keystore2_abort_finalized_op_fail_test() {
+    let op_response = create_signing_operation(
+        ForcedOp(false),
+        KeyPurpose::SIGN,
+        Digest::SHA_2_256,
+        Domain::APP,
+        -1,
+        Some("ks_op_abort_fail_test_key".to_string()),
+    )
+    .unwrap();
+
+    let op: binder::Strong<dyn IKeystoreOperation> = op_response.iOperation.unwrap();
+    perform_sample_sign_operation(&op).unwrap();
+    let result = key_generations::map_ks_error(op.abort());
+    assert!(result.is_err());
+    assert_eq!(Error::Km(ErrorCode::INVALID_OPERATION_HANDLE), result.unwrap_err());
+}
+
+/// Create an operation and use it for performing sign operation. Before finishing the operation
+/// try to abort the operation. Test should successfully abort the operation. After aborting try to
+/// use the operation handle, test should fail to use already aborted operation handle with error
+/// code `INVALID_OPERATION_HANDLE`.
+#[test]
+fn keystore2_op_abort_success_test() {
+    let op_response = create_signing_operation(
+        ForcedOp(false),
+        KeyPurpose::SIGN,
+        Digest::SHA_2_256,
+        Domain::APP,
+        -1,
+        Some("ks_op_abort_success_key".to_string()),
+    )
+    .unwrap();
+
+    let op: binder::Strong<dyn IKeystoreOperation> = op_response.iOperation.unwrap();
+    op.update(b"my message").unwrap();
+    let result = key_generations::map_ks_error(op.abort());
+    assert!(result.is_ok());
+
+    // Try to use the op handle after abort.
+    let result = key_generations::map_ks_error(op.finish(None, None));
+    assert!(result.is_err());
+    assert_eq!(Error::Km(ErrorCode::INVALID_OPERATION_HANDLE), result.unwrap_err());
+}
+
+/// Executes an operation in a thread. Performs an `update` operation repeatedly till the user
+/// interrupts it or encounters any error other than `OPERATION_BUSY`.
+/// Return `false` in case of any error other than `OPERATION_BUSY`, otherwise it returns true.
+fn perform_abort_op_busy_in_thread(
+    op: binder::Strong<dyn IKeystoreOperation>,
+    should_exit_clone: Arc<AtomicBool>,
+) -> JoinHandle<bool> {
+    thread::spawn(move || {
+        loop {
+            if should_exit_clone.load(Ordering::Relaxed) {
+                // Caller requested to exit the thread.
+                return true;
+            }
+
+            match key_generations::map_ks_error(op.update(b"my message")) {
+                Ok(_) => continue,
+                Err(Error::Rc(ResponseCode::OPERATION_BUSY)) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+}
+
+/// Create an operation and try to use same operation handle in multiple threads to perform
+/// operations. Test tries to abort the operation and expects `abort` call to fail with the error
+/// response `OPERATION_BUSY` as multiple threads try to access the same operation handle
+/// simultaneously. Test tries to simulate `OPERATION_BUSY` error response from `abort` api.
+#[test]
+fn keystore2_op_abort_fails_with_operation_busy_error_test() {
+    loop {
+        let op_response = create_signing_operation(
+            ForcedOp(false),
+            KeyPurpose::SIGN,
+            Digest::SHA_2_256,
+            Domain::APP,
+            -1,
+            Some("op_abort_busy_alias_test_key".to_string()),
+        )
+        .unwrap();
+        let op: binder::Strong<dyn IKeystoreOperation> = op_response.iOperation.unwrap();
+
+        let should_exit = Arc::new(AtomicBool::new(false));
+
+        let update_t_handle1 = perform_abort_op_busy_in_thread(op.clone(), should_exit.clone());
+        let update_t_handle2 = perform_abort_op_busy_in_thread(op.clone(), should_exit.clone());
+
+        // Attempt to abort the operation and anticipate an 'OPERATION_BUSY' error, as multiple
+        // threads are concurrently accessing the same operation handle.
+        let result = match op.abort() {
+            Ok(_) => 0, // Operation successfully aborted.
+            Err(e) => e.service_specific_error(),
+        };
+
+        // Notify threads to stop performing `update` operation.
+        should_exit.store(true, Ordering::Relaxed);
+
+        let _update_op_result = update_t_handle1.join().unwrap();
+        let _update_op_result2 = update_t_handle2.join().unwrap();
+
+        if result == ResponseCode::OPERATION_BUSY.0 {
+            // The abort call failed with an OPERATION_BUSY error, as anticipated, due to multiple
+            // threads competing for access to the same operation handle.
+            return;
+        }
+        assert_eq!(result, 0);
+    }
 }
