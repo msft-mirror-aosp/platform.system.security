@@ -19,16 +19,19 @@ use crate::error::into_logged_binder;
 use crate::error::map_km_error;
 use crate::error::Error;
 use crate::globals::get_keymint_device;
-use crate::globals::{DB, LEGACY_IMPORTER, SUPER_KEY};
+use crate::globals::{DB, ENCODED_MODULE_INFO, LEGACY_IMPORTER, SUPER_KEY};
 use crate::ks_err;
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::super_key::SuperKeyManager;
 use crate::utils::{
-    check_get_app_uids_affected_by_sid_permissions, check_key_permission,
+    check_dump_permission, check_get_app_uids_affected_by_sid_permissions, check_key_permission,
     check_keystore_permission, uid_to_android_user, watchdog as wd,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    ErrorCode::ErrorCode, IKeyMintDevice::IKeyMintDevice, SecurityLevel::SecurityLevel,
+    ErrorCode::ErrorCode, IKeyMintDevice::IKeyMintDevice, KeyParameter::KeyParameter, KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
+};
+use apex_aidl_interface::aidl::android::apex::{
+    IApexService::IApexService,
 };
 use android_security_maintenance::aidl::android::security::maintenance::IKeystoreMaintenance::{
     BnKeystoreMaintenance, IKeystoreMaintenance,
@@ -36,13 +39,46 @@ use android_security_maintenance::aidl::android::security::maintenance::IKeystor
 use android_security_maintenance::binder::{
     BinderFeatures, Interface, Result as BinderResult, Strong, ThreadState,
 };
+use android_security_metrics::aidl::android::security::metrics::{
+    KeystoreAtomPayload::KeystoreAtomPayload::StorageStats
+};
 use android_system_keystore2::aidl::android::system::keystore2::KeyDescriptor::KeyDescriptor;
 use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use binder::wait_for_interface;
+use bssl_crypto::digest;
+use der::{DerOrd, Encode, asn1::OctetString, asn1::SetOfVec, Sequence};
 use keystore2_crypto::Password;
+use rustutils::system_properties::PropertyWatcher;
+use std::cmp::Ordering;
 
 /// Reexport Domain for the benefit of DeleteListener
 pub use android_system_keystore2::aidl::android::system::keystore2::Domain::Domain;
+
+#[cfg(test)]
+mod tests;
+
+/// Version number of KeyMint V4.
+pub const KEYMINT_V4: i32 = 400;
+
+/// Module information structure for DER-encoding.
+#[derive(Sequence, Debug, PartialEq, Eq)]
+struct ModuleInfo {
+    name: OctetString,
+    version: i64,
+}
+
+impl DerOrd for ModuleInfo {
+    // DER mandates "encodings of the component values of a set-of value shall appear in ascending
+    // order". `der_cmp` serves as a proxy for determining that ordering (though why the `der` crate
+    // requires this is unclear). Essentially, we just need to compare the `name` lengths, and then
+    // if those are equal, the `name`s themselves. (No need to consider `version`s since there can't
+    // be more than one `ModuleInfo` with the same `name` in the set-of `ModuleInfo`s.) We rely on
+    // `OctetString`'s `der_cmp` to do the aforementioned comparison.
+    fn der_cmp(&self, other: &Self) -> std::result::Result<Ordering, der::Error> {
+        self.name.der_cmp(&other.name)
+    }
+}
 
 /// The Maintenance module takes a delete listener argument which observes user and namespace
 /// deletion events.
@@ -136,19 +172,35 @@ impl Maintenance {
             .context(ks_err!("While invoking the delete listener."))
     }
 
-    fn call_with_watchdog<F>(sec_level: SecurityLevel, name: &'static str, op: &F) -> Result<()>
+    fn call_with_watchdog<F>(
+        sec_level: SecurityLevel,
+        name: &'static str,
+        op: &F,
+        min_version: Option<i32>,
+    ) -> Result<()>
     where
         F: Fn(Strong<dyn IKeyMintDevice>) -> binder::Result<()>,
     {
-        let (km_dev, _, _) =
+        let (km_dev, hw_info, _) =
             get_keymint_device(&sec_level).context(ks_err!("getting keymint device"))?;
+
+        if let Some(min_version) = min_version {
+            if hw_info.versionNumber < min_version {
+                log::info!("skipping {name} for {sec_level:?} since its keymint version {} is less than the minimum required version {min_version}", hw_info.versionNumber);
+                return Ok(());
+            }
+        }
 
         let _wp = wd::watch_millis_with("Maintenance::call_with_watchdog", 500, (sec_level, name));
         map_km_error(op(km_dev)).with_context(|| ks_err!("calling {}", name))?;
         Ok(())
     }
 
-    fn call_on_all_security_levels<F>(name: &'static str, op: F) -> Result<()>
+    fn call_on_all_security_levels<F>(
+        name: &'static str,
+        op: F,
+        min_version: Option<i32>,
+    ) -> Result<()>
     where
         F: Fn(Strong<dyn IKeyMintDevice>) -> binder::Result<()>,
     {
@@ -157,7 +209,7 @@ impl Maintenance {
             (SecurityLevel::STRONGBOX, "STRONGBOX"),
         ];
         sec_levels.iter().try_fold((), |_result, (sec_level, sec_level_string)| {
-            let curr_result = Maintenance::call_with_watchdog(*sec_level, name, &op);
+            let curr_result = Maintenance::call_with_watchdog(*sec_level, name, &op, min_version);
             match curr_result {
                 Ok(()) => log::info!(
                     "Call to {} succeeded for security level {}.",
@@ -194,7 +246,67 @@ impl Maintenance {
         {
             log::error!("SUPER_KEY.set_up_boot_level_cache failed:\n{:?}\n:(", e);
         }
-        Maintenance::call_on_all_security_levels("earlyBootEnded", |dev| dev.earlyBootEnded())
+
+        if keystore2_flags::attest_modules() {
+            std::thread::spawn(move || {
+                Self::watch_apex_info()
+                    .unwrap_or_else(|e| log::error!("watch_apex_info failed: {e:?}"));
+            });
+        }
+        Maintenance::call_on_all_security_levels("earlyBootEnded", |dev| dev.earlyBootEnded(), None)
+    }
+
+    /// Watch the `apexd.status` system property, and read apex module information once
+    /// it is `activated`.
+    ///
+    /// Blocks waiting for system property changes, so must be run in its own thread.
+    fn watch_apex_info() -> Result<()> {
+        let prop = "apexd.status";
+        log::info!("start monitoring '{prop}' property");
+        let mut w = PropertyWatcher::new(prop).context(ks_err!("PropertyWatcher::new failed"))?;
+        loop {
+            let value = w.read(|_name, value| Ok(value.to_string()));
+            // The status for apexd moves from "starting" to "activated" to "ready"; the apex
+            // info file should be populated for either of the latter two states, so cope with
+            // both in case we miss a state change.
+            log::info!("property '{prop}' is now '{value:?}'");
+            if matches!(value.as_deref(), Ok("activated") | Ok("ready")) {
+                match Self::read_apex_info() {
+                    Ok(modules) => {
+                        Self::set_module_info(modules)
+                            .context(ks_err!("failed to set module info"))?;
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "failed to read apex info, try again on next state change: {e:?}"
+                        );
+                    }
+                }
+            }
+
+            log::info!("await a change to '{prop}'...");
+            w.wait(None).context(ks_err!("property wait failed"))?;
+            log::info!("await a change to '{prop}'...notified");
+        }
+        Ok(())
+    }
+
+    fn read_apex_info() -> Result<Vec<ModuleInfo>> {
+        let _wp = wd::watch("read_apex_info via IApexService.getActivePackages()");
+        let apexd: Strong<dyn IApexService> =
+            wait_for_interface("apexservice").context("failed to AIDL connect to apexd")?;
+        let packages = apexd.getActivePackages().context("failed to retrieve active packages")?;
+        packages
+            .into_iter()
+            .map(|pkg| {
+                log::info!("apex modules += {} version {}", pkg.moduleName, pkg.versionCode);
+                let name = OctetString::new(pkg.moduleName.as_bytes()).map_err(|e| {
+                    anyhow!("failed to convert '{}' to OCTET_STRING: {e:?}", pkg.moduleName)
+                })?;
+                Ok(ModuleInfo { name, version: pkg.versionCode })
+            })
+            .collect()
     }
 
     fn migrate_key_namespace(source: &KeyDescriptor, destination: &KeyDescriptor) -> Result<()> {
@@ -250,7 +362,7 @@ impl Maintenance {
             .context(ks_err!("Checking permission"))?;
         log::info!("In delete_all_keys.");
 
-        Maintenance::call_on_all_security_levels("deleteAllKeys", |dev| dev.deleteAllKeys())
+        Maintenance::call_on_all_security_levels("deleteAllKeys", |dev| dev.deleteAllKeys(), None)
     }
 
     fn get_app_uids_affected_by_sid(
@@ -264,9 +376,162 @@ impl Maintenance {
         DB.with(|db| db.borrow_mut().get_app_uids_affected_by_sid(user_id, secure_user_id))
             .context(ks_err!("Failed to get app UIDs affected by SID"))
     }
+
+    fn dump_state(&self, f: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(f, "keystore2 running")?;
+        writeln!(f)?;
+
+        // Display underlying device information
+        for sec_level in &[SecurityLevel::TRUSTED_ENVIRONMENT, SecurityLevel::STRONGBOX] {
+            let Ok((_dev, hw_info, uuid)) = get_keymint_device(sec_level) else { continue };
+
+            writeln!(f, "Device info for {sec_level:?} with {uuid:?}")?;
+            writeln!(f, "  HAL version:              {}", hw_info.versionNumber)?;
+            writeln!(f, "  Implementation name:      {}", hw_info.keyMintName)?;
+            writeln!(f, "  Implementation author:    {}", hw_info.keyMintAuthorName)?;
+            writeln!(f, "  Timestamp token required: {}", hw_info.timestampTokenRequired)?;
+        }
+        writeln!(f)?;
+
+        // Display module attestation information
+        {
+            let info = ENCODED_MODULE_INFO.read().unwrap();
+            if let Some(info) = info.as_ref() {
+                writeln!(f, "Attested module information (DER-encoded):")?;
+                writeln!(f, "  {}", hex::encode(info))?;
+                writeln!(f)?;
+            } else {
+                writeln!(f, "Attested module information not set")?;
+                writeln!(f)?;
+            }
+        }
+
+        // Display database size information.
+        match crate::metrics_store::pull_storage_stats() {
+            Ok(atoms) => {
+                writeln!(f, "Database size information (in bytes):")?;
+                for atom in atoms {
+                    if let StorageStats(stats) = &atom.payload {
+                        let stype = format!("{:?}", stats.storage_type);
+                        if stats.unused_size == 0 {
+                            writeln!(f, "  {:<40}: {:>12}", stype, stats.size)?;
+                        } else {
+                            writeln!(
+                                f,
+                                "  {:<40}: {:>12} (unused {})",
+                                stype, stats.size, stats.unused_size
+                            )?;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                writeln!(f, "Failed to retrieve storage stats: {e:?}")?;
+            }
+        }
+        writeln!(f)?;
+
+        // Display database config information.
+        writeln!(f, "Database configuration:")?;
+        DB.with(|db| -> std::io::Result<()> {
+            let pragma_str = |f: &mut dyn std::io::Write, name| -> std::io::Result<()> {
+                let mut db = db.borrow_mut();
+                let value: String = db
+                    .pragma(name)
+                    .unwrap_or_else(|e| format!("unknown value for '{name}', failed: {e:?}"));
+                writeln!(f, "  {name} = {value}")
+            };
+            let pragma_i32 = |f: &mut dyn std::io::Write, name| -> std::io::Result<()> {
+                let mut db = db.borrow_mut();
+                let value: i32 = db.pragma(name).unwrap_or_else(|e| {
+                    log::error!("unknown value for '{name}', failed: {e:?}");
+                    -1
+                });
+                writeln!(f, "  {name} = {value}")
+            };
+            pragma_i32(f, "auto_vacuum")?;
+            pragma_str(f, "journal_mode")?;
+            pragma_i32(f, "journal_size_limit")?;
+            pragma_i32(f, "synchronous")?;
+            pragma_i32(f, "schema_version")?;
+            pragma_i32(f, "user_version")?;
+            Ok(())
+        })?;
+        writeln!(f)?;
+
+        // Display accumulated metrics.
+        writeln!(f, "Metrics information:")?;
+        writeln!(f)?;
+        write!(f, "{:?}", *crate::metrics_store::METRICS_STORE)?;
+        writeln!(f)?;
+
+        // Reminder: any additional information added to the `dump_state()` output needs to be
+        // careful not to include confidential information (e.g. key material).
+
+        Ok(())
+    }
+
+    fn set_module_info(module_info: Vec<ModuleInfo>) -> Result<()> {
+        log::info!("set_module_info with {} modules", module_info.len());
+        let encoding = Self::encode_module_info(module_info)
+            .map_err(|e| anyhow!({ e }))
+            .context(ks_err!("Failed to encode module_info"))?;
+        let hash = digest::Sha256::hash(&encoding).to_vec();
+
+        {
+            let mut saved = ENCODED_MODULE_INFO.write().unwrap();
+            if let Some(saved_encoding) = &*saved {
+                if *saved_encoding == encoding {
+                    log::warn!(
+                        "Module info already set, ignoring repeated attempt to set same info."
+                    );
+                    return Ok(());
+                }
+                return Err(Error::Rc(ResponseCode::INVALID_ARGUMENT)).context(ks_err!(
+                    "Failed to set module info as it is already set to a different value."
+                ));
+            }
+            *saved = Some(encoding);
+        }
+
+        let kps =
+            vec![KeyParameter { tag: Tag::MODULE_HASH, value: KeyParameterValue::Blob(hash) }];
+
+        Maintenance::call_on_all_security_levels(
+            "setAdditionalAttestationInfo",
+            |dev| dev.setAdditionalAttestationInfo(&kps),
+            Some(KEYMINT_V4),
+        )
+    }
+
+    fn encode_module_info(module_info: Vec<ModuleInfo>) -> Result<Vec<u8>, der::Error> {
+        SetOfVec::<ModuleInfo>::from_iter(module_info.into_iter())?.to_der()
+    }
 }
 
-impl Interface for Maintenance {}
+impl Interface for Maintenance {
+    fn dump(
+        &self,
+        f: &mut dyn std::io::Write,
+        _args: &[&std::ffi::CStr],
+    ) -> Result<(), binder::StatusCode> {
+        if !keystore2_flags::enable_dump() {
+            log::info!("skipping dump() as flag not enabled");
+            return Ok(());
+        }
+        log::info!("dump()");
+        let _wp = wd::watch("IKeystoreMaintenance::dump");
+        check_dump_permission().map_err(|_e| {
+            log::error!("dump permission denied");
+            binder::StatusCode::PERMISSION_DENIED
+        })?;
+
+        self.dump_state(f).map_err(|e| {
+            log::error!("dump_state failed: {e:?}");
+            binder::StatusCode::UNKNOWN_ERROR
+        })
+    }
+}
 
 impl IKeystoreMaintenance for Maintenance {
     fn onUserAdded(&self, user_id: i32) -> BinderResult<()> {
