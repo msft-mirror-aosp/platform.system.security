@@ -1245,7 +1245,7 @@ impl KeystoreDB {
     /// types that map to a table, information about the table's storage is
     /// returned. Requests for storage types that are not DB tables return None.
     pub fn get_storage_stat(&mut self, storage_type: MetricsStorage) -> Result<StorageStats> {
-        let _wp = wd::watch("KeystoreDB::get_storage_stat");
+        let _wp = wd::watch_millis_with("KeystoreDB::get_storage_stat", 500, storage_type);
 
         match storage_type {
             MetricsStorage::DATABASE => self.get_total_size(),
@@ -3048,5 +3048,12 @@ impl KeystoreDB {
 
         let app_uids_vec: Vec<i64> = app_uids_affected_by_sid.into_iter().collect();
         Ok(app_uids_vec)
+    }
+
+    /// Retrieve a database PRAGMA config value.
+    pub fn pragma<T: FromSql>(&mut self, name: &str) -> Result<T> {
+        self.conn
+            .query_row(&format!("PRAGMA persistent.{name}"), (), |row| row.get(0))
+            .context(format!("failed to read pragma {name}"))
     }
 }
