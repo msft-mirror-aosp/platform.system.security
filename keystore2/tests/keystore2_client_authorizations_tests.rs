@@ -1025,6 +1025,11 @@ fn test_supplementary_attestation_info() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), Error::Rc(ResponseCode::INVALID_ARGUMENT));
 
+    if sl.get_keymint_version() < 400 {
+        // Module hash will only be populated in KeyMint if the underlying device is KeyMint V4+.
+        return;
+    }
+
     // Generate an attestation.
     let alias = "ks_module_info_test";
     let params = authorizations::AuthSetBuilder::new()
