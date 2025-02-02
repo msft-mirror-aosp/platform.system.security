@@ -19,7 +19,6 @@ use crate::keystore2_client_test_utils::{
     verify_certificate_serial_num, verify_certificate_subject_name, SAMPLE_PLAIN_TEXT,
 };
 use crate::{require_keymint, skip_test_if_no_app_attest_key_feature};
-use aconfig_android_hardware_biometrics_rust;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, BlockMode::BlockMode, Digest::Digest, EcCurve::EcCurve,
     ErrorCode::ErrorCode, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
@@ -943,25 +942,7 @@ fn add_hardware_token(auth_type: HardwareAuthenticatorType) {
 }
 
 #[test]
-fn keystore2_flagged_off_get_last_auth_password_permission_denied() {
-    if aconfig_android_hardware_biometrics_rust::last_authentication_time() {
-        return;
-    }
-
-    let keystore_auth = get_keystore_auth_service();
-
-    let result = keystore_auth.getLastAuthTime(0, &[HardwareAuthenticatorType::PASSWORD]);
-
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().service_specific_error(), ResponseCode::PERMISSION_DENIED.0);
-}
-
-#[test]
-fn keystore2_flagged_on_get_last_auth_password_success() {
-    if !aconfig_android_hardware_biometrics_rust::last_authentication_time() {
-        return;
-    }
-
+fn keystore2_get_last_auth_password_success() {
     let keystore_auth = get_keystore_auth_service();
 
     add_hardware_token(HardwareAuthenticatorType::PASSWORD);
@@ -969,11 +950,7 @@ fn keystore2_flagged_on_get_last_auth_password_success() {
 }
 
 #[test]
-fn keystore2_flagged_on_get_last_auth_fingerprint_success() {
-    if !aconfig_android_hardware_biometrics_rust::last_authentication_time() {
-        return;
-    }
-
+fn keystore2_get_last_auth_fingerprint_success() {
     let keystore_auth = get_keystore_auth_service();
 
     add_hardware_token(HardwareAuthenticatorType::FINGERPRINT);
@@ -1025,6 +1002,11 @@ fn test_supplementary_attestation_info() {
         // Module info is only populated if the flag is set.
         return;
     }
+
+    // Test should not run before MODULE_HASH supplementary info is populated.
+    assert!(rustutils::system_properties::read_bool("keystore.module_hash.sent", false)
+        .unwrap_or(false));
+
     let sl = SecLevel::tee();
 
     // Retrieve the input value that gets hashed into the attestation.
