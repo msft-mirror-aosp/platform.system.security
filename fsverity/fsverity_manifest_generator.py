@@ -54,12 +54,29 @@ if __name__ == '__main__':
       help='input file for the build manifest')
   args = p.parse_args()
 
+  links = {}
   digests = FSVerityDigests()
   for f in sorted(args.inputs):
     # f is a full path for now; make it relative so it starts with {mount_point}/
-    digest = digests.digests[os.path.relpath(f, args.base_dir)]
-    digest.digest = _digest(args.fsverity_path, f)
-    digest.hash_alg = HASH_ALGORITHM
+    rel = os.path.relpath(f, args.base_dir)
+
+    # Some fsv_meta files are links to other ones. Don't read through the link, because the
+    # layout of files in the build system may not match the layout of files on the device.
+    # Instead, read its target and use it to copy the digest from the real file after all files
+    # are processed.
+    if os.path.islink(f):
+      links[rel] = os.path.normpath(os.path.join(os.path.dirname(rel), os.readlink(f)))
+    else:
+      digest = digests.digests[rel]
+      digest.digest = _digest(args.fsverity_path, f)
+      digest.hash_alg = HASH_ALGORITHM
+
+  for link_rel, real_rel in links.items():
+    if real_rel not in digests.digests:
+      sys.exit(f'There was a fsv_meta symlink to {real_rel}, but that file was not a fsv_meta file')
+    link_digest = digests.digests[link_rel]
+    real_digest = digests.digests[real_rel]
+    link_digest.CopyFrom(real_digest)
 
   manifest = digests.SerializeToString()
 
