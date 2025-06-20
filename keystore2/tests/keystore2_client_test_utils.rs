@@ -138,6 +138,16 @@ macro_rules! require_keymint {
     };
 }
 
+#[macro_export]
+macro_rules! skip_if_no_hw_curve25519_support {
+    ($sl:ident) => {
+        if $sl.get_keymint_version() < 2 {
+            // Curve 25519 was included in version 2 of the KeyMint interface.
+            return;
+        }
+    };
+}
+
 /// Generate EC key and grant it to the list of users with given access vector.
 /// Returns the list of granted keys `nspace` values in the order of given grantee uids.
 pub fn generate_ec_key_and_grant_to_users(
