@@ -391,6 +391,8 @@ fn keystore2_aes_gcm_op_fails_missing_mac_len() {
     assert!(
         e == Error::Km(ErrorCode::MISSING_MAC_LENGTH)
             || e == Error::Km(ErrorCode::UNSUPPORTED_MAC_LENGTH)
+            // Add INVALID_TAG for compatibility with older versions implementations
+            || e == Error::Km(ErrorCode::INVALID_TAG)
     );
 }
 
@@ -433,7 +435,12 @@ fn keystore2_aes_gcm_op_fails_unsupported_mac_len() {
         &mut None,
     ));
     assert!(result.is_err());
-    assert_eq!(Error::Km(ErrorCode::UNSUPPORTED_MAC_LENGTH), result.unwrap_err());
+    let e = result.unwrap_err();
+    assert!(
+        e == Error::Km(ErrorCode::UNSUPPORTED_MAC_LENGTH)
+            // Add INVALID_MAC_LENGTH for compatibility with older versions implementations
+            || e == Error::Km(ErrorCode::INVALID_MAC_LENGTH)
+    );
 }
 
 /// Generate a AES-CBC-PKCS7 key without `CALLER_NONCE` authorization. Try to set nonce while

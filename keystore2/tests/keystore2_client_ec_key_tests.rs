@@ -281,7 +281,7 @@ fn keystore2_generate_ec_key_25519_multi_purpose() {
         .ec_curve(EcCurve::CURVE_25519)
         .purpose(KeyPurpose::SIGN)
         .purpose(KeyPurpose::AGREE_KEY)
-        .digest(Digest::SHA_2_256);
+        .digest(Digest::NONE);
 
     let result = key_generations::map_ks_error(sl.binder.generateKey(
         &KeyDescriptor {
@@ -353,16 +353,25 @@ fn keystore2_ec_25519_generate_key_fail() {
 
     for digest in digests {
         let alias = format!("ks_ec_25519_test_key_gen_{}{}", getuid(), digest.0);
-        let key_metadata = key_generations::generate_ec_key(
+        let gen_key_result = key_generations::map_ks_error(key_generations::generate_ec_key(
             &sl,
             Domain::APP,
             -1,
             Some(alias.to_string()),
             EcCurve::CURVE_25519,
             digest,
-        )
-        .unwrap();
+        ));
 
+        if gen_key_result.is_err() && get_vsr_api_level() <= 33 {
+            // Compatibility error on older devices (Android 13 and earlier).
+            // Older implementations allowed the generation of an EC key with CURVE_25519
+            // only when using digest mode NONE. Any other digest value fails with an
+            // INVALID_ARGUMENT error.
+            assert_eq!(Error::Km(ErrorCode::INVALID_ARGUMENT), gen_key_result.unwrap_err());
+            continue;
+        }
+
+        let key_metadata = gen_key_result.unwrap();
         // The KeyMint v2 API added `CURVE_25519` and specified that "Ed25519 keys only support
         // Digest::NONE".  However, this was not checked at the time so we can only be strict about
         // checking this for more recent implementations.
