@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::keystore2_client_test_utils::{
-    perform_sample_sym_key_decrypt_op, perform_sample_sym_key_encrypt_op, SAMPLE_PLAIN_TEXT,
+    get_vsr_api_level, perform_sample_sym_key_decrypt_op, perform_sample_sym_key_encrypt_op,
+    SAMPLE_PLAIN_TEXT,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, BlockMode::BlockMode, ErrorCode::ErrorCode, KeyPurpose::KeyPurpose,
@@ -151,8 +152,14 @@ fn keystore2_3des_key_fails_missing_padding() {
         &op_params,
         false,
     ));
-    assert!(result.is_err());
-    assert_eq!(Error::Km(ErrorCode::UNSUPPORTED_PADDING_MODE), result.unwrap_err());
+    // b/454242778: Some devices launched with Android T only receive system updates,
+    // not vendor updates. Because the missing padding mode is not strictly enforced on
+    // older devices (vendor-api-level <= 33), we only apply this check to devices
+    // with vendor-api-level > 33 (Android 14 and later).
+    if get_vsr_api_level() > 33 {
+        assert!(result.is_err());
+        assert_eq!(Error::Km(ErrorCode::UNSUPPORTED_PADDING_MODE), result.unwrap_err());
+    }
 }
 
 /// Generate a 3DES key with padding mode NONE. Try to encrypt a text whose length isn't a

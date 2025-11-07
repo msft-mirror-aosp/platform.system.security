@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::keystore2_client_test_utils::{delete_app_key, perform_sample_sign_operation, ForcedOp};
+use crate::keystore2_client_test_utils::{
+    delete_app_key, get_vsr_api_level, perform_sample_sign_operation, ForcedOp,
+};
+use crate::skip_on_vendor_api_level_android_t_and_earlier;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Digest::Digest, ErrorCode::ErrorCode, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
 };
@@ -184,6 +187,7 @@ fn create_rsa_encrypt_decrypt_key_op_success(
     padding: PaddingMode,
     mgf_digest: Option<Digest>,
 ) {
+    skip_on_vendor_api_level_android_t_and_earlier!();
     let sl = SecLevel::tee();
 
     let result = create_rsa_key_and_operation(

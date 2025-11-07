@@ -148,6 +148,19 @@ macro_rules! skip_if_no_hw_curve25519_support {
     };
 }
 
+#[macro_export]
+macro_rules! skip_on_vendor_api_level_android_t_and_earlier {
+    () => {
+        // b/454242778: Some devices launched with Android T will only receive
+        // system updates, not vendor updates. On older implementations, RSA encryption
+        // with padding modes NONE or RSA_PKCS1_1_5_ENCRYPT only accepted digest value NONE.
+        // Since other digest values are not supported, we are skipping this test for this scenario.
+        if get_vsr_api_level() < 34 {
+            return;
+        }
+    };
+}
+
 /// Generate EC key and grant it to the list of users with given access vector.
 /// Returns the list of granted keys `nspace` values in the order of given grantee uids.
 pub fn generate_ec_key_and_grant_to_users(
